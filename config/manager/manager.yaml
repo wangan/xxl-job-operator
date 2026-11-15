@@ -1,0 +1,181 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: xxl-job-system
+  labels:
+    app.kubernetes.io/name: xxl-job-operator
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: xxl-job-operator-controller-manager
+  namespace: xxl-job-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: xxl-job-operator-manager-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "endpoints", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["services", "events"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["xxljob.io"]
+    resources: ["xxljobadmins", "xxljobexecutors", "xxljobtasks"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["xxljob.io"]
+    resources: ["xxljobadmins/status", "xxljobexecutors/status", "xxljobtasks/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["xxljob.io"]
+    resources: ["xxljobadmins/finalizers", "xxljobexecutors/finalizers", "xxljobtasks/finalizers"]
+    verbs: ["update"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: xxl-job-operator-manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: xxl-job-operator-manager-role
+subjects:
+  - kind: ServiceAccount
+    name: xxl-job-operator-controller-manager
+    namespace: xxl-job-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: xxl-job-operator-proxy
+  namespace: xxl-job-system
+  labels:
+    app.kubernetes.io/name: xxl-job-operator
+spec:
+  type: ClusterIP
+  selector:
+    control-plane: controller-manager
+    app.kubernetes.io/name: xxl-job-operator
+  ports:
+    - name: proxy-executor
+      port: 9999
+      targetPort: 9999
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xxl-job-operator-controller-manager
+  namespace: xxl-job-system
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: xxl-job-operator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: xxl-job-operator
+  template:
+    metadata:
+      labels:
+        control-plane: controller-manager
+        app.kubernetes.io/name: xxl-job-operator
+    spec:
+      serviceAccountName: xxl-job-operator-controller-manager
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: manager
+          image: ghcr.io/xxl-job/xxl-job-operator:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - /manager
+          args:
+            - --leader-elect=true
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+            - --proxy-executor-bind-address=:9999
+            - --proxy-executor-service-url=http://xxl-job-operator-proxy.xxl-job-system.svc.cluster.local:9999/
+            # 如已部署 cert-manager 与 config/webhook/manifests.yaml，可将 --enable-webhooks 设为 true 开启自动注入
+            - --enable-webhooks=false
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+            - name: proxy-exec
+              containerPort: 9999
+            - name: webhook-server
+              containerPort: 9443
+              protocol: TCP
+          volumeMounts:
+            - mountPath: /tmp/k8s-webhook-server/serving-certs
+              name: webhook-cert
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: webhook-cert
+          secret:
+            defaultMode: 420
+            secretName: webhook-server-cert
+            optional: true
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: xxl-job-operator-controller-manager-pdb
+  namespace: xxl-job-system
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: xxl-job-operator
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: xxl-job-operator
+

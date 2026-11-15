@@ -1,0 +1,138 @@
+# ==============================================================================
+# 示例 5：无 Operator 的标准 K8s 高可用部署模板（对照基准方案）
+# 适用场景：暂不引入 CRD / Operator，仅通过原生 K8s Deployment + Service + Downward API + PreStop
+# 解决容器网卡 IP 识别错误、动态 IP 注册与优雅停机摘流问题。
+# ==============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xxl-job-admin-standalone
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: xxl-job-admin-standalone
+  template:
+    metadata:
+      labels:
+        app: xxl-job-admin-standalone
+    spec:
+      containers:
+        - name: xxl-job-admin
+          image: xuxueli/xxl-job-admin:2.4.1
+          ports:
+            - containerPort: 8080
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: SPRING_DATASOURCE_URL
+              value: "jdbc:mysql://mysql.default.svc.cluster.local:3306/xxl_job?useUnicode=true&characterEncoding=UTF-8&autoReconnect=true&serverTimezone=Asia/Shanghai"
+            - name: SPRING_DATASOURCE_USERNAME
+              value: "root"
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: xxl-job-admin-secret
+                  key: db-password
+            - name: XXL_JOB_ACCESSTOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: xxl-job-admin-secret
+                  key: access-token
+            - name: PARAMS
+              value: "--server.port=8080 --server.servlet.context-path=/xxl-job-admin"
+          readinessProbe:
+            httpGet:
+              path: /xxl-job-admin/toLogin
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: xxl-job-admin-svc
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    app: xxl-job-admin-standalone
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+# 业务执行器 Deployment（利用 Downward API 注入真实 Pod IP + PreStop 主动调用 registryRemove 无损下线）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-executor-standalone
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sample-executor-standalone
+  template:
+    metadata:
+      labels:
+        app: sample-executor-standalone
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: executor
+          image: xuxueli/xxl-job-executor-sample-springboot:2.4.1
+          ports:
+            - name: http
+              containerPort: 8081
+            - name: xxl-executor
+              containerPort: 9999
+          env:
+            # 1. 通过 Downward API 获取真实的 K8s Pod IP，避免获取到容器内部虚拟网桥 IP
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: XXL_JOB_ADMIN_ADDRESSES
+              value: "http://xxl-job-admin-svc.default.svc.cluster.local:8080/xxl-job-admin"
+            - name: XXL_JOB_ACCESSTOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: xxl-job-admin-secret
+                  key: access-token
+            - name: XXL_JOB_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: xxl-job-admin-secret
+                  key: access-token
+            - name: XXL_JOB_EXECUTOR_APPNAME
+              value: "xxl-job-executor-sample"
+            - name: XXL_JOB_EXECUTOR_IP
+              value: "$(POD_IP)"
+            - name: XXL_JOB_EXECUTOR_PORT
+              value: "9999"
+            - name: PARAMS
+              value: >-
+                --xxl.job.admin.addresses=$(XXL_JOB_ADMIN_ADDRESSES)
+                --xxl.job.accessToken=$(XXL_JOB_ACCESS_TOKEN)
+                --xxl.job.executor.appname=$(XXL_JOB_EXECUTOR_APPNAME)
+                --xxl.job.executor.ip=$(XXL_JOB_EXECUTOR_IP)
+                --xxl.job.executor.port=$(XXL_JOB_EXECUTOR_PORT)
+          lifecycle:
+            # 2. 滚动升级或缩容时，PreStop 遍历所有 Admin 地址主动注销当前 Pod IP，再等待 20s 让在途任务执行完毕
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    PAYLOAD="{\"registryGroup\":\"EXECUTOR\",\"registryKey\":\"${XXL_JOB_EXECUTOR_APPNAME}\",\"registryValue\":\"http://${POD_IP}:${XXL_JOB_EXECUTOR_PORT}/\"}"
+                    for ADMIN_URL in $(echo "${XXL_JOB_ADMIN_ADDRESSES}" | tr ',' ' '); do
+                      ADMIN_URL=${ADMIN_URL%/}
+                      wget -qO- --header="Content-Type: application/json" \
+                        --header="XXL-JOB-ACCESS-TOKEN: ${XXL_JOB_ACCESS_TOKEN}" \
+                        --post-data="${PAYLOAD}" \
+                        "${ADMIN_URL}/api/registryRemove" >/dev/null 2>&1 || true
+                    done
+                    sleep 20

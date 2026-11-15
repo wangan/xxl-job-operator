@@ -1,0 +1,140 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: xxljobadmins.xxljob.io
+  labels:
+    app.kubernetes.io/name: xxl-job-operator
+spec:
+  group: xxljob.io
+  names:
+    kind: XxlJobAdmin
+    listKind: XxlJobAdminList
+    plural: xxljobadmins
+    singular: xxljobadmin
+    shortNames:
+      - xja
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Ready
+          type: integer
+          jsonPath: .status.readyReplicas
+        - name: AdminURL
+          type: string
+          jsonPath: .status.adminURL
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              x-kubernetes-validations:
+                - rule: "(has(self.externalURL) && size(self.externalURL) > 0) || (has(self.datasource) && has(self.datasource.url) && size(self.datasource.url) > 0 && has(self.datasource.username) && size(self.datasource.username) > 0)"
+                  message: "datasource (url and username) is required when externalURL is not specified"
+              properties:
+                image:
+                  type: string
+                replicas:
+                  type: integer
+                  format: int32
+                port:
+                  type: integer
+                  format: int32
+                  default: 8080
+                contextPath:
+                  type: string
+                  default: "/xxl-job-admin"
+                externalURL:
+                  type: string
+                serviceType:
+                  type: string
+                  default: "ClusterIP"
+                extraJavaOpts:
+                  type: string
+                datasource:
+                  type: object
+                  properties:
+                    url:
+                      type: string
+                    username:
+                      type: string
+                    password:
+                      type: string
+                    passwordSecretRef:
+                      type: object
+                      required:
+                        - name
+                        - key
+                      properties:
+                        name:
+                          type: string
+                        key:
+                          type: string
+                auth:
+                  type: object
+                  properties:
+                    username:
+                      type: string
+                      default: "admin"
+                    password:
+                      type: string
+                    passwordSecretRef:
+                      type: object
+                      required:
+                        - name
+                        - key
+                      properties:
+                        name:
+                          type: string
+                        key:
+                          type: string
+                    accessToken:
+                      type: string
+                    accessTokenSecretRef:
+                      type: object
+                      required:
+                        - name
+                        - key
+                      properties:
+                        name:
+                          type: string
+                        key:
+                          type: string
+                resources:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                readyReplicas:
+                  type: integer
+                  format: int32
+                adminURL:
+                  type: string
+                observedGeneration:
+                  type: integer
+                  format: int64
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true

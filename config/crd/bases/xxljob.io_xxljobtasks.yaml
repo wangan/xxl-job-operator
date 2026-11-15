@@ -1,0 +1,273 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: xxljobtasks.xxljob.io
+  labels:
+    app.kubernetes.io/name: xxl-job-operator
+spec:
+  group: xxljob.io
+  names:
+    kind: XxlJobTask
+    listKind: XxlJobTaskList
+    plural: xxljobtasks
+    singular: xxljobtask
+    shortNames:
+      - xjt
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Executor
+          type: string
+          jsonPath: .spec.executorRef.name
+        - name: Handler
+          type: string
+          jsonPath: .spec.executorHandler
+        - name: Schedule
+          type: string
+          jsonPath: .spec.scheduleConf
+        - name: JobID
+          type: integer
+          jsonPath: .status.jobId
+        - name: Running
+          type: boolean
+          jsonPath: .spec.triggerStatus
+        - name: Synced
+          type: boolean
+          jsonPath: .status.synced
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - executorRef
+                - jobDesc
+                - author
+                - scheduleType
+                - triggerStatus
+              x-kubernetes-validations:
+                - rule: "!(self.scheduleType == 'NONE' && self.triggerStatus)"
+                  message: "scheduleType NONE cannot be combined with triggerStatus=true (XXL-JOB rejects /jobinfo/start for NONE)"
+                - rule: "self.scheduleType == 'NONE' || (has(self.scheduleConf) && size(self.scheduleConf) > 0)"
+                  message: "scheduleConf is required when scheduleType is CRON or FIX_RATE"
+                - rule: "(has(self.glueType) && self.glueType.startsWith('GLUE_')) || (has(self.executorHandler) && size(self.executorHandler) > 0)"
+                  message: "executorHandler is required when glueType is BEAN or K8S_JOB"
+              properties:
+                executorRef:
+                  type: object
+                  required:
+                    - name
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                jobDesc:
+                  type: string
+                  minLength: 1
+                  maxLength: 200
+                author:
+                  type: string
+                  minLength: 1
+                  maxLength: 64
+                alarmEmail:
+                  type: string
+                  maxLength: 255
+                scheduleType:
+                  type: string
+                  enum:
+                    - CRON
+                    - FIX_RATE
+                    - NONE
+                scheduleConf:
+                  type: string
+                  maxLength: 128
+                misfireStrategy:
+                  type: string
+                  default: DO_NOTHING
+                  enum:
+                    - DO_NOTHING
+                    - FIRE_ONCE_NOW
+                executorRouteStrategy:
+                  type: string
+                  default: FIRST
+                  enum:
+                    - FIRST
+                    - LAST
+                    - ROUND
+                    - RANDOM
+                    - CONSISTENT_HASH
+                    - LEAST_FREQUENTLY_USED
+                    - LEAST_RECENTLY_USED
+                    - FAILOVER
+                    - BUSYOVER
+                    - SHARDING_BROADCAST
+                executorHandler:
+                  type: string
+                  maxLength: 255
+                executorParam:
+                  type: string
+                  maxLength: 512
+                executorBlockStrategy:
+                  type: string
+                  default: SERIAL_EXECUTION
+                  enum:
+                    - SERIAL_EXECUTION
+                    - DISCARD_LATER
+                    - COVER_EARLY
+                executorTimeout:
+                  type: integer
+                  minimum: 0
+                  default: 0
+                executorFailRetryCount:
+                  type: integer
+                  minimum: 0
+                  default: 0
+                glueType:
+                  type: string
+                  default: BEAN
+                  enum:
+                    - BEAN
+                    - K8S_JOB
+                    - GLUE_GROOVY
+                    - GLUE_SHELL
+                    - GLUE_PYTHON
+                    - GLUE_PHP
+                    - GLUE_NODEJS
+                    - GLUE_POWERSHELL
+                glueSource:
+                  type: string
+                glueRemark:
+                  type: string
+                  maxLength: 100
+                  x-kubernetes-validations:
+                    - rule: "size(self) == 0 || size(self) >= 4"
+                      message: "glueRemark must be empty or at least 4 characters"
+                childJobId:
+                  type: string
+                  maxLength: 255
+                  pattern: '^$|^[0-9]+(,[0-9]+)*$'
+                triggerStatus:
+                  type: boolean
+                k8sJobTemplate:
+                  type: object
+                  properties:
+                    image:
+                      type: string
+                    automountServiceAccountToken:
+                      type: boolean
+                    command:
+                      type: array
+                      items:
+                        type: string
+                    args:
+                      type: array
+                      items:
+                        type: string
+                    env:
+                      type: array
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    resources:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    serviceAccountName:
+                      type: string
+                    restartPolicy:
+                      type: string
+                      default: Never
+                    backoffLimit:
+                      type: integer
+                      format: int32
+                      default: 0
+                    activeDeadlineSeconds:
+                      type: integer
+                      format: int64
+                    ttlSecondsAfterFinished:
+                      type: integer
+                      format: int32
+                      default: 3600
+                    imagePullPolicy:
+                      type: string
+                    imagePullSecrets:
+                      type: array
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    securityContext:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    podSecurityContext:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    nodeSelector:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    tolerations:
+                      type: array
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    affinity:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    volumes:
+                      type: array
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    volumeMounts:
+                      type: array
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    podLabels:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    podAnnotations:
+                      type: object
+                      additionalProperties:
+                        type: string
+            status:
+              type: object
+              properties:
+                jobId:
+                  type: integer
+                jobGroupId:
+                  type: integer
+                adminURL:
+                  type: string
+                synced:
+                  type: boolean
+                triggerStatus:
+                  type: integer
+                lastSyncTime:
+                  type: string
+                  format: date-time
+                lastExecutionJobName:
+                  type: string
+                message:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true

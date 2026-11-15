@@ -1,0 +1,48 @@
+# ==============================================================================
+# 示例 1：通过 XxlJobAdmin CRD 声明式拉起高可用 XXL-JOB 调度中心 (v2.4.x / v2.5.x)
+# ==============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: xxl-job-admin-secret
+  namespace: default
+type: Opaque
+stringData:
+  # 生产环境请务必替换为高熵随机密码与 Token（切勿使用弱口令）
+  db-password: "<CHANGE_ME_STRONG_DB_PASSWORD>"
+  admin-password: "<CHANGE_ME_STRONG_ADMIN_PASSWORD>"
+  access-token: "<CHANGE_ME_STRONG_ACCESS_TOKEN>"
+---
+apiVersion: xxljob.io/v1alpha1
+kind: XxlJobAdmin
+metadata:
+  name: xxl-job-admin
+  namespace: default
+spec:
+  image: xuxueli/xxl-job-admin:2.4.1
+  replicas: 2 # 多副本高可用部署（依托数据库行锁 xxl_job_lock 避免重复触发）
+  port: 8080
+  contextPath: /xxl-job-admin
+  serviceType: ClusterIP
+  extraJavaOpts: "-Xms512m -Xmx512m"
+  datasource:
+    url: "jdbc:mysql://mysql.default.svc.cluster.local:3306/xxl_job?useUnicode=true&characterEncoding=UTF-8&autoReconnect=true&serverTimezone=Asia/Shanghai"
+    username: "root"
+    passwordSecretRef:
+      name: xxl-job-admin-secret
+      key: db-password
+  auth:
+    username: "admin"
+    passwordSecretRef:
+      name: xxl-job-admin-secret
+      key: admin-password
+    accessTokenSecretRef:
+      name: xxl-job-admin-secret
+      key: access-token
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi

@@ -1,0 +1,71 @@
+# ==============================================================================
+# 示例 4：流派二 —— Sidecar 无侵入注入流派 (Sidecar Mode)
+# 特点：
+# 1. 适用于 Python / Go / Node.js / C++ 或不希望改造 Java SDK 的存量服务
+# 2. Pod 添加标签 xxljob.io/inject: "true" 与注解 xxljob.io/mode: "sidecar" 后，Webhook 自动注入 xxl-job-sidecar 容器
+# 3. Operator 通过 addressType=1 实时同步就绪 Pod 的 Sidecar 地址，Sidecar 验签 XXL-JOB-ACCESS-TOKEN 后将 /run 请求转发至同 Pod 内业务容器的 http://127.0.0.1:<targetPort>/job/<handler>
+# ==============================================================================
+apiVersion: xxljob.io/v1alpha1
+kind: XxlJobExecutor
+metadata:
+  name: ai-inference-sidecar-executor
+  namespace: default
+spec:
+  adminRef:
+    name: xxl-job-admin
+    namespace: default
+  appName: ai-inference-executor
+  title: "AI特征执行器"
+  mode: Sidecar
+  executorPort: 9999
+  podSelector:
+    matchLabels:
+      app: ai-feature-worker
+---
+apiVersion: xxljob.io/v1alpha1
+kind: XxlJobTask
+metadata:
+  name: feature-cache-warmup-task
+  namespace: default
+spec:
+  executorRef:
+    name: ai-inference-sidecar-executor
+  jobDesc: "推荐特征缓存定时预热"
+  author: "ai-team"
+  scheduleType: CRON
+  scheduleConf: "0 */15 * * * ?"
+  executorRouteStrategy: ROUND
+  executorHandler: "warmupFeatureCache"
+  executorParam: '{"topK": 10000}'
+  triggerStatus: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-feature-worker
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ai-feature-worker
+  template:
+    metadata:
+      labels:
+        app: ai-feature-worker
+        xxljob.io/inject: "true"
+      annotations:
+        xxljob.io/mode: "sidecar"
+        xxljob.io/executor: "ai-inference-sidecar-executor"
+        xxljob.io/app-name: "ai-inference-executor"
+        xxljob.io/admin-url: "http://xxl-job-admin.default.svc.cluster.local:8080/xxl-job-admin"
+        xxljob.io/access-token-secret-name: "xxl-job-admin-secret"
+        xxljob.io/access-token-secret-key: "access-token"
+        xxljob.io/target-http-port: "8000"
+    spec:
+      containers:
+        - name: python-fastapi-worker
+          image: example.com/ai-feature-worker:v1.0.0
+          ports:
+            - name: http
+              containerPort: 8000

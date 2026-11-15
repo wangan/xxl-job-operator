@@ -1,0 +1,63 @@
+# ==============================================================================
+# 示例 3：流派三 —— K8s 原生 Job 代理流派 (K8sJobProxy Mode)
+# 特点：
+# 1. 无需常驻执行器 Pod，平时零业务资源占用
+# 2. XXL-JOB Admin 触发任务时，Operator 内置的 K8sJobProxy 执行器动态创建一次性 K8s batch/v1.Job
+# 3. 任务完成后自动通过 /api/callback 回传结果，并支持在 XXL-JOB 控制台实时查看 K8s Pod 容器日志与终止任务
+# ==============================================================================
+apiVersion: xxljob.io/v1alpha1
+kind: XxlJobExecutor
+metadata:
+  name: k8s-batch-proxy-executor
+  namespace: default
+spec:
+  adminRef:
+    name: xxl-job-admin
+    namespace: default
+  appName: k8s-batch-proxy-executor
+  title: "K8sJob代理执行器"
+  mode: K8sJobProxy
+  proxyServiceAddress: "http://xxl-job-operator-proxy.xxl-job-system.svc.cluster.local:9999/"
+---
+apiVersion: xxljob.io/v1alpha1
+kind: XxlJobTask
+metadata:
+  name: finance-daily-settlement-job
+  namespace: default
+spec:
+  executorRef:
+    name: k8s-batch-proxy-executor
+  jobDesc: "财务日终对账批处理（动态拉起一次性 K8s Job）"
+  author: "finance-team"
+  scheduleType: CRON
+  scheduleConf: "0 30 2 * * ?"
+  executorRouteStrategy: FIRST
+  executorHandler: "financeDailySettlement"
+  executorParam: "--env=prod --reconcile-window=1d"
+  executorBlockStrategy: DISCARD_LATER
+  executorTimeout: 1800
+  executorFailRetryCount: 2
+  glueType: K8S_JOB
+  triggerStatus: true
+  k8sJobTemplate:
+    image: python:3.11-slim
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        echo "Starting Finance Settlement JobID=${XXL_JOB_ID} LogID=${XXL_JOB_LOG_ID}"
+        echo "Params: ${XXL_JOB_PARAM}"
+        echo "Shard: ${XXL_JOB_SHARDING_INDEX}/${XXL_JOB_SHARDING_TOTAL}"
+        python3 -c "import time; print('Reconciling ledger...'); time.sleep(2); print('Settlement Done!')"
+    restartPolicy: Never
+    backoffLimit: 0
+    ttlSecondsAfterFinished: 3600
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 65534
+    resources:
+      requests:
+        cpu: 500m
+        memory: 512Mi
+      limits:
+        cpu: "2"
+        memory: 2Gi

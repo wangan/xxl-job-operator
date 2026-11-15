@@ -1,0 +1,84 @@
+# ==============================================================================
+# 示例 2：流派一 —— 容器常驻流派 (Resident Mode)
+# 特点：
+# 1. Operator 自动监听匹配 podSelector 的 Pod 状态，并以 addressType=1 (Operator 托管地址列表) 实时同步：
+#    - 当 Pod Ready 时自动将真实 PodIP:9999 写入 XXL-JOB Admin 的 xxl_job_group.address_list
+#    - 当 Pod 进入 Terminating 或 NotReady 时，Operator 立即从 address_list 剔除该 IP（无需等待 30s~90s 超时）；
+#      当全部实例均处于下线状态时，自动写入 /proxy/_unavailable/ 哨兵地址防止回退到注册表
+# 2. 配合 Pod 标签 xxljob.io/inject: "true" 与注解 xxljob.io/mode: "resident"，
+#    MutatingWebhook 自动注入 Downward API 环境变量与 PreStop 无损停机钩子
+# ==============================================================================
+apiVersion: xxljob.io/v1alpha1
+kind: XxlJobExecutor
+metadata:
+  name: order-service-executor
+  namespace: default
+spec:
+  adminRef:
+    name: xxl-job-admin
+    namespace: default
+  appName: order-service-executor
+  title: "订单中心执行器"
+  mode: Resident
+  executorPort: 9999
+  gracefulDrainSeconds: 20
+  podSelector:
+    matchLabels:
+      app: order-service
+---
+apiVersion: xxljob.io/v1alpha1
+kind: XxlJobTask
+metadata:
+  name: order-close-expired-task
+  namespace: default
+spec:
+  executorRef:
+    name: order-service-executor
+  jobDesc: "超时未支付订单自动关单（分片广播）"
+  author: "order-team"
+  alarmEmail: "order-oncall@example.com"
+  scheduleType: CRON
+  scheduleConf: "0 */1 * * * ?"
+  executorRouteStrategy: SHARDING_BROADCAST
+  executorHandler: "closeExpiredOrderJobHandler"
+  executorParam: "batchSize=500"
+  executorBlockStrategy: SERIAL_EXECUTION
+  executorTimeout: 60
+  executorFailRetryCount: 1
+  glueType: BEAN
+  triggerStatus: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+        xxljob.io/inject: "true"
+      annotations:
+        # 触发 Webhook 自动注入 Downward API (POD_IP, XXL_JOB_EXECUTOR_IP)、SecretKeyRef (XXL_JOB_ACCESSTOKEN) 及 PreStop 优雅注销钩子
+        xxljob.io/mode: "resident"
+        xxljob.io/executor: "order-service-executor"
+        xxljob.io/app-name: "order-service-executor"
+        xxljob.io/admin-url: "http://xxl-job-admin.default.svc.cluster.local:8080/xxl-job-admin"
+        xxljob.io/access-token-secret-name: "xxl-job-admin-secret"
+        xxljob.io/access-token-secret-key: "access-token"
+        xxljob.io/executor-port: "9999"
+        xxljob.io/graceful-drain-seconds: "20"
+    spec:
+      containers:
+        - name: order-service
+          image: example.com/order-service:v1.0.0
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: xxl-job
+              containerPort: 9999

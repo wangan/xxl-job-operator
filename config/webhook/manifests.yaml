@@ -1,0 +1,79 @@
+# ==============================================================================
+# Pod MutatingAdmissionWebhook 部署清单（配合 cert-manager 自动签发 TLS 证书）
+# 启用方式：
+#   1. kubectl apply -f config/webhook/manifests.yaml
+#   2. 在 config/manager/manager.yaml 中开启参数 --enable-webhooks=true 并挂载 webhook-server-cert Secret
+# ==============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: xxl-job-operator-webhook-service
+  namespace: xxl-job-system
+  labels:
+    app.kubernetes.io/name: xxl-job-operator
+spec:
+  ports:
+    - port: 443
+      targetPort: 9443
+      protocol: TCP
+      name: https
+  selector:
+    control-plane: controller-manager
+    app.kubernetes.io/name: xxl-job-operator
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: xxl-job-operator-selfsigned-issuer
+  namespace: xxl-job-system
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: xxl-job-operator-serving-cert
+  namespace: xxl-job-system
+spec:
+  dnsNames:
+    - xxl-job-operator-webhook-service.xxl-job-system.svc
+    - xxl-job-operator-webhook-service.xxl-job-system.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: xxl-job-operator-selfsigned-issuer
+  secretName: webhook-server-cert
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: xxl-job-operator-mutating-webhook
+  annotations:
+    cert-manager.io/inject-ca-from: xxl-job-system/xxl-job-operator-serving-cert
+webhooks:
+  - name: mpod.xxljob.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    reinvocationPolicy: Never
+    clientConfig:
+      service:
+        name: xxl-job-operator-webhook-service
+        namespace: xxl-job-system
+        path: /mutate-v1-pod
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - kube-system
+            - kube-public
+            - xxl-job-system
+    objectSelector:
+      matchLabels:
+        xxljob.io/inject: "true"
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+        scope: "Namespaced"
