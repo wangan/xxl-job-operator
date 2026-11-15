@@ -72,6 +72,50 @@ type queuedTrigger struct {
 	param       xxlclient.TriggerParam
 }
 
+type ctxMutex struct {
+	once sync.Once
+	sem  chan struct{}
+}
+
+func (m *ctxMutex) ensure() chan struct{} {
+	m.once.Do(func() {
+		m.sem = make(chan struct{}, 1)
+	})
+	return m.sem
+}
+
+func (m *ctxMutex) Lock() {
+	m.ensure() <- struct{}{}
+}
+
+func (m *ctxMutex) TryLock() bool {
+	select {
+	case m.ensure() <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *ctxMutex) LockContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case m.ensure() <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *ctxMutex) Unlock() {
+	<-m.ensure()
+}
+
 // Agent runs inside a Pod as a sidecar container:
 // 1. Maintains heartbeat registration (/api/registry) with one or more XXL-JOB Admin instances
 // 2. Exposes /beat, /idleBeat, /run, /kill, /log (authenticated with XXL-JOB-ACCESS-TOKEN), /healthz, /readyz, and loopback-only /preStop
@@ -81,9 +125,11 @@ type Agent struct {
 	adminClis  []*xxlclient.Client
 	httpClient *http.Client
 
-	draining    atomic.Bool
-	preStopOnce sync.Once
-	replayMu    sync.Mutex
+	draining       atomic.Bool
+	preStopOnce    sync.Once
+	replayMu       ctxMutex
+	bgReplayCtx    context.Context
+	bgReplayCancel context.CancelFunc
 
 	mu                 sync.Mutex
 	running            map[int]map[int64]*runningEntry // jobID -> logID -> runningEntry
@@ -154,6 +200,7 @@ func NewAgent(cfg Config) (*Agent, error) {
 		return nil, fmt.Errorf("at least one valid XXL-JOB Admin URL is required")
 	}
 
+	bgCtx, bgCancel := context.WithCancel(context.Background())
 	a := &Agent{
 		cfg:       cfg,
 		adminClis: clis,
@@ -166,6 +213,8 @@ func NewAgent(cfg Config) (*Agent, error) {
 				return http.ErrUseLastResponse
 			},
 		},
+		bgReplayCtx:        bgCtx,
+		bgReplayCancel:     bgCancel,
 		running:            make(map[int]map[int64]*runningEntry),
 		serialQueues:       make(map[int][]queuedTrigger),
 		serialWorkerActive: make(map[int]bool),
@@ -175,37 +224,63 @@ func NewAgent(cfg Config) (*Agent, error) {
 		inFlightCallbacks:  make(map[int64]bool),
 		logs:               make(map[int64]string),
 	}
+	a.replayMu.ensure()
 	if cfg.CallbackDir != "" {
 		go a.replaySpooledCallbacks()
 	}
 	return a, nil
 }
 
+func (a *Agent) backgroundReplayContext() context.Context {
+	a.mu.Lock()
+	ctx := a.bgReplayCtx
+	a.mu.Unlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
 // StartDrain marks the Sidecar Agent as draining under a.mu so /readyz returns 503, /run atomically rejects
-// any concurrent trigger before mutating a.running, and periodic Register() calls stop immediately (fixes R7-P3-1, EG2-13).
+// any concurrent trigger before mutating a.running, periodic Register() calls stop immediately, and any stalled
+// background spool replay releases replayMu so /preStop FlushSpooledCallbacksContext can flush drained callbacks (fixes R7-P3-1, EG2-13).
 func (a *Agent) StartDrain() {
 	a.mu.Lock()
 	a.draining.Store(true)
+	cancel := a.bgReplayCancel
 	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // StartSpoolRetryLoop periodically replays any spooled callback files left in CallbackDir after transient
-// Admin outages until ctx is cancelled (fixes R7-P2-1).
+// Admin outages until ctx is cancelled or StartDrain() enters graceful shutdown (fixes R7-P2-1).
 func (a *Agent) StartSpoolRetryLoop(ctx context.Context, interval time.Duration) {
 	if a.cfg.CallbackDir == "" {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
+	bgCtx := a.backgroundReplayContext()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-bgCtx.Done():
+			return
 		case <-ticker.C:
-			a.replaySpooledCallbacks()
+			runCtx, runCancel := context.WithCancel(ctx)
+			stop := context.AfterFunc(bgCtx, runCancel)
+			a.replaySpooledCallbacksWithContext(runCtx, false)
+			stop()
+			runCancel()
 		}
 	}
 }
@@ -250,12 +325,17 @@ func (a *Agent) handleReadyz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("ready"))
 }
 
-func sanitizeAccessToken(raw string) string {
+// SanitizeAccessToken trims outer whitespace and strips any embedded CR/LF characters from a token value.
+func SanitizeAccessToken(raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if !strings.ContainsAny(trimmed, "\r\n") {
 		return trimmed
 	}
-	return strings.NewReplacer("\r", "", "\n", "").Replace(trimmed)
+	return strings.TrimSpace(strings.NewReplacer("\r", "", "\n", "").Replace(trimmed))
+}
+
+func sanitizeAccessToken(raw string) string {
+	return SanitizeAccessToken(raw)
 }
 
 func (a *Agent) isValidAccessToken(token string) bool {
@@ -674,12 +754,21 @@ func (a *Agent) executeAndCallback(queueCtx context.Context, queueCancel context
 				if err != nil {
 					execErr = err
 				} else {
-					bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, MaxSingleLogBytes))
-					_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-					resp.Body.Close()
-					output = string(bodyBytes)
+					// Stream the entire business response body until EOF so premature truncation never closes
+					// the socket early or reports success while the handler is still running, while capping
+					// retained log output in memory at MaxSingleLogBytes and surfacing mid-stream read/timeout errors.
+					lb := &limitedBuffer{max: MaxSingleLogBytes}
+					_, readErr := io.Copy(lb, resp.Body)
+					_ = resp.Body.Close()
+					output = lb.buf.String()
 					if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-						execErr = fmt.Errorf("business container returned HTTP %d: %s", resp.StatusCode, output)
+						if readErr != nil {
+							execErr = fmt.Errorf("business container returned HTTP %d (body read error: %w): %s", resp.StatusCode, readErr, output)
+						} else {
+							execErr = fmt.Errorf("business container returned HTTP %d: %s", resp.StatusCode, output)
+						}
+					} else if readErr != nil {
+						execErr = fmt.Errorf("read business container response body failed: %w", readErr)
 					}
 				}
 			}
@@ -928,7 +1017,7 @@ func (a *Agent) tryBeginCallbackDelivery(logID int64) (func(), bool) {
 }
 
 func (a *Agent) replaySpooledCallbacks() {
-	a.replaySpooledCallbacksWithContext(context.Background(), false)
+	a.replaySpooledCallbacksWithContext(a.backgroundReplayContext(), false)
 }
 
 func (a *Agent) replaySpooledCallbacksWithContext(ctx context.Context, blocking bool) {
@@ -942,9 +1031,13 @@ func (a *Agent) replaySpooledCallbacksWithContext(ctx context.Context, blocking 
 		return
 	}
 	if blocking {
-		a.replayMu.Lock()
-	} else if !a.replayMu.TryLock() {
-		return
+		if err := a.replayMu.LockContext(ctx); err != nil {
+			return
+		}
+	} else {
+		if !a.replayMu.TryLock() {
+			return
+		}
 	}
 	defer a.replayMu.Unlock()
 

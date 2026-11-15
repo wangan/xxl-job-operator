@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"net/url"
 	"reflect"
 	"strings"
 	"sync"
@@ -13,6 +15,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -20,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	xxljobv1alpha1 "github.com/xxl-job/xxl-job-operator/api/v1alpha1"
+	"github.com/xxl-job/xxl-job-operator/pkg/proxyexecutor"
 	"github.com/xxl-job/xxl-job-operator/pkg/xxlclient"
 )
 
@@ -35,10 +39,25 @@ const (
 
 	maxClientCacheEntries    = 64
 	maxTokenCacheEntries     = 256
+	maxPreviousAdminURLs     = 8
 	tokenCacheTTL            = 30 * time.Second
 	tokenRotationGracePeriod = 10 * time.Minute
 	forceRefreshCooldown     = 5 * time.Second
+
+	ConditionAdminEndpointSynced    = proxyexecutor.ConditionAdminEndpointSynced
+	ConditionPreviousAdminURLs      = proxyexecutor.ConditionPreviousAdminURLs
+	ConditionPreviousAdminEndpoints = "PreviousAdminEndpoints"
 )
+
+// syncedAdminEndpointMeta aliases proxyexecutor.SyncedAdminEndpointMeta so controllers and K8sJobProxy
+// share the exact same ConditionAdminEndpointSynced JSON wire format.
+type syncedAdminEndpointMeta = proxyexecutor.SyncedAdminEndpointMeta
+
+type cachedEndpointAuthSnapshot struct {
+	adminName string
+	adminUID  types.UID
+	auth      xxljobv1alpha1.AuthSpec
+}
 
 // ClientFactory allows overriding xxlclient creation in unit tests.
 type ClientFactory func(cfg xxlclient.Config) (*xxlclient.Client, error)
@@ -102,7 +121,231 @@ var (
 
 	secretCacheMu sync.Mutex
 	secretCache   = make(map[string]cachedTokenEntry)
+
+	endpointAuthMu    sync.Mutex
+	endpointAuthCache = make(map[string]cachedEndpointAuthSnapshot)
+	endpointAuthOrder []string
 )
+
+func recordEndpointAuthSnapshot(namespace, adminURL string, admin *xxljobv1alpha1.XxlJobAdmin) {
+	u := strings.TrimRight(strings.TrimSpace(adminURL), "/")
+	if namespace == "" || u == "" || admin == nil {
+		return
+	}
+	key := namespace + "|" + u
+	snap := cachedEndpointAuthSnapshot{
+		adminName: admin.Name,
+		adminUID:  admin.UID,
+		auth:      *admin.Spec.Auth.DeepCopy(),
+	}
+	endpointAuthMu.Lock()
+	defer endpointAuthMu.Unlock()
+	if _, exists := endpointAuthCache[key]; exists {
+		for i, k := range endpointAuthOrder {
+			if k == key {
+				endpointAuthOrder = append(endpointAuthOrder[:i], endpointAuthOrder[i+1:]...)
+				break
+			}
+		}
+	} else {
+		for len(endpointAuthCache) >= maxClientCacheEntries && len(endpointAuthOrder) > 0 {
+			oldest := endpointAuthOrder[0]
+			endpointAuthOrder = endpointAuthOrder[1:]
+			delete(endpointAuthCache, oldest)
+		}
+	}
+	endpointAuthCache[key] = snap
+	endpointAuthOrder = append(endpointAuthOrder, key)
+}
+
+func lookupEndpointAuthSnapshot(namespace, adminURL string) (cachedEndpointAuthSnapshot, bool) {
+	u := strings.TrimRight(strings.TrimSpace(adminURL), "/")
+	if namespace == "" || u == "" {
+		return cachedEndpointAuthSnapshot{}, false
+	}
+	endpointAuthMu.Lock()
+	defer endpointAuthMu.Unlock()
+	snap, ok := endpointAuthCache[namespace+"|"+u]
+	return snap, ok
+}
+
+func encodeSyncedAdminEndpointMeta(admin *xxljobv1alpha1.XxlJobAdmin, adminURL string) string {
+	return proxyexecutor.EncodeSyncedAdminEndpointMeta(admin, adminURL)
+}
+
+func extractSyncedAdminEndpointMeta(conditions []metav1.Condition) *syncedAdminEndpointMeta {
+	return proxyexecutor.DecodeSyncedAdminEndpointMeta(conditions)
+}
+
+func extractPreviousAdminEndpointMetas(admin *xxljobv1alpha1.XxlJobAdmin) []syncedAdminEndpointMeta {
+	if admin == nil {
+		return nil
+	}
+	cond := meta.FindStatusCondition(admin.Status.Conditions, ConditionPreviousAdminEndpoints)
+	if cond == nil || strings.TrimSpace(cond.Message) == "" {
+		return nil
+	}
+	var parsed []syncedAdminEndpointMeta
+	if err := json.Unmarshal([]byte(cond.Message), &parsed); err != nil {
+		return nil
+	}
+	return parsed
+}
+
+func lookupAdminRecordedEndpointMeta(admin *xxljobv1alpha1.XxlJobAdmin, targetURL string) *syncedAdminEndpointMeta {
+	targetURL = strings.TrimRight(strings.TrimSpace(targetURL), "/")
+	if admin == nil || targetURL == "" {
+		return nil
+	}
+	if cur := extractSyncedAdminEndpointMeta(admin.Status.Conditions); cur != nil &&
+		strings.TrimRight(strings.TrimSpace(cur.AdminURL), "/") == targetURL &&
+		sameAdminIdentity(cur.AdminName, types.UID(cur.AdminUID), admin) {
+		cp := *cur
+		return &cp
+	}
+	prevList := extractPreviousAdminEndpointMetas(admin)
+	for i := len(prevList) - 1; i >= 0; i-- {
+		item := prevList[i]
+		if strings.TrimRight(strings.TrimSpace(item.AdminURL), "/") == targetURL &&
+			sameAdminIdentity(item.AdminName, types.UID(item.AdminUID), admin) {
+			cp := item
+			return &cp
+		}
+	}
+	return nil
+}
+
+func recordPreviousAdminURLCondition(admin *xxljobv1alpha1.XxlJobAdmin, prevURL string) {
+	prevURL = strings.TrimRight(strings.TrimSpace(prevURL), "/")
+	if admin == nil || prevURL == "" {
+		return
+	}
+	currentURL := strings.TrimRight(ResolveAdminURL(admin), "/")
+	var urls []string
+	for _, existing := range extractPreviousAdminURLs(admin) {
+		if existing != "" && existing != prevURL && existing != currentURL {
+			urls = append(urls, existing)
+		}
+	}
+	urls = append(urls, prevURL)
+	if len(urls) > maxPreviousAdminURLs {
+		urls = urls[len(urls)-maxPreviousAdminURLs:]
+	}
+	meta.SetStatusCondition(&admin.Status.Conditions, metav1.Condition{
+		Type:               ConditionPreviousAdminURLs,
+		Status:             metav1.ConditionTrue,
+		Reason:             "AdminURLUpdated",
+		Message:            strings.Join(urls, ","),
+		LastTransitionTime: metav1.Now(),
+	})
+
+	var prevMeta *syncedAdminEndpointMeta
+	if cur := extractSyncedAdminEndpointMeta(admin.Status.Conditions); cur != nil &&
+		strings.TrimRight(strings.TrimSpace(cur.AdminURL), "/") == prevURL &&
+		sameAdminIdentity(cur.AdminName, types.UID(cur.AdminUID), admin) {
+		cp := *cur
+		prevMeta = &cp
+	} else if snap, ok := lookupEndpointAuthSnapshot(admin.Namespace, prevURL); ok && sameAdminIdentity(snap.adminName, snap.adminUID, admin) {
+		trimmedPw := strings.TrimSpace(snap.auth.Password)
+		sanitizedTok := sanitizeTokenValue(snap.auth.AccessToken)
+		m := syncedAdminEndpointMeta{
+			AdminName:              admin.Name,
+			AdminUID:               string(admin.UID),
+			AdminURL:               prevURL,
+			ManagedInCluster:       proxyexecutor.IsClusterLocalAdminServiceURL(prevURL, admin.Name, admin.Namespace),
+			AuthCaptured:           true,
+			Username:               snap.auth.Username,
+			UsedDefaultPassword:    snap.auth.PasswordSecretRef == nil && (trimmedPw == "" || trimmedPw == "123456"),
+			UsedDefaultAccessToken: snap.auth.AccessTokenSecretRef == nil && (sanitizedTok == "" || sanitizedTok == "default_token"),
+		}
+		if snap.auth.PasswordSecretRef != nil {
+			m.PasswordSecretRef = snap.auth.PasswordSecretRef.DeepCopy()
+		}
+		if snap.auth.AccessTokenSecretRef != nil {
+			m.AccessTokenSecretRef = snap.auth.AccessTokenSecretRef.DeepCopy()
+		}
+		prevMeta = &m
+	}
+	if prevMeta != nil {
+		var metas []syncedAdminEndpointMeta
+		for _, existing := range extractPreviousAdminEndpointMetas(admin) {
+			eu := strings.TrimRight(strings.TrimSpace(existing.AdminURL), "/")
+			if eu != "" && eu != prevURL && eu != currentURL {
+				metas = append(metas, existing)
+			}
+		}
+		metas = append(metas, *prevMeta)
+		if len(metas) > maxPreviousAdminURLs {
+			metas = metas[len(metas)-maxPreviousAdminURLs:]
+		}
+		if raw, err := json.Marshal(metas); err == nil {
+			meta.SetStatusCondition(&admin.Status.Conditions, metav1.Condition{
+				Type:               ConditionPreviousAdminEndpoints,
+				Status:             metav1.ConditionTrue,
+				Reason:             "AdminURLUpdated",
+				Message:            string(raw),
+				LastTransitionTime: metav1.Now(),
+			})
+		}
+	}
+}
+
+func syncAdminCurrentEndpointCondition(admin *xxljobv1alpha1.XxlJobAdmin, adminURL string) bool {
+	if admin == nil {
+		return false
+	}
+	recordEndpointAuthSnapshot(admin.Namespace, adminURL, admin)
+	msg := encodeSyncedAdminEndpointMeta(admin, adminURL)
+	if msg == "" {
+		return false
+	}
+	prev := meta.FindStatusCondition(admin.Status.Conditions, ConditionAdminEndpointSynced)
+	if prev != nil && prev.Status == metav1.ConditionTrue && prev.Message == msg {
+		return false
+	}
+	meta.SetStatusCondition(&admin.Status.Conditions, metav1.Condition{
+		Type:               ConditionAdminEndpointSynced,
+		Status:             metav1.ConditionTrue,
+		Reason:             "EndpointSynced",
+		Message:            msg,
+		LastTransitionTime: metav1.Now(),
+	})
+	return true
+}
+
+func extractPreviousAdminURLs(admin *xxljobv1alpha1.XxlJobAdmin) []string {
+	if admin == nil {
+		return nil
+	}
+	cond := meta.FindStatusCondition(admin.Status.Conditions, ConditionPreviousAdminURLs)
+	if cond == nil || strings.TrimSpace(cond.Message) == "" {
+		return nil
+	}
+	var res []string
+	for _, part := range strings.Split(cond.Message, ",") {
+		u := strings.TrimRight(strings.TrimSpace(part), "/")
+		if u != "" {
+			res = append(res, u)
+		}
+	}
+	return res
+}
+
+func adminHasRecordedPreviousURL(admin *xxljobv1alpha1.XxlJobAdmin, targetURL string) bool {
+	targetURL = strings.TrimRight(strings.TrimSpace(targetURL), "/")
+	if admin == nil || targetURL == "" {
+		return false
+	}
+	if strings.TrimRight(strings.TrimSpace(admin.Status.AdminURL), "/") == targetURL {
+		return true
+	}
+	for _, u := range extractPreviousAdminURLs(admin) {
+		if u == targetURL {
+			return true
+		}
+	}
+	return false
+}
 
 // getOrCreateCachedClient returns a cached *xxlclient.Client for the given Config so login session cookies
 // and HTTP keep-alive connections are reused across Reconcile cycles (with LRU eviction and immediate
@@ -226,6 +469,11 @@ func ResolveAdminAndClientWithReader(
 	}
 	accessToken = sanitizeTokenValue(accessToken)
 	if accessToken == "" {
+		if admin.Spec.Auth.AccessTokenSecretRef != nil && admin.Spec.Auth.AccessTokenSecretRef.Name != "" {
+			invalidateSecretCacheOnly(secretReader, admin.Namespace, admin.Spec.Auth.AccessTokenSecretRef)
+			return &admin, nil, fmt.Errorf("resolve admin accessToken: key %q in Secret %s/%s must not be empty or whitespace-only",
+				admin.Spec.Auth.AccessTokenSecretRef.Key, admin.Namespace, admin.Spec.Auth.AccessTokenSecretRef.Name)
+		}
 		accessToken = "default_token"
 	}
 	prevAccessToken = sanitizeTokenValue(prevAccessToken)
@@ -243,7 +491,219 @@ func ResolveAdminAndClientWithReader(
 	if err != nil {
 		return &admin, nil, err
 	}
+	recordEndpointAuthSnapshot(admin.Namespace, baseURL, &admin)
 	return &admin, cli, nil
+}
+
+// resolvePreviousAdminClient locates the XxlJobAdmin CR responsible for prevAdminURL (including when an
+// XxlJobAdmin modified Spec.ExternalURL / Port / ContextPath in place) and builds a client explicitly
+// targeting prevAdminURL using saved endpoint credentials.
+func resolvePreviousAdminClient(
+	ctx context.Context,
+	k8sClient client.Client,
+	secretReader client.Reader,
+	factory ClientFactory,
+	namespace, prevAdminURL string,
+	savedMeta *syncedAdminEndpointMeta,
+	fallbackAdminName string,
+) (*xxljobv1alpha1.XxlJobAdmin, *xxlclient.Client, error) {
+	return resolvePreviousAdminClientInternal(ctx, k8sClient, secretReader, factory, namespace, prevAdminURL, savedMeta, fallbackAdminName, false)
+}
+
+func resolveReachablePreviousAdminClient(
+	ctx context.Context,
+	k8sClient client.Client,
+	secretReader client.Reader,
+	factory ClientFactory,
+	namespace, prevAdminURL string,
+	savedMeta *syncedAdminEndpointMeta,
+	fallbackAdminName string,
+) (*xxljobv1alpha1.XxlJobAdmin, *xxlclient.Client, error) {
+	return resolvePreviousAdminClientInternal(ctx, k8sClient, secretReader, factory, namespace, prevAdminURL, savedMeta, fallbackAdminName, true)
+}
+
+func resolvePreviousAdminClientInternal(
+	ctx context.Context,
+	k8sClient client.Client,
+	secretReader client.Reader,
+	factory ClientFactory,
+	namespace, prevAdminURL string,
+	savedMeta *syncedAdminEndpointMeta,
+	fallbackAdminName string,
+	skipRetiredManaged bool,
+) (*xxljobv1alpha1.XxlJobAdmin, *xxlclient.Client, error) {
+	if secretReader == nil {
+		secretReader = k8sClient
+	}
+	prevAdminURL = strings.TrimRight(strings.TrimSpace(prevAdminURL), "/")
+	if namespace == "" || prevAdminURL == "" {
+		return nil, nil, nil
+	}
+	if err := validateExternalAdminURL(prevAdminURL); err != nil {
+		return nil, nil, nil
+	}
+
+	listReader := secretReader
+	if listReader == nil {
+		listReader = k8sClient
+	}
+	var adminList xxljobv1alpha1.XxlJobAdminList
+	if err := listReader.List(ctx, &adminList, client.InNamespace(namespace)); err != nil {
+		return nil, nil, err
+	}
+
+	pickCandidate := func(matchFn func(*xxljobv1alpha1.XxlJobAdmin) bool) *xxljobv1alpha1.XxlJobAdmin {
+		var deleting *xxljobv1alpha1.XxlJobAdmin
+		for i := range adminList.Items {
+			item := &adminList.Items[i]
+			if !matchFn(item) {
+				continue
+			}
+			if item.DeletionTimestamp.IsZero() {
+				return item
+			}
+			if deleting == nil {
+				deleting = item
+			}
+		}
+		return deleting
+	}
+
+	// 1. Exact current Spec URL match
+	matchedAdmin := pickCandidate(func(item *xxljobv1alpha1.XxlJobAdmin) bool {
+		return strings.TrimRight(ResolveAdminURL(item), "/") == prevAdminURL
+	})
+	// 2. Recorded Status.AdminURL or PreviousAdminURLs condition match (in-place URL edit)
+	if matchedAdmin == nil {
+		matchedAdmin = pickCandidate(func(item *xxljobv1alpha1.XxlJobAdmin) bool {
+			return adminHasRecordedPreviousURL(item, prevAdminURL)
+		})
+	}
+	// 3. Persisted AdminEndpointSynced metadata match on the dependent CR
+	if matchedAdmin == nil && savedMeta != nil && strings.TrimSpace(savedMeta.AdminName) != "" &&
+		(savedMeta.AdminURL == "" || strings.TrimRight(strings.TrimSpace(savedMeta.AdminURL), "/") == prevAdminURL) {
+		savedName := strings.TrimSpace(savedMeta.AdminName)
+		savedUID := strings.TrimSpace(savedMeta.AdminUID)
+		matchedAdmin = pickCandidate(func(item *xxljobv1alpha1.XxlJobAdmin) bool {
+			if item.Name != savedName {
+				return false
+			}
+			if savedUID != "" && item.UID != "" && string(item.UID) != savedUID {
+				return false
+			}
+			return true
+		})
+	}
+	// 4. In-memory auth snapshot match for prevAdminURL
+	snap, hasSnap := lookupEndpointAuthSnapshot(namespace, prevAdminURL)
+	if matchedAdmin == nil && hasSnap && snap.adminName != "" {
+		matchedAdmin = pickCandidate(func(item *xxljobv1alpha1.XxlJobAdmin) bool {
+			if item.Name != snap.adminName {
+				return false
+			}
+			if snap.adminUID != "" && item.UID != "" && item.UID != snap.adminUID {
+				return false
+			}
+			return true
+		})
+	}
+	// 5. Pre-upgrade fallback for cluster-internal Service URLs (<fallbackAdminName>.<namespace>.svc.cluster.local)
+	// when ConditionAdminEndpointSynced was not yet recorded on the dependent CR.
+	if matchedAdmin == nil && savedMeta == nil && strings.TrimSpace(fallbackAdminName) != "" {
+		fbName := strings.TrimSpace(fallbackAdminName)
+		svcHost := strings.ToLower(fmt.Sprintf("%s.%s.svc.cluster.local", fbName, namespace))
+		if u, parseErr := url.Parse(prevAdminURL); parseErr == nil && strings.EqualFold(u.Hostname(), svcHost) {
+			matchedAdmin = pickCandidate(func(item *xxljobv1alpha1.XxlJobAdmin) bool {
+				return item.Name == fbName
+			})
+		}
+	}
+
+	if matchedAdmin == nil {
+		return nil, nil, nil
+	}
+	if skipRetiredManaged && (isSameManagedAdminDBUpdate(matchedAdmin, prevAdminURL, savedMeta) ||
+		isRetiredManagedAdminEndpoint(matchedAdmin, prevAdminURL, savedMeta)) {
+		return matchedAdmin, nil, nil
+	}
+
+	authSpec := matchedAdmin.Spec.Auth
+	if hasSnap && sameAdminIdentity(snap.adminName, snap.adminUID, matchedAdmin) {
+		// If SecretRefs are still set on matchedAdmin and match, use live SecretRefs; if inline credentials were
+		// modified simultaneously with ExternalURL, prefer the snapshot captured for prevAdminURL.
+		authSpec = snap.auth
+	} else {
+		var effectiveMeta *syncedAdminEndpointMeta
+		adminMeta := lookupAdminRecordedEndpointMeta(matchedAdmin, prevAdminURL)
+		if adminMeta != nil && adminMeta.AuthCaptured {
+			effectiveMeta = adminMeta
+		} else if savedMeta != nil && (savedMeta.AdminURL == "" || strings.TrimRight(strings.TrimSpace(savedMeta.AdminURL), "/") == prevAdminURL) {
+			effectiveMeta = savedMeta
+		} else if adminMeta != nil {
+			effectiveMeta = adminMeta
+		}
+		if effectiveMeta != nil && (effectiveMeta.AdminURL == "" || strings.TrimRight(strings.TrimSpace(effectiveMeta.AdminURL), "/") == prevAdminURL) {
+			if effectiveMeta.AuthCaptured {
+				authSpec.Username = effectiveMeta.Username
+				authSpec.PasswordSecretRef = effectiveMeta.PasswordSecretRef
+				authSpec.AccessTokenSecretRef = effectiveMeta.AccessTokenSecretRef
+				if effectiveMeta.UsedDefaultPassword {
+					authSpec.Password = ""
+				}
+				if effectiveMeta.UsedDefaultAccessToken {
+					authSpec.AccessToken = ""
+				}
+			} else {
+				if effectiveMeta.Username != "" {
+					authSpec.Username = effectiveMeta.Username
+				}
+				if effectiveMeta.PasswordSecretRef != nil {
+					authSpec.PasswordSecretRef = effectiveMeta.PasswordSecretRef
+				}
+				if effectiveMeta.AccessTokenSecretRef != nil {
+					authSpec.AccessTokenSecretRef = effectiveMeta.AccessTokenSecretRef
+				}
+			}
+		}
+	}
+
+	username := authSpec.Username
+	if username == "" {
+		username = "admin"
+	}
+	password, err := resolveSecretOrValue(ctx, secretReader, namespace, authSpec.PasswordSecretRef, authSpec.Password, "123456")
+	if err != nil {
+		return matchedAdmin, nil, fmt.Errorf("resolve previous admin password: %w", err)
+	}
+	accessToken, prevAccessToken, err := resolveSecretOrValueWithPrevious(ctx, secretReader, namespace, authSpec.AccessTokenSecretRef, authSpec.AccessToken, "default_token")
+	if err != nil {
+		return matchedAdmin, nil, fmt.Errorf("resolve previous admin accessToken: %w", err)
+	}
+	accessToken = sanitizeTokenValue(accessToken)
+	if accessToken == "" {
+		if authSpec.AccessTokenSecretRef != nil && authSpec.AccessTokenSecretRef.Name != "" {
+			invalidateSecretCacheOnly(secretReader, namespace, authSpec.AccessTokenSecretRef)
+			return matchedAdmin, nil, fmt.Errorf("resolve previous admin accessToken: key %q in Secret %s/%s must not be empty or whitespace-only",
+				authSpec.AccessTokenSecretRef.Key, namespace, authSpec.AccessTokenSecretRef.Name)
+		}
+		accessToken = "default_token"
+	}
+	prevAccessToken = sanitizeTokenValue(prevAccessToken)
+
+	if factory == nil {
+		factory = getOrCreateCachedClient
+	}
+	cli, err := factory(xxlclient.Config{
+		BaseURL:             prevAdminURL,
+		Username:            username,
+		Password:            password,
+		AccessToken:         accessToken,
+		PreviousAccessToken: prevAccessToken,
+	})
+	if err != nil {
+		return matchedAdmin, nil, err
+	}
+	return matchedAdmin, cli, nil
 }
 
 // ResolveAdminExplicitAccessToken resolves the configured accessToken on XxlJobAdmin without falling back
@@ -697,6 +1157,29 @@ func purgeAdminCaches(ctx context.Context, k8sClient client.Client, reader clien
 	if su := strings.TrimRight(strings.TrimSpace(admin.Status.AdminURL), "/"); su != "" && !sharedURLs[su] {
 		evictClientCacheByAdminURL(su)
 	}
+	for _, pu := range extractPreviousAdminURLs(admin) {
+		if pu != "" && !sharedURLs[pu] {
+			evictClientCacheByAdminURL(pu)
+		}
+	}
+
+	endpointAuthMu.Lock()
+	nsEndpointPrefix := admin.Namespace + "|"
+	var nextEndpointOrder []string
+	for _, k := range endpointAuthOrder {
+		snap, exists := endpointAuthCache[k]
+		if !exists {
+			continue
+		}
+		urlPart := strings.TrimPrefix(k, nsEndpointPrefix)
+		if strings.HasPrefix(k, nsEndpointPrefix) && snap.adminName == admin.Name && !sharedURLs[urlPart] {
+			delete(endpointAuthCache, k)
+			continue
+		}
+		nextEndpointOrder = append(nextEndpointOrder, k)
+	}
+	endpointAuthOrder = nextEndpointOrder
+	endpointAuthMu.Unlock()
 
 	refs := []*xxljobv1alpha1.SecretKeyReference{
 		admin.Spec.Datasource.PasswordSecretRef,
@@ -788,6 +1271,123 @@ func sanitizeTokenValue(raw string) string {
 	return strings.NewReplacer("\r", "", "\n", "").Replace(trimmed)
 }
 
+func isPureExternalAdmin(admin *xxljobv1alpha1.XxlJobAdmin) bool {
+	if admin == nil {
+		return false
+	}
+	return strings.TrimSpace(admin.Spec.ExternalURL) != "" && strings.TrimSpace(admin.Spec.Image) == ""
+}
+
+// isSameManagedAdminDBUpdate reports whether prevAdminURL belonged to the same live, managed in-cluster
+// XxlJobAdmin CR backed by the same Datasource.URL (including in-place Spec.Port / Spec.ContextPath edits
+// on a cluster-local Service URL as well as Hybrid mode ExternalURL + Image updates over the same Deployment/DB).
+func isSameManagedAdminDBUpdate(
+	admin *xxljobv1alpha1.XxlJobAdmin,
+	prevAdminURL string,
+	savedMeta *syncedAdminEndpointMeta,
+) bool {
+	prevAdminURL = strings.TrimRight(strings.TrimSpace(prevAdminURL), "/")
+	if admin == nil || !admin.DeletionTimestamp.IsZero() || prevAdminURL == "" {
+		return false
+	}
+	if isPureExternalAdmin(admin) {
+		return false
+	}
+	currentDBHash := proxyexecutor.DatasourceURLHash(admin.Spec.Datasource.URL)
+	if currentDBHash == "" {
+		return false
+	}
+	if savedMeta != nil {
+		if sName := strings.TrimSpace(savedMeta.AdminName); sName != "" && sName != admin.Name {
+			return false
+		}
+		if sUID := strings.TrimSpace(savedMeta.AdminUID); sUID != "" && admin.UID != "" && sUID != string(admin.UID) {
+			return false
+		}
+	}
+	isClusterLocal := proxyexecutor.IsClusterLocalAdminServiceURL(prevAdminURL, admin.Name, admin.Namespace)
+	if savedMeta != nil && (savedMeta.AdminURL == "" || strings.TrimRight(strings.TrimSpace(savedMeta.AdminURL), "/") == prevAdminURL) {
+		if savedMeta.DatasourceHash != "" {
+			return savedMeta.DatasourceHash == currentDBHash
+		}
+		if savedMeta.AuthCaptured && !savedMeta.ManagedInCluster {
+			return false
+		}
+	}
+	if adminMeta := lookupAdminRecordedEndpointMeta(admin, prevAdminURL); adminMeta != nil {
+		if sUID := strings.TrimSpace(adminMeta.AdminUID); sUID != "" && admin.UID != "" && sUID != string(admin.UID) {
+			return false
+		}
+		if adminMeta.DatasourceHash != "" {
+			return adminMeta.DatasourceHash == currentDBHash
+		}
+		if adminMeta.AuthCaptured && !adminMeta.ManagedInCluster {
+			return false
+		}
+	}
+	return isClusterLocal
+}
+
+// isAdminInstanceOrDBReplaced reports whether a dependent resource whose ConditionAdminEndpointSynced recorded
+// savedMeta is now facing a recreated Admin CR (different UID) or a managed Admin whose Datasource.URL changed
+// in place (even when ResolveAdminURL did not change).
+func isAdminInstanceOrDBReplaced(admin *xxljobv1alpha1.XxlJobAdmin, savedMeta *syncedAdminEndpointMeta) bool {
+	if admin == nil || savedMeta == nil {
+		return false
+	}
+	if sName := strings.TrimSpace(savedMeta.AdminName); sName != "" && sName != admin.Name {
+		return false
+	}
+	if sUID := strings.TrimSpace(savedMeta.AdminUID); sUID != "" && admin.UID != "" && sUID != string(admin.UID) {
+		return true
+	}
+	if !isPureExternalAdmin(admin) && strings.TrimSpace(savedMeta.DatasourceHash) != "" {
+		currentDBHash := proxyexecutor.DatasourceURLHash(admin.Spec.Datasource.URL)
+		if currentDBHash != "" && savedMeta.DatasourceHash != currentDBHash {
+			return true
+		}
+	}
+	return false
+}
+
+// isRetiredManagedAdminEndpoint reports whether prevAdminURL was served by matchedAdmin's owned in-cluster
+// Deployment/Service (either via <name>.<ns>.svc.cluster.local or Hybrid ExternalURL + Image) and that
+// in-cluster endpoint has since been retired or overwritten (e.g., switching to pure ExternalURL mode where
+// cleanupOwnedInClusterResources deletes the Service/Deployment, or changing URL alongside Datasource.URL).
+func isRetiredManagedAdminEndpoint(
+	matchedAdmin *xxljobv1alpha1.XxlJobAdmin,
+	prevAdminURL string,
+	savedMeta ...*syncedAdminEndpointMeta,
+) bool {
+	prevAdminURL = strings.TrimRight(strings.TrimSpace(prevAdminURL), "/")
+	if matchedAdmin == nil || prevAdminURL == "" {
+		return false
+	}
+	wasManagedInCluster := proxyexecutor.IsClusterLocalAdminServiceURL(prevAdminURL, matchedAdmin.Name, matchedAdmin.Namespace)
+	if !wasManagedInCluster && len(savedMeta) > 0 && savedMeta[0] != nil {
+		sm := savedMeta[0]
+		if (sm.AdminURL == "" || strings.TrimRight(strings.TrimSpace(sm.AdminURL), "/") == prevAdminURL) &&
+			sameAdminIdentity(sm.AdminName, types.UID(sm.AdminUID), matchedAdmin) &&
+			(sm.ManagedInCluster || sm.DatasourceHash != "") {
+			wasManagedInCluster = true
+		}
+	}
+	if !wasManagedInCluster {
+		if adminMeta := lookupAdminRecordedEndpointMeta(matchedAdmin, prevAdminURL); adminMeta != nil &&
+			(adminMeta.ManagedInCluster || adminMeta.DatasourceHash != "") {
+			wasManagedInCluster = true
+		}
+	}
+	if !wasManagedInCluster {
+		return false
+	}
+	if isPureExternalAdmin(matchedAdmin) {
+		return true
+	}
+	currentURL := strings.TrimRight(ResolveAdminURL(matchedAdmin), "/")
+	return currentURL != prevAdminURL
+}
+
 // isMigratingFromPreviousAdmin reports whether a resource whose Status.AdminURL was recorded against prevAdminURL
 // is now targeting a different XxlJobAdmin in namespace, even when the new target XxlJobAdmin is not yet created,
 // missing its Secret, or not yet ready.
@@ -795,17 +1395,25 @@ func isMigratingFromPreviousAdmin(
 	ctx context.Context,
 	reader client.Reader,
 	namespace, targetAdminName, prevAdminURL string,
+	savedMeta ...*syncedAdminEndpointMeta,
 ) (bool, error) {
 	prevAdminURL = strings.TrimRight(strings.TrimSpace(prevAdminURL), "/")
 	targetAdminName = strings.TrimSpace(targetAdminName)
 	if prevAdminURL == "" || targetAdminName == "" {
 		return false, nil
 	}
+	var metaArg *syncedAdminEndpointMeta
+	if len(savedMeta) > 0 {
+		metaArg = savedMeta[0]
+	}
 	var targetAdmin xxljobv1alpha1.XxlJobAdmin
 	err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: targetAdminName}, &targetAdmin)
 	if err == nil {
 		targetURL := strings.TrimRight(ResolveAdminURL(&targetAdmin), "/")
 		if targetURL == prevAdminURL {
+			return false, nil
+		}
+		if isSameManagedAdminDBUpdate(&targetAdmin, prevAdminURL, metaArg) {
 			return false, nil
 		}
 		targetStatusURL := strings.TrimRight(strings.TrimSpace(targetAdmin.Status.AdminURL), "/")
@@ -833,7 +1441,7 @@ func isMigratingFromPreviousAdmin(
 			continue
 		}
 		if strings.TrimRight(ResolveAdminURL(item), "/") == prevAdminURL ||
-			strings.TrimRight(strings.TrimSpace(item.Status.AdminURL), "/") == prevAdminURL {
+			adminHasRecordedPreviousURL(item, prevAdminURL) {
 			return true, nil
 		}
 	}
@@ -854,7 +1462,7 @@ func isPreviousAdminDeleting(ctx context.Context, reader client.Reader, namespac
 	for i := range adminList.Items {
 		item := &adminList.Items[i]
 		matches := strings.TrimRight(ResolveAdminURL(item), "/") == prevAdminURL ||
-			strings.TrimRight(strings.TrimSpace(item.Status.AdminURL), "/") == prevAdminURL
+			adminHasRecordedPreviousURL(item, prevAdminURL)
 		if !matches {
 			continue
 		}

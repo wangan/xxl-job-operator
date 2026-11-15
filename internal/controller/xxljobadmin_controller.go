@@ -118,11 +118,19 @@ func (r *XxlJobAdminReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return ctrl.Result{}, err
 		}
 		adminURL := ResolveAdminURL(&admin)
+		desiredEndpointMeta := encodeSyncedAdminEndpointMeta(&admin, adminURL)
+		prevEndpointCond := meta.FindStatusCondition(admin.Status.Conditions, ConditionAdminEndpointSynced)
+		endpointCondChanged := desiredEndpointMeta != "" && (prevEndpointCond == nil || prevEndpointCond.Status != metav1.ConditionTrue || prevEndpointCond.Message != desiredEndpointMeta)
 		if admin.Status.Phase != "Running" ||
 			admin.Status.ReadyReplicas != 0 ||
 			admin.Status.AdminURL != adminURL ||
-			admin.Status.ObservedGeneration != admin.Generation {
+			admin.Status.ObservedGeneration != admin.Generation ||
+			endpointCondChanged {
 			prevAdminURL := admin.Status.AdminURL
+			if prevAdminURL != "" && strings.TrimRight(strings.TrimSpace(prevAdminURL), "/") != strings.TrimRight(strings.TrimSpace(adminURL), "/") {
+				recordPreviousAdminURLCondition(&admin, prevAdminURL)
+			}
+			syncAdminCurrentEndpointCondition(&admin, adminURL)
 			admin.Status.Phase = "Running"
 			admin.Status.ReadyReplicas = 0
 			admin.Status.AdminURL = adminURL
@@ -139,6 +147,8 @@ func (r *XxlJobAdminReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			}
 			if prevAdminURL != "" && prevAdminURL != adminURL {
 				evictClientCacheByAdminURL(prevAdminURL)
+			} else if endpointCondChanged {
+				evictClientCacheByAdminURL(adminURL)
 			}
 		}
 		if admin.Spec.Auth.PasswordSecretRef != nil || admin.Spec.Auth.AccessTokenSecretRef != nil {
@@ -209,6 +219,8 @@ func (r *XxlJobAdminReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			c := &deploy.Spec.Template.Spec.Containers[0]
 			c.Name = desiredContainer.Name
 			c.Image = desiredContainer.Image
+			c.Command = desiredContainer.Command
+			c.Args = desiredContainer.Args
 			c.Env = desiredContainer.Env
 			c.Resources = desiredContainer.Resources
 			c.Ports = desiredContainer.Ports
@@ -264,12 +276,20 @@ func (r *XxlJobAdminReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		reason = "ReplicasReady"
 	}
 	adminURL := ResolveAdminURL(&admin)
+	desiredEndpointMeta := encodeSyncedAdminEndpointMeta(&admin, adminURL)
+	prevEndpointCond := meta.FindStatusCondition(admin.Status.Conditions, ConditionAdminEndpointSynced)
+	endpointCondChanged := desiredEndpointMeta != "" && (prevEndpointCond == nil || prevEndpointCond.Status != metav1.ConditionTrue || prevEndpointCond.Message != desiredEndpointMeta)
 
 	if admin.Status.Phase != phase ||
 		admin.Status.ReadyReplicas != readyReplicas ||
 		admin.Status.AdminURL != adminURL ||
-		admin.Status.ObservedGeneration != admin.Generation {
+		admin.Status.ObservedGeneration != admin.Generation ||
+		endpointCondChanged {
 		prevAdminURL := admin.Status.AdminURL
+		if prevAdminURL != "" && strings.TrimRight(strings.TrimSpace(prevAdminURL), "/") != strings.TrimRight(strings.TrimSpace(adminURL), "/") {
+			recordPreviousAdminURLCondition(&admin, prevAdminURL)
+		}
+		syncAdminCurrentEndpointCondition(&admin, adminURL)
 		admin.Status.Phase = phase
 		admin.Status.ReadyReplicas = readyReplicas
 		admin.Status.AdminURL = adminURL
@@ -287,6 +307,8 @@ func (r *XxlJobAdminReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		if prevAdminURL != "" && prevAdminURL != adminURL {
 			evictClientCacheByAdminURL(prevAdminURL)
+		} else if endpointCondChanged {
+			evictClientCacheByAdminURL(adminURL)
 		}
 	}
 	if admin.Spec.Datasource.PasswordSecretRef != nil ||
@@ -354,31 +376,51 @@ func (r *XxlJobAdminReconciler) countReferencingExecutors(ctx context.Context, a
 		return 0, err
 	}
 
-	candidateURLs := make(map[string]bool, 2)
+	candidateURLs := make(map[string]bool, 4)
 	if u := strings.TrimRight(ResolveAdminURL(admin), "/"); u != "" {
 		candidateURLs[u] = true
 	}
 	if su := strings.TrimRight(strings.TrimSpace(admin.Status.AdminURL), "/"); su != "" {
 		candidateURLs[su] = true
 	}
+	for _, pu := range extractPreviousAdminURLs(admin) {
+		if pu != "" {
+			candidateURLs[pu] = true
+		}
+	}
 
-	if len(candidateURLs) > 0 {
-		var adminList xxljobv1alpha1.XxlJobAdminList
-		if err := r.List(ctx, &adminList, client.InNamespace(admin.Namespace)); err != nil {
-			return 0, err
+	otherOwnedURLs := make(map[string]bool)
+	var adminList xxljobv1alpha1.XxlJobAdminList
+	if err := r.List(ctx, &adminList, client.InNamespace(admin.Namespace)); err != nil {
+		return 0, err
+	}
+	for i := range adminList.Items {
+		other := &adminList.Items[i]
+		if other.Name == admin.Name || !other.DeletionTimestamp.IsZero() {
+			continue
 		}
-		for i := range adminList.Items {
-			other := &adminList.Items[i]
-			if other.Name == admin.Name || !other.DeletionTimestamp.IsZero() {
-				continue
-			}
-			if ou := strings.TrimRight(ResolveAdminURL(other), "/"); ou != "" {
-				delete(candidateURLs, ou)
-			}
-			if osu := strings.TrimRight(strings.TrimSpace(other.Status.AdminURL), "/"); osu != "" {
-				delete(candidateURLs, osu)
-			}
+		if ou := strings.TrimRight(ResolveAdminURL(other), "/"); ou != "" {
+			otherOwnedURLs[ou] = true
+			delete(candidateURLs, ou)
 		}
+		if osu := strings.TrimRight(strings.TrimSpace(other.Status.AdminURL), "/"); osu != "" {
+			otherOwnedURLs[osu] = true
+			delete(candidateURLs, osu)
+		}
+	}
+
+	matchesSavedEndpointAdmin := func(conds []metav1.Condition, statusURL string) bool {
+		if statusURL != "" && otherOwnedURLs[statusURL] {
+			return false
+		}
+		saved := extractSyncedAdminEndpointMeta(conds)
+		if saved == nil || saved.AdminName != admin.Name {
+			return false
+		}
+		if saved.AdminUID != "" && admin.UID != "" && saved.AdminUID != string(admin.UID) {
+			return false
+		}
+		return true
 	}
 
 	count := 0
@@ -393,26 +435,26 @@ func (r *XxlJobAdminReconciler) countReferencingExecutors(ctx context.Context, a
 			continue
 		}
 		itemAdminURL := strings.TrimRight(strings.TrimSpace(item.Status.AdminURL), "/")
-		if itemAdminURL != "" && candidateURLs[itemAdminURL] &&
-			(item.Status.JobGroupID > 0 ||
-				len(item.Status.RegisteredAddresses) > 0 ||
-				len(item.Status.DrainedAddresses) > 0 ||
-				len(item.Status.RegistryKeepAliveAddresses) > 0) {
+		hasRemoteExecState := item.Status.JobGroupID > 0 ||
+			len(item.Status.RegisteredAddresses) > 0 ||
+			len(item.Status.DrainedAddresses) > 0 ||
+			len(item.Status.RegistryKeepAliveAddresses) > 0
+		if hasRemoteExecState &&
+			((itemAdminURL != "" && candidateURLs[itemAdminURL]) || matchesSavedEndpointAdmin(item.Status.Conditions, itemAdminURL)) {
 			count++
 		}
 	}
 
-	if len(candidateURLs) > 0 {
-		var taskList xxljobv1alpha1.XxlJobTaskList
-		if err := r.List(ctx, &taskList, client.InNamespace(admin.Namespace)); err != nil {
-			return 0, err
-		}
-		for i := range taskList.Items {
-			t := &taskList.Items[i]
-			taskAdminURL := strings.TrimRight(strings.TrimSpace(t.Status.AdminURL), "/")
-			if (t.Status.JobID > 0 || t.Status.JobGroupID > 0) && taskAdminURL != "" && candidateURLs[taskAdminURL] {
-				count++
-			}
+	var taskList xxljobv1alpha1.XxlJobTaskList
+	if err := r.List(ctx, &taskList, client.InNamespace(admin.Namespace)); err != nil {
+		return 0, err
+	}
+	for i := range taskList.Items {
+		t := &taskList.Items[i]
+		taskAdminURL := strings.TrimRight(strings.TrimSpace(t.Status.AdminURL), "/")
+		if (t.Status.JobID > 0 || t.Status.JobGroupID > 0) &&
+			((taskAdminURL != "" && candidateURLs[taskAdminURL]) || matchesSavedEndpointAdmin(t.Status.Conditions, taskAdminURL)) {
+			count++
 		}
 	}
 
@@ -520,6 +562,11 @@ func (r *XxlJobAdminReconciler) buildDeployment(ctx context.Context, admin *xxlj
 		}
 	}
 
+	var adminCommand []string
+	if admin.Spec.Auth.AccessTokenSecretRef != nil && admin.Spec.Auth.AccessTokenSecretRef.Name != "" {
+		adminCommand = buildAdminContainerCommand()
+	}
+
 	deploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      admin.Name,
@@ -541,6 +588,7 @@ func (r *XxlJobAdminReconciler) buildDeployment(ctx context.Context, admin *xxlj
 						{
 							Name:      "xxl-job-admin",
 							Image:     image,
+							Command:   adminCommand,
 							Env:       envVars,
 							Resources: admin.Spec.Resources,
 							Ports: []corev1.ContainerPort{
@@ -561,6 +609,21 @@ func (r *XxlJobAdminReconciler) buildDeployment(ctx context.Context, admin *xxlj
 		}
 	}
 	return deploy, nil
+}
+
+// buildAdminContainerCommand normalizes XXL_JOB_ACCESSTOKEN and XXL_JOB_ACCESS_TOKEN in container memory
+// (stripping CR/LF and trimming leading/trailing whitespace identically to Operator sanitizeTokenValue,
+// ProxyExecutor, Sidecar, and PreStop hooks) before exec'ing the XXL-JOB Admin JVM without exposing
+// secret plaintext in Deployment.Spec or /proc/*/cmdline.
+func buildAdminContainerCommand() []string {
+	script := `norm_tok() { v="$1"; cr="$(printf '\r')"; lf="$(printf '\nx')"; lf="${lf%x}"; ` +
+		`while [ "${v#*"$cr"}" != "$v" ]; do v="${v%%"$cr"*}${v#*"$cr"}"; done; ` +
+		`while [ "${v#*"$lf"}" != "$v" ]; do v="${v%%"$lf"*}${v#*"$lf"}"; done; ` +
+		`v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"; printf '%s' "$v"; }; ` +
+		`if [ -n "${XXL_JOB_ACCESSTOKEN+x}" ]; then XXL_JOB_ACCESSTOKEN="$(norm_tok "$XXL_JOB_ACCESSTOKEN")"; export XXL_JOB_ACCESSTOKEN; fi; ` +
+		`if [ -n "${XXL_JOB_ACCESS_TOKEN+x}" ]; then XXL_JOB_ACCESS_TOKEN="$(norm_tok "$XXL_JOB_ACCESS_TOKEN")"; export XXL_JOB_ACCESS_TOKEN; fi; ` +
+		`exec java ${JAVA_OPTS:-} ${LOG_HOME:+-DLOG_HOME="$LOG_HOME"} -jar /app.jar ${PARAMS:-}`
+	return []string{"/bin/sh", "-c", script}
 }
 
 // computeCredentialsHash computes a salted SHA-256 digest of all Secret values consumed by the Admin Pod
@@ -594,6 +657,9 @@ func (r *XxlJobAdminReconciler) computeCredentialsHash(ctx context.Context, admi
 		val, ok := sec.Data[ref.Key]
 		if !ok {
 			return "", fmt.Errorf("key %q not found in Secret %s/%s for credentials hash", ref.Key, admin.Namespace, ref.Name)
+		}
+		if ref == admin.Spec.Auth.AccessTokenSecretRef && sanitizeTokenValue(string(val)) == "" {
+			return "", fmt.Errorf("accessToken key %q in Secret %s/%s must not be empty or whitespace-only", ref.Key, admin.Namespace, ref.Name)
 		}
 		_, _ = fmt.Fprintf(h, "%d:%s/%s/%s=%s;", idx, sec.UID, ref.Name, ref.Key, string(val))
 	}

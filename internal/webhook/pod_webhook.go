@@ -62,15 +62,18 @@ const (
 	AnnotationSidecarEnableGlue = "xxljob.io/sidecar-enable-glue"
 	// AnnotationSidecarSharedSecret optionally overrides the per-pod shared secret between sidecar and business container.
 	AnnotationSidecarSharedSecret = "xxljob.io/sidecar-shared-secret"
+	// AnnotationSidecarRunAsUser optionally specifies an explicit non-root numeric UID (>0) for the injected sidecar container.
+	AnnotationSidecarRunAsUser = "xxljob.io/sidecar-run-as-user"
 	// AnnotationInjectedStatus marks that the pod has been mutated by xxl-job-operator.
 	AnnotationInjectedStatus = "xxljob.io/injected"
 
-	SidecarContainerName   = "xxl-job-sidecar"
-	SharedVolumeName       = "xxl-job-shared"
-	SharedMountPath        = "/xxl-job/shared"
-	SidecarSpoolVolumeName = "xxl-job-sidecar-spool"
-	SidecarSpoolMountPath  = "/xxl-job/spool"
-	SidecarCallbackDir     = "/xxl-job/spool/callbacks"
+	SidecarContainerName     = "xxl-job-sidecar"
+	DefaultSidecarNonRootUID = int64(65532)
+	SharedVolumeName         = "xxl-job-shared"
+	SharedMountPath          = "/xxl-job/shared"
+	SidecarSpoolVolumeName   = "xxl-job-sidecar-spool"
+	SidecarSpoolMountPath    = "/xxl-job/spool"
+	SidecarCallbackDir       = "/xxl-job/spool/callbacks"
 )
 
 var knownInfraSidecarNames = map[string]bool{
@@ -331,7 +334,15 @@ func (m *PodExecutorMutator) MutatePodOrError(ctx context.Context, pod *corev1.P
 		if tokenSecretRef == nil && accessToken == "" {
 			return false, fmt.Errorf("sidecar injection denied: a valid SecretKeyRef or explicit non-default accessToken is required")
 		}
-		m.mutateSidecarPod(pod, appName, adminURL, accessToken, tokenSecretRef, execPort, targetPort, drainSecs, enableGlue, crAddressType)
+		var sidecarRunAsUser *int64
+		if rawUID := strings.TrimSpace(pod.Annotations[AnnotationSidecarRunAsUser]); rawUID != "" {
+			parsedUID, parseErr := strconv.ParseInt(rawUID, 10, 64)
+			if parseErr != nil || parsedUID <= 0 {
+				return false, fmt.Errorf("sidecar injection denied: %s must be a positive non-root integer UID (>0), got %q", AnnotationSidecarRunAsUser, rawUID)
+			}
+			sidecarRunAsUser = &parsedUID
+		}
+		m.mutateSidecarPod(pod, appName, adminURL, accessToken, tokenSecretRef, execPort, targetPort, drainSecs, enableGlue, crAddressType, sidecarRunAsUser)
 	}
 
 	// Ensure TerminationGracePeriodSeconds accommodates 2x drain window + buffer (fixes R6-P1-11)
@@ -561,6 +572,7 @@ func (m *PodExecutorMutator) mutateSidecarPod(
 	execPort, targetPort, drainSecs int,
 	enableGlue bool,
 	crAddressType *int,
+	explicitSidecarRunAsUser *int64,
 ) {
 	for i := range pod.Spec.Containers {
 		if pod.Spec.Containers[i].Name == SidecarContainerName {
@@ -712,6 +724,25 @@ func (m *PodExecutorMutator) mutateSidecarPod(
 	runAsNonRoot := true
 	allowPrivilegeEscalation := false
 	readOnlyRootFS := true
+	var sidecarRunAsUser *int64
+	var sidecarRunAsGroup *int64
+	if explicitSidecarRunAsUser != nil {
+		uid := *explicitSidecarRunAsUser
+		sidecarRunAsUser = &uid
+	} else if pod.Spec.SecurityContext != nil && pod.Spec.SecurityContext.RunAsUser != nil && *pod.Spec.SecurityContext.RunAsUser <= 0 {
+		// Override Pod-level root/non-positive runAsUser so Kubelet verifyRunAsNonRoot does not reject
+		// the sidecar with "container's runAsUser breaks non-root policy", while keeping RunAsUser nil
+		// when Pod RunAsUser is unset or positive for OpenShift restricted-v2 SCC compatibility.
+		uid := DefaultSidecarNonRootUID
+		sidecarRunAsUser = &uid
+	}
+	if pod.Spec.SecurityContext != nil && pod.Spec.SecurityContext.RunAsGroup != nil && *pod.Spec.SecurityContext.RunAsGroup <= 0 {
+		gid := DefaultSidecarNonRootUID
+		if sidecarRunAsUser != nil {
+			gid = *sidecarRunAsUser
+		}
+		sidecarRunAsGroup = &gid
+	}
 
 	sidecar := corev1.Container{
 		Name:  SidecarContainerName,
@@ -746,6 +777,8 @@ func (m *PodExecutorMutator) mutateSidecarPod(
 		},
 		SecurityContext: &corev1.SecurityContext{
 			RunAsNonRoot:             &runAsNonRoot,
+			RunAsUser:                sidecarRunAsUser,
+			RunAsGroup:               sidecarRunAsGroup,
 			AllowPrivilegeEscalation: &allowPrivilegeEscalation,
 			ReadOnlyRootFilesystem:   &readOnlyRootFS,
 			Capabilities: &corev1.Capabilities{

@@ -35,7 +35,10 @@ import (
 	"github.com/xxl-job/xxl-job-operator/pkg/xxlclient"
 )
 
-const ExecutorFinalizer = "xxljob.io/executor-finalizer"
+const (
+	ExecutorFinalizer             = "xxljob.io/executor-finalizer"
+	ConditionServiceBackendActive = "ServiceBackendActive"
+)
 
 // XxlJobExecutorReconciler reconciles a XxlJobExecutor object.
 type XxlJobExecutorReconciler struct {
@@ -97,9 +100,12 @@ func (r *XxlJobExecutorReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				logger.Info("Bypassing remote JobGroup cleanup because namespace is terminating or force-delete/timeout is active")
 			} else {
 				currentAdminURL := ResolveAdminURL(adminCR)
-				sameAdmin := execCR.Status.AdminURL == "" ||
-					strings.TrimRight(execCR.Status.AdminURL, "/") == strings.TrimRight(currentAdminURL, "/")
-				if !sameAdmin {
+				prevExecMeta := extractSyncedAdminEndpointMeta(execCR.Status.Conditions)
+				adminReplaced := isAdminInstanceOrDBReplaced(adminCR, prevExecMeta)
+				sameAdmin := !adminReplaced && (execCR.Status.AdminURL == "" ||
+					strings.TrimRight(execCR.Status.AdminURL, "/") == strings.TrimRight(currentAdminURL, "/") ||
+					isSameManagedAdminDBUpdate(adminCR, execCR.Status.AdminURL, prevExecMeta))
+				if !sameAdmin && execCR.Status.AdminURL != "" && strings.TrimRight(execCR.Status.AdminURL, "/") != strings.TrimRight(currentAdminURL, "/") {
 					if prevErr := r.cleanupExecutorOnPreviousAdmin(ctx, reader, &execCR, execCR.Status.AdminURL, forceOrNsTerminating, bypassRemote); prevErr != nil {
 						logger.Error(prevErr, "Failed to clean up executor on previous XxlJobAdmin during deletion, will retry", "recordedAdminURL", execCR.Status.AdminURL)
 						return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -147,8 +153,9 @@ func (r *XxlJobExecutorReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// the old JobGroup on the previous Admin BEFORE resolving/validating the new target Admin so missing/broken
 	// new Admin configs never leave stale registrations on the old Admin or deadlock old Admin deletion.
 	prevAdminURL := strings.TrimRight(strings.TrimSpace(execCR.Status.AdminURL), "/")
+	prevExecMeta := extractSyncedAdminEndpointMeta(execCR.Status.Conditions)
 	prevAdminCleaned := false
-	migratingPrevAdmin, migCheckErr := isMigratingFromPreviousAdmin(ctx, reader, execCR.Namespace, execCR.Spec.AdminRef.Name, prevAdminURL)
+	migratingPrevAdmin, migCheckErr := isMigratingFromPreviousAdmin(ctx, reader, execCR.Namespace, execCR.Spec.AdminRef.Name, prevAdminURL, prevExecMeta)
 	if migCheckErr != nil {
 		return ctrl.Result{}, migCheckErr
 	}
@@ -177,7 +184,9 @@ func (r *XxlJobExecutorReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
-	isCrossAdminMigration := migratingPrevAdmin || (prevAdminURL != "" && prevAdminURL != strings.TrimRight(adminURL, "/"))
+	adminReplaced := isAdminInstanceOrDBReplaced(adminCR, prevExecMeta)
+	sameManagedDB := !adminReplaced && isSameManagedAdminDBUpdate(adminCR, prevAdminURL, prevExecMeta)
+	isCrossAdminMigration := migratingPrevAdmin || (prevAdminURL != "" && prevAdminURL != strings.TrimRight(adminURL, "/") && !sameManagedDB)
 	if !migratingPrevAdmin && isCrossAdminMigration {
 		if cleanErr := r.cleanupExecutorOnPreviousAdmin(ctx, reader, &execCR, prevAdminURL, false, false); cleanErr != nil {
 			logger.Error(cleanErr, "Failed to clean up executor on previous XxlJobAdmin during cross-Admin migration, will retry",
@@ -186,6 +195,13 @@ func (r *XxlJobExecutorReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		prevAdminCleaned = clearPreviousAdminStatus(&execCR)
+	}
+	hasContinuousAdminState := !isCrossAdminMigration && !adminReplaced
+	if adminReplaced && !isCrossAdminMigration {
+		xxlCli.InvalidateGroupSnapshot(0)
+		if execCR.Status.JobGroupID > 0 {
+			xxlCli.InvalidateGroupSnapshot(execCR.Status.JobGroupID)
+		}
 	}
 
 	port := execCR.Spec.ExecutorPort
@@ -201,7 +217,7 @@ func (r *XxlJobExecutorReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	var registryErrors []string
 
 	prevDrainedSet := make(map[string]bool, len(execCR.Status.DrainedAddresses))
-	if !isCrossAdminMigration {
+	if hasContinuousAdminState {
 		for _, addr := range execCR.Status.DrainedAddresses {
 			prevDrainedSet[addr] = true
 		}
@@ -222,6 +238,12 @@ func (r *XxlJobExecutorReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		proxyBaseAddr = "http://xxl-job-operator-proxy.xxl-job-system.svc.cluster.local:9999/"
 	}
 
+	isServiceDNSMode := execCR.Spec.Mode != xxljobv1alpha1.ExecutorModeK8sJobProxy &&
+		execCR.Spec.UseServiceDNS &&
+		strings.TrimSpace(execCR.Spec.ServiceName) != ""
+	prevSvcBackendCond := meta.FindStatusCondition(execCR.Status.Conditions, ConditionServiceBackendActive)
+	svcBackendCondChanged := false
+
 	switch execCR.Spec.Mode {
 	case xxljobv1alpha1.ExecutorModeK8sJobProxy:
 		// Stream 3: K8s Native Job Proxy mode with tenant-scoped routing path /proxy/<ns>/<executor>/ (fixes P0-7 & R4-P0-2)
@@ -230,9 +252,57 @@ func (r *XxlJobExecutorReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	default:
 		// Stream 1 (Resident) & Stream 2 (Sidecar)
-		if execCR.Spec.UseServiceDNS && execCR.Spec.ServiceName != "" {
-			dnsURL := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/", execCR.Spec.ServiceName, execCR.Namespace, port)
-			activeAddresses = []string{dnsURL}
+		if isServiceDNSMode {
+			svcName := strings.TrimSpace(execCR.Spec.ServiceName)
+			dnsURL := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/", svcName, execCR.Namespace, port)
+			readyBackends, keepAliveBackends, backendErr := evaluateServiceDNSBackends(ctx, r.Client, &execCR)
+			if backendErr != nil {
+				if prevAdminCleaned {
+					r.updateErrorStatus(ctx, &execCR, fmt.Sprintf("Inspect Service DNS backends failed: %v", backendErr), true)
+				}
+				return ctrl.Result{}, backendErr
+			}
+
+			desiredSvcStatus := metav1.ConditionFalse
+			svcReason := "NoActiveBackends"
+			svcMsg := fmt.Sprintf("Service %s/%s has no active backends", execCR.Namespace, svcName)
+			if readyBackends > 0 {
+				activeAddresses = []string{dnsURL}
+				desiredSvcStatus = metav1.ConditionTrue
+				svcReason = "BackendsReady"
+				svcMsg = fmt.Sprintf("Service %s/%s has %d ready backend(s)", execCR.Namespace, svcName, readyBackends)
+			} else if keepAliveBackends > 0 {
+				drainedSet[dnsURL] = true
+				if addressType == 1 {
+					registryKeepAliveSet[dnsURL] = true
+					desiredSvcStatus = metav1.ConditionTrue
+					svcReason = "BackendsDraining"
+					svcMsg = fmt.Sprintf("Service %s/%s has 0 ready backends and %d draining backend(s) in keep-alive window",
+						execCR.Namespace, svcName, keepAliveBackends)
+				} else if addressType == 0 {
+					removedSet[dnsURL] = true
+					if !prevDrainedSet[dnsURL] || prevRegUnhealthy {
+						if err := xxlCli.RemoveExecutor(ctx, execCR.Spec.AppName, dnsURL); err != nil {
+							RegistryHeartbeatErrorsTotal.WithLabelValues(execCR.Namespace, execCR.Name).Inc()
+							registryErrors = append(registryErrors, err.Error())
+						}
+					}
+					svcReason = "BackendsDrainingAutoMode"
+					svcMsg = fmt.Sprintf("Service %s/%s has 0 ready backends under addressType=0", execCR.Namespace, svcName)
+				}
+			}
+
+			svcBackendCondChanged = prevSvcBackendCond == nil ||
+				prevSvcBackendCond.Status != desiredSvcStatus ||
+				prevSvcBackendCond.Reason != svcReason ||
+				prevSvcBackendCond.Message != svcMsg
+			meta.SetStatusCondition(&execCR.Status.Conditions, metav1.Condition{
+				Type:               ConditionServiceBackendActive,
+				Status:             desiredSvcStatus,
+				Reason:             svcReason,
+				Message:            svcMsg,
+				LastTransitionTime: metav1.Now(),
+			})
 		} else if len(execCR.Spec.StaticAddresses) > 0 {
 			for _, a := range execCR.Spec.StaticAddresses {
 				activeAddresses = append(activeAddresses, ensureTrailingSlash(a))
@@ -301,8 +371,13 @@ func (r *XxlJobExecutorReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
-	// Register active addresses and draining-keepalive Pod addresses in xxl_job_registry when backed by
-	// K8sJobProxy, PodSelector, or addressType=0 (reinforced by RegistryHeartbeatRunner every 20s)
+	if !isServiceDNSMode && prevSvcBackendCond != nil {
+		svcBackendCondChanged = true
+		meta.RemoveStatusCondition(&execCR.Status.Conditions, ConditionServiceBackendActive)
+	}
+
+	// Register active addresses and draining-keepalive Pod/Service addresses in xxl_job_registry when backed by
+	// K8sJobProxy, PodSelector, active ServiceDNS, or addressType=0 (reinforced by RegistryHeartbeatRunner every 20s)
 	// (fixes R4-P0-1, R5-P1-2, R5-P1-5, R6-P2-8, R8-P1-5).
 	shouldHeartbeatRegistry := shouldHeartbeatExecutorRegistry(&execCR)
 	activeSet := make(map[string]bool, len(activeAddresses))
@@ -324,10 +399,10 @@ func (r *XxlJobExecutorReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}
 
-	// Deregister Pods that were previously in RegisteredAddresses, DrainedAddresses, or RegistryKeepAliveAddresses
+	// Deregister Pods/Services that were previously in RegisteredAddresses, DrainedAddresses, or RegistryKeepAliveAddresses
 	// and are no longer active or running in the cluster from xxl_job_registry (fixes R5-P1-5, R6-P1-10, R7-P1-8, R8-P1-5, R10-P1-1).
-	usesExecutorRegistry := shouldHeartbeatRegistry || (addressType == 0 && execCR.Spec.PodSelector != nil)
-	if !isCrossAdminMigration && usesExecutorRegistry && isExecutorAppNameSynced(&execCR) {
+	usesExecutorRegistry := shouldHeartbeatRegistry || isServiceDNSMode || (addressType == 0 && execCR.Spec.PodSelector != nil)
+	if hasContinuousAdminState && usesExecutorRegistry && isExecutorAppNameSynced(&execCR) {
 		prevAll := append([]string{}, execCR.Status.RegisteredAddresses...)
 		prevAll = append(prevAll, execCR.Status.DrainedAddresses...)
 		prevAll = append(prevAll, execCR.Status.RegistryKeepAliveAddresses...)
@@ -381,7 +456,7 @@ func (r *XxlJobExecutorReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	// If Spec.AppName changed in-place on the same Admin (producing a new JobGroupID), migrate any owned tasks
 	// in the previous JobGroup to syncedGroup.ID and remove the orphaned previous JobGroup before overwriting Status.JobGroupID (fixes R11-P1-1).
-	if !isCrossAdminMigration && execCR.Status.JobGroupID > 0 && execCR.Status.JobGroupID != syncedGroup.ID {
+	if hasContinuousAdminState && execCR.Status.JobGroupID > 0 && execCR.Status.JobGroupID != syncedGroup.ID {
 		if migErr := r.migrateAndCleanupPreviousJobGroupOnSameAdmin(ctx, xxlCli, &execCR, execCR.Status.JobGroupID, syncedGroup.ID); migErr != nil {
 			r.updateErrorStatusWithAddresses(ctx, &execCR, activeAddresses, drainedAddresses, keepAliveAddresses,
 				fmt.Sprintf("Failed to migrate/clean up previous JobGroup %d on XXL-JOB Admin: %v", execCR.Status.JobGroupID, migErr))
@@ -401,6 +476,11 @@ func (r *XxlJobExecutorReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	prevAppCond := meta.FindStatusCondition(execCR.Status.Conditions, "AppNameSynced")
 	appCondChanged := prevAppCond == nil || prevAppCond.Status != metav1.ConditionTrue || prevAppCond.Message != execCR.Spec.AppName
 
+	endpointMetaMsg := encodeSyncedAdminEndpointMeta(adminCR, adminURL)
+	prevEndpointCond := meta.FindStatusCondition(execCR.Status.Conditions, ConditionAdminEndpointSynced)
+	endpointCondChanged := endpointMetaMsg != "" &&
+		(prevEndpointCond == nil || prevEndpointCond.Status != metav1.ConditionTrue || prevEndpointCond.Message != endpointMetaMsg)
+
 	// Only write Status to APIServer if any meaningful field changed (prevents hot loops, fixes P0-1)
 	statusChanged := execCR.Status.JobGroupID != syncedGroup.ID ||
 		execCR.Status.AdminURL != adminURL ||
@@ -412,7 +492,9 @@ func (r *XxlJobExecutorReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		execCR.Status.TerminatingPodsDrained != len(drainedAddresses) ||
 		execCR.Status.Message != msg ||
 		regCondChanged ||
-		appCondChanged
+		appCondChanged ||
+		svcBackendCondChanged ||
+		endpointCondChanged
 
 	if statusChanged {
 		now := metav1.Now()
@@ -440,6 +522,15 @@ func (r *XxlJobExecutorReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			Message:            execCR.Spec.AppName,
 			LastTransitionTime: now,
 		})
+		if endpointMetaMsg != "" {
+			meta.SetStatusCondition(&execCR.Status.Conditions, metav1.Condition{
+				Type:               ConditionAdminEndpointSynced,
+				Status:             metav1.ConditionTrue,
+				Reason:             "EndpointSynced",
+				Message:            endpointMetaMsg,
+				LastTransitionTime: now,
+			})
+		}
 		if registryHealthy {
 			meta.SetStatusCondition(&execCR.Status.Conditions, metav1.Condition{
 				Type:               "RegistryHealthy",
@@ -501,7 +592,8 @@ func clearPreviousAdminStatus(execCR *xxljobv1alpha1.XxlJobExecutor) bool {
 		len(execCR.Status.RegistryKeepAliveAddresses) > 0 ||
 		execCR.Status.ActivePods != 0 ||
 		execCR.Status.TerminatingPodsDrained != 0 ||
-		meta.FindStatusCondition(execCR.Status.Conditions, "AppNameSynced") != nil
+		meta.FindStatusCondition(execCR.Status.Conditions, "AppNameSynced") != nil ||
+		meta.FindStatusCondition(execCR.Status.Conditions, ConditionAdminEndpointSynced) != nil
 	execCR.Status.JobGroupID = 0
 	execCR.Status.AdminURL = ""
 	execCR.Status.RegisteredAddresses = nil
@@ -510,6 +602,7 @@ func clearPreviousAdminStatus(execCR *xxljobv1alpha1.XxlJobExecutor) bool {
 	execCR.Status.ActivePods = 0
 	execCR.Status.TerminatingPodsDrained = 0
 	meta.RemoveStatusCondition(&execCR.Status.Conditions, "AppNameSynced")
+	meta.RemoveStatusCondition(&execCR.Status.Conditions, ConditionAdminEndpointSynced)
 	return changed
 }
 
@@ -582,42 +675,33 @@ func (r *XxlJobExecutorReconciler) cleanupExecutorOnPreviousAdmin(
 	bypassRemote bool,
 ) error {
 	prevAdminURL = strings.TrimRight(strings.TrimSpace(prevAdminURL), "/")
-	if prevAdminURL == "" {
+	if execCR == nil || prevAdminURL == "" {
 		return nil
 	}
-	var adminList xxljobv1alpha1.XxlJobAdminList
-	if err := r.List(ctx, &adminList, client.InNamespace(execCR.Namespace)); err != nil {
-		return err
+	fallbackAdminName := ""
+	if execCR.Spec.AdminRef.Namespace == "" || execCR.Spec.AdminRef.Namespace == execCR.Namespace {
+		fallbackAdminName = execCR.Spec.AdminRef.Name
 	}
-	var matchedAdmin *xxljobv1alpha1.XxlJobAdmin
-	var deletingMatch *xxljobv1alpha1.XxlJobAdmin
-	for i := range adminList.Items {
-		item := &adminList.Items[i]
-		if strings.TrimRight(ResolveAdminURL(item), "/") != prevAdminURL {
-			continue
-		}
-		if item.DeletionTimestamp.IsZero() {
-			matchedAdmin = item
-			break
-		}
-		if deletingMatch == nil {
-			deletingMatch = item
-		}
-	}
-	if matchedAdmin == nil {
-		matchedAdmin = deletingMatch
-	}
-	if matchedAdmin == nil {
+	savedMeta := extractSyncedAdminEndpointMeta(execCR.Status.Conditions)
+	matchedAdmin, prevCli, err := resolveReachablePreviousAdminClient(
+		ctx, r.Client, reader, r.ClientFactory,
+		execCR.Namespace, prevAdminURL, savedMeta, fallbackAdminName,
+	)
+	if matchedAdmin != nil && isRetiredManagedAdminEndpoint(matchedAdmin, prevAdminURL, savedMeta) {
 		return nil
 	}
-	bypassPrev := bypassRemote || (!matchedAdmin.DeletionTimestamp.IsZero() && shouldBypassRemoteCleanup(ctx, reader, matchedAdmin))
-	_, prevCli, err := ResolveAdminAndClientWithReader(ctx, r.Client, reader, r.ClientFactory,
-		xxljobv1alpha1.LocalObjectReference{Name: matchedAdmin.Name}, execCR.Namespace)
+	if matchedAdmin == nil && err == nil {
+		return nil
+	}
+	bypassPrev := bypassRemote || (matchedAdmin != nil && !matchedAdmin.DeletionTimestamp.IsZero() && shouldBypassRemoteCleanup(ctx, reader, matchedAdmin))
 	if err != nil {
 		if bypassPrev {
 			return nil
 		}
 		return err
+	}
+	if prevCli == nil {
+		return nil
 	}
 	// When cleaning up on a previous Admin (either during live cross-Admin migration or when deleting an executor
 	// whose AdminRef was already pointed to a different Admin), ignore business rejections on RemoveJobGroup (e.g., if
@@ -656,6 +740,18 @@ func (r *XxlJobExecutorReconciler) deterministicProxyAddress(execCR *xxljobv1alp
 	return buildScopedProxyURL(proxyBaseAddr, execCR.Namespace, execCR.Name)
 }
 
+func deterministicServiceDNSAddress(execCR *xxljobv1alpha1.XxlJobExecutor) string {
+	if execCR == nil || execCR.Spec.Mode == xxljobv1alpha1.ExecutorModeK8sJobProxy ||
+		!execCR.Spec.UseServiceDNS || strings.TrimSpace(execCR.Spec.ServiceName) == "" {
+		return ""
+	}
+	port := execCR.Spec.ExecutorPort
+	if port <= 0 {
+		port = 9999
+	}
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/", strings.TrimSpace(execCR.Spec.ServiceName), execCR.Namespace, port)
+}
+
 func (r *XxlJobExecutorReconciler) cleanupExecutorOnAdminInternal(
 	ctx context.Context,
 	xxlCli *xxlclient.Client,
@@ -666,8 +762,11 @@ func (r *XxlJobExecutorReconciler) cleanupExecutorOnAdminInternal(
 	bypassRemote bool,
 ) error {
 	addressType := resolveExecutorAddressType(execCR)
-	usesExecutorRegistry := shouldHeartbeatExecutorRegistry(execCR) || (addressType == 0 && execCR.Spec.PodSelector != nil)
+	isServiceDNS := execCR != nil && execCR.Spec.Mode != xxljobv1alpha1.ExecutorModeK8sJobProxy &&
+		execCR.Spec.UseServiceDNS && strings.TrimSpace(execCR.Spec.ServiceName) != ""
+	usesExecutorRegistry := shouldHeartbeatExecutorRegistry(execCR) || isServiceDNS || (addressType == 0 && execCR.Spec.PodSelector != nil)
 	proxyAddr := r.deterministicProxyAddress(execCR)
+	dnsAddr := deterministicServiceDNSAddress(execCR)
 
 	deregisterForAppName := func(appName string) {
 		if appName == "" {
@@ -693,7 +792,11 @@ func (r *XxlJobExecutorReconciler) cleanupExecutorOnAdminInternal(
 			}
 		}
 		if proxyAddr != "" && !deregistered[proxyAddr] {
+			deregistered[proxyAddr] = true
 			_ = xxlCli.RemoveExecutor(ctx, appName, proxyAddr)
+		}
+		if dnsAddr != "" && !deregistered[dnsAddr] {
+			_ = xxlCli.RemoveExecutor(ctx, appName, dnsAddr)
 		}
 	}
 
@@ -713,10 +816,15 @@ func (r *XxlJobExecutorReconciler) cleanupExecutorOnAdminInternal(
 				deregisterForAppName(prevGrp.AppName)
 			}
 		}
-	} else if !deregisterRecordedAddresses && proxyAddr != "" && execCR.Spec.AppName != "" {
-		// Even when Status.RegisteredAddresses belonged to a previous Admin, K8sJobProxy's deterministic
-		// scoped proxy URL on the current Admin can be safely deregistered.
-		_ = xxlCli.RemoveExecutor(ctx, execCR.Spec.AppName, proxyAddr)
+	} else if !deregisterRecordedAddresses && execCR.Spec.AppName != "" {
+		// Even when Status.RegisteredAddresses belonged to a previous Admin, deterministic scoped proxy or
+		// Service DNS URLs on the current Admin can be safely deregistered.
+		if proxyAddr != "" {
+			_ = xxlCli.RemoveExecutor(ctx, execCR.Spec.AppName, proxyAddr)
+		}
+		if dnsAddr != "" {
+			_ = xxlCli.RemoveExecutor(ctx, execCR.Spec.AppName, dnsAddr)
+		}
 	}
 
 	removeGroupByID := func(groupID int, lookupAppName string) error {
@@ -892,7 +1000,9 @@ func (r *XxlJobExecutorReconciler) migrateAndCleanupPreviousJobGroupOnSameAdmin(
 	xxlCli.InvalidateGroupSnapshot(newGroupID)
 
 	addressType := resolveExecutorAddressType(execCR)
-	usesExecutorRegistry := shouldHeartbeatExecutorRegistry(execCR) || (addressType == 0 && execCR.Spec.PodSelector != nil)
+	isServiceDNS := execCR != nil && execCR.Spec.Mode != xxljobv1alpha1.ExecutorModeK8sJobProxy &&
+		execCR.Spec.UseServiceDNS && strings.TrimSpace(execCR.Spec.ServiceName) != ""
+	usesExecutorRegistry := shouldHeartbeatExecutorRegistry(execCR) || isServiceDNS || (addressType == 0 && execCR.Spec.PodSelector != nil)
 	if usesExecutorRegistry {
 		deregisterOld := func(oldAppName string) {
 			if oldAppName == "" || oldAppName == execCR.Spec.AppName {
@@ -983,7 +1093,8 @@ func (r *XxlJobExecutorReconciler) countReferencingTasks(ctx context.Context, ex
 		// while its remote XXL-JOB Admin task is still recorded in execCR.Status.JobGroupID.
 		if execCR.Status.JobGroupID > 0 && item.Status.JobGroupID == execCR.Status.JobGroupID {
 			taskAdminURL := strings.TrimRight(strings.TrimSpace(item.Status.AdminURL), "/")
-			sameRecordedAdmin := execAdminURL == "" || taskAdminURL == "" || execAdminURL == taskAdminURL
+			sameRecordedAdmin := execAdminURL == "" || taskAdminURL == "" ||
+				proxyexecutor.SameSyncedAdminOrigin(execCR.Status.Conditions, execAdminURL, item.Status.Conditions, taskAdminURL)
 			if !sameRecordedAdmin {
 				continue
 			}
@@ -1234,14 +1345,49 @@ func (r *XxlJobExecutorReconciler) findExecutorsForPod(ctx context.Context, obj 
 	var requests []reconcile.Request
 	for i := range list.Items {
 		item := &list.Items[i]
-		if item.Spec.PodSelector == nil {
-			continue
+		matched := false
+		if item.Spec.PodSelector != nil {
+			if sel, err := metav1.LabelSelectorAsSelector(item.Spec.PodSelector); err == nil && sel.Matches(labels.Set(pod.Labels)) {
+				matched = true
+			}
 		}
-		sel, err := metav1.LabelSelectorAsSelector(item.Spec.PodSelector)
-		if err != nil {
-			continue
+		if !matched && item.Spec.UseServiceDNS && strings.TrimSpace(item.Spec.ServiceName) != "" {
+			var svc corev1.Service
+			if err := r.Get(ctx, types.NamespacedName{Namespace: item.Namespace, Name: strings.TrimSpace(item.Spec.ServiceName)}, &svc); err == nil && len(svc.Spec.Selector) > 0 {
+				if labels.SelectorFromSet(labels.Set(svc.Spec.Selector)).Matches(labels.Set(pod.Labels)) {
+					matched = true
+				}
+			}
 		}
-		if sel.Matches(labels.Set(pod.Labels)) {
+		if matched {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Namespace: item.Namespace,
+					Name:      item.Name,
+				},
+			})
+		}
+	}
+	return requests
+}
+
+func (r *XxlJobExecutorReconciler) findExecutorsForServiceOrEndpoints(ctx context.Context, obj client.Object) []reconcile.Request {
+	if obj == nil {
+		return nil
+	}
+	ns := obj.GetNamespace()
+	name := obj.GetName()
+	if ns == "" || name == "" {
+		return nil
+	}
+	var list xxljobv1alpha1.XxlJobExecutorList
+	if err := r.List(ctx, &list, client.InNamespace(ns)); err != nil {
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range list.Items {
+		item := &list.Items[i]
+		if item.Spec.UseServiceDNS && strings.TrimSpace(item.Spec.ServiceName) == name {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Namespace: item.Namespace,
@@ -1302,12 +1448,17 @@ func (r *XxlJobExecutorReconciler) findExecutorsForAdmin(ctx context.Context, ob
 	if !ok || adminCR == nil {
 		return nil
 	}
-	candidateURLs := make(map[string]bool, 2)
+	candidateURLs := make(map[string]bool, 4)
 	if u := strings.TrimRight(ResolveAdminURL(adminCR), "/"); u != "" {
 		candidateURLs[u] = true
 	}
 	if su := strings.TrimRight(strings.TrimSpace(adminCR.Status.AdminURL), "/"); su != "" {
 		candidateURLs[su] = true
+	}
+	for _, pu := range extractPreviousAdminURLs(adminCR) {
+		if pu != "" {
+			candidateURLs[pu] = true
+		}
 	}
 	var list xxljobv1alpha1.XxlJobExecutorList
 	if err := r.List(ctx, &list, client.InNamespace(adminCR.Namespace)); err != nil {
@@ -1350,12 +1501,138 @@ func resolveExecutorAddressType(execCR *xxljobv1alpha1.XxlJobExecutor) int {
 	return 1
 }
 
+func isServiceDNSBackendActive(execCR *xxljobv1alpha1.XxlJobExecutor) bool {
+	if execCR == nil {
+		return false
+	}
+	cond := meta.FindStatusCondition(execCR.Status.Conditions, ConditionServiceBackendActive)
+	return cond != nil && cond.Status == metav1.ConditionTrue
+}
+
+// evaluateServiceDNSBackends inspects the target Kubernetes Service, its Endpoints, and matching Pods to determine
+// how many ready backends and how many draining/keep-alive backends currently back a UseServiceDNS executor.
+func evaluateServiceDNSBackends(
+	ctx context.Context,
+	k8sClient client.Reader,
+	execCR *xxljobv1alpha1.XxlJobExecutor,
+) (readyCount int, keepAliveCount int, err error) {
+	if k8sClient == nil || execCR == nil {
+		return 0, 0, nil
+	}
+	svcName := strings.TrimSpace(execCR.Spec.ServiceName)
+	if svcName == "" {
+		return 0, 0, nil
+	}
+
+	var svc corev1.Service
+	if getErr := k8sClient.Get(ctx, types.NamespacedName{Namespace: execCR.Namespace, Name: svcName}, &svc); getErr != nil {
+		if apierrors.IsNotFound(getErr) {
+			return 0, 0, nil
+		}
+		return 0, 0, getErr
+	}
+	svcDeleting := !svc.DeletionTimestamp.IsZero()
+	if svc.Spec.Type == corev1.ServiceTypeExternalName {
+		if !svcDeleting && strings.TrimSpace(svc.Spec.ExternalName) != "" {
+			return 1, 0, nil
+		}
+		return 0, 0, nil
+	}
+
+	var podSel labels.Selector
+	if len(svc.Spec.Selector) > 0 {
+		podSel = labels.SelectorFromSet(labels.Set(svc.Spec.Selector))
+	} else if execCR.Spec.PodSelector != nil {
+		if s, selErr := metav1.LabelSelectorAsSelector(execCR.Spec.PodSelector); selErr == nil {
+			podSel = s
+		}
+	}
+
+	var ep corev1.Endpoints
+	epErr := k8sClient.Get(ctx, types.NamespacedName{Namespace: execCR.Namespace, Name: svcName}, &ep)
+	if epErr != nil && !apierrors.IsNotFound(epErr) {
+		return 0, 0, epErr
+	}
+
+	seenPods := make(map[string]bool)
+	if epErr == nil {
+		for _, subset := range ep.Subsets {
+			for _, addr := range subset.Addresses {
+				if addr.TargetRef != nil && addr.TargetRef.Kind == "Pod" && addr.TargetRef.Name != "" {
+					seenPods[addr.TargetRef.Name] = true
+					var pod corev1.Pod
+					pErr := k8sClient.Get(ctx, types.NamespacedName{Namespace: execCR.Namespace, Name: addr.TargetRef.Name}, &pod)
+					if pErr == nil {
+						if isK8sJobProxyManagedPod(&pod) || !isPodInjectedWhenRequired(&pod, execCR.Spec.Mode) || pod.Status.Phase != corev1.PodRunning {
+							continue
+						}
+						if svcDeleting || !pod.DeletionTimestamp.IsZero() || !isPodReady(&pod) {
+							if isPodWithinKeepAliveWindow(&pod) {
+								keepAliveCount++
+							}
+						} else {
+							readyCount++
+						}
+					} else if apierrors.IsNotFound(pErr) {
+						if !svcDeleting && strings.TrimSpace(addr.IP) != "" {
+							readyCount++
+						}
+					} else {
+						return 0, 0, pErr
+					}
+				} else if !svcDeleting && strings.TrimSpace(addr.IP) != "" {
+					readyCount++
+				}
+			}
+			for _, addr := range subset.NotReadyAddresses {
+				if addr.TargetRef != nil && addr.TargetRef.Kind == "Pod" && addr.TargetRef.Name != "" {
+					seenPods[addr.TargetRef.Name] = true
+					var pod corev1.Pod
+					if pErr := k8sClient.Get(ctx, types.NamespacedName{Namespace: execCR.Namespace, Name: addr.TargetRef.Name}, &pod); pErr == nil {
+						if !isK8sJobProxyManagedPod(&pod) && isPodInjectedWhenRequired(&pod, execCR.Spec.Mode) && isPodWithinKeepAliveWindow(&pod) {
+							keepAliveCount++
+						}
+					} else if !apierrors.IsNotFound(pErr) {
+						return 0, 0, pErr
+					}
+				}
+			}
+		}
+	}
+
+	if podSel != nil && (apierrors.IsNotFound(epErr) || (readyCount == 0 && keepAliveCount == 0)) {
+		var podList corev1.PodList
+		if listErr := k8sClient.List(ctx, &podList, client.InNamespace(execCR.Namespace), client.MatchingLabelsSelector{Selector: podSel}); listErr != nil {
+			return 0, 0, listErr
+		}
+		for i := range podList.Items {
+			pod := &podList.Items[i]
+			if seenPods[pod.Name] || isK8sJobProxyManagedPod(pod) || pod.Status.PodIP == "" ||
+				pod.Status.Phase != corev1.PodRunning || !isPodInjectedWhenRequired(pod, execCR.Spec.Mode) {
+				continue
+			}
+			if svcDeleting || !pod.DeletionTimestamp.IsZero() || !isPodReady(pod) {
+				if isPodWithinKeepAliveWindow(pod) {
+					keepAliveCount++
+				}
+			} else if apierrors.IsNotFound(epErr) {
+				readyCount++
+			}
+		}
+	}
+
+	return readyCount, keepAliveCount, nil
+}
+
 func shouldHeartbeatExecutorRegistry(execCR *xxljobv1alpha1.XxlJobExecutor) bool {
 	if execCR == nil {
 		return false
 	}
 	if execCR.Spec.Mode == xxljobv1alpha1.ExecutorModeK8sJobProxy {
 		return true
+	}
+	if execCR.Spec.UseServiceDNS && strings.TrimSpace(execCR.Spec.ServiceName) != "" {
+		return isServiceDNSBackendActive(execCR)
 	}
 	addressType := resolveExecutorAddressType(execCR)
 	return addressType == 1 &&
@@ -1400,6 +1677,8 @@ func (r *XxlJobExecutorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			),
 		)).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.findExecutorsForPod), builder.WithPredicates(podExecutorLifecyclePredicate())).
+		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.findExecutorsForServiceOrEndpoints)).
+		Watches(&corev1.Endpoints{}, handler.EnqueueRequestsFromMapFunc(r.findExecutorsForServiceOrEndpoints)).
 		Watches(&xxljobv1alpha1.XxlJobTask{}, handler.EnqueueRequestsFromMapFunc(r.findDeletingExecutorsForTask), builder.WithPredicates(taskForDeletingExecutorPredicate())).
 		Watches(&xxljobv1alpha1.XxlJobAdmin{}, handler.EnqueueRequestsFromMapFunc(r.findExecutorsForAdmin), builder.WithPredicates(adminForExecutorPredicate())).
 		Complete(r)

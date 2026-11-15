@@ -40,6 +40,9 @@ type K8sJobCallbackReconciler struct {
 	ClientFactory ClientFactory
 }
 
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs/finalizers,verbs=update
+
 func (r *K8sJobCallbackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
@@ -166,7 +169,7 @@ func (r *K8sJobCallbackReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 					return ctrl.Result{}, patchErr
 				}
 
-				policy := metav1.DeletePropagationBackground
+				policy := metav1.DeletePropagationForeground
 				if delErr := r.Delete(ctx, &job, &client.DeleteOptions{PropagationPolicy: &policy}); delErr != nil && !apierrors.IsNotFound(delErr) {
 					return ctrl.Result{}, delErr
 				}
@@ -193,7 +196,7 @@ func (r *K8sJobCallbackReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				return ctrl.Result{}, patchErr
 			}
 
-			policy := metav1.DeletePropagationBackground
+			policy := metav1.DeletePropagationForeground
 			if delErr := r.Delete(ctx, &job, &client.DeleteOptions{PropagationPolicy: &policy}); delErr != nil && !apierrors.IsNotFound(delErr) {
 				return ctrl.Result{}, delErr
 			}
@@ -374,6 +377,8 @@ func (r *K8sJobCallbackReconciler) deliverCallback(
 	var execName string
 	var origAdminName string
 	var origAdminURL string
+	var origAdminUID string
+	var origAdminDBHash string
 	var logID int64
 	var logDateTime int64
 
@@ -384,6 +389,8 @@ func (r *K8sJobCallbackReconciler) deliverCallback(
 		execName = strings.TrimSpace(job.Annotations[proxyexecutor.AnnotationExecutorName])
 		origAdminName = strings.TrimSpace(job.Annotations[proxyexecutor.AnnotationAdminName])
 		origAdminURL = strings.TrimRight(strings.TrimSpace(job.Annotations[proxyexecutor.AnnotationAdminURL]), "/")
+		origAdminUID = strings.TrimSpace(job.Annotations[proxyexecutor.AnnotationAdminUID])
+		origAdminDBHash = strings.TrimSpace(job.Annotations[proxyexecutor.AnnotationAdminDatasourceHash])
 		logID, _ = strconv.ParseInt(job.Annotations[proxyexecutor.AnnotationLogID], 10, 64)
 		logDateTime, _ = strconv.ParseInt(job.Annotations[proxyexecutor.AnnotationLogDateTime], 10, 64)
 	}
@@ -411,7 +418,7 @@ func (r *K8sJobCallbackReconciler) deliverCallback(
 		execName = job.Labels[proxyexecutor.LabelExecutorName]
 	}
 
-	xxlCli, matchedAdmin, err := r.resolveCallbackAdminClient(ctx, reader, ns, execName, origAdminName, origAdminURL)
+	xxlCli, matchedAdmin, err := r.resolveCallbackAdminClient(ctx, reader, ns, execName, origAdminName, origAdminURL, origAdminUID, origAdminDBHash)
 	bypassOriginAdmin := matchedAdmin != nil && !matchedAdmin.DeletionTimestamp.IsZero() && shouldBypassRemoteCleanup(ctx, reader, matchedAdmin)
 	if err != nil {
 		if bypassOriginAdmin {
@@ -453,66 +460,74 @@ func (r *K8sJobCallbackReconciler) deliverCallback(
 func (r *K8sJobCallbackReconciler) resolveCallbackAdminClient(
 	ctx context.Context,
 	reader client.Reader,
-	namespace, execName, origAdminName, origAdminURL string,
+	namespace, execName, origAdminName, origAdminURL, origAdminUID, origAdminDBHash string,
 ) (*xxlclient.Client, *xxljobv1alpha1.XxlJobAdmin, error) {
 	// 1. When the Job recorded its originating XxlJobAdmin at trigger time, route /api/callback strictly to that
-	// originating Admin even if XxlJobExecutor.Spec.AdminRef was migrated while the Job was in flight (fixes EG2-09).
+	// originating Admin even if XxlJobExecutor.Spec.AdminRef was migrated or XxlJobAdmin.Spec.ExternalURL / Port /
+	// ContextPath was edited in place while the Job was in flight (fixes EG2-09).
 	if origAdminName != "" || origAdminURL != "" {
+		var savedMeta *syncedAdminEndpointMeta
+		if origAdminName != "" || origAdminUID != "" || origAdminDBHash != "" {
+			savedMeta = &syncedAdminEndpointMeta{
+				AdminName:        origAdminName,
+				AdminUID:         origAdminUID,
+				AdminURL:         origAdminURL,
+				ManagedInCluster: origAdminDBHash != "",
+				DatasourceHash:   origAdminDBHash,
+			}
+		}
 		if origAdminName != "" {
 			adminCR, cli, err := ResolveAdminAndClientWithReader(
 				ctx, r.Client, reader, r.ClientFactory,
 				xxljobv1alpha1.LocalObjectReference{Name: origAdminName},
 				namespace,
 			)
-			if err == nil {
+			sameUID := origAdminUID == "" || adminCR == nil || adminCR.UID == "" || string(adminCR.UID) == origAdminUID
+			sameDB := !isAdminInstanceOrDBReplaced(adminCR, savedMeta)
+			if err == nil && sameUID && sameDB {
 				resolvedURL := strings.TrimRight(ResolveAdminURL(adminCR), "/")
-				if origAdminURL == "" || resolvedURL == origAdminURL {
+				if origAdminURL == "" || resolvedURL == origAdminURL || isSameManagedAdminDBUpdate(adminCR, origAdminURL, savedMeta) {
 					return cli, adminCR, nil
 				}
-			} else if adminCR != nil {
+			} else if adminCR != nil && sameUID && sameDB {
 				// Admin CR exists, so err is a Secret/client error (even if apierrors.IsNotFound(err) is true for a missing Secret);
-				// propagate err when URLs match so K8sJobCallbackReconciler retries instead of dropping the callback.
+				// propagate err when URLs match (or same managed DB) so K8sJobCallbackReconciler retries instead of dropping the callback.
 				resolvedURL := strings.TrimRight(ResolveAdminURL(adminCR), "/")
-				if origAdminURL == "" || resolvedURL == origAdminURL {
+				if origAdminURL == "" || resolvedURL == origAdminURL || isSameManagedAdminDBUpdate(adminCR, origAdminURL, savedMeta) {
 					return nil, adminCR, err
 				}
-			} else if !apierrors.IsNotFound(err) {
+			} else if err != nil && adminCR == nil && !apierrors.IsNotFound(err) {
 				return nil, nil, err
+			}
+			if adminCR != nil && (!sameUID || !sameDB) {
+				resolvedURL := strings.TrimRight(ResolveAdminURL(adminCR), "/")
+				if origAdminURL == "" || resolvedURL == origAdminURL || isRetiredManagedAdminEndpoint(adminCR, origAdminURL, savedMeta) {
+					return nil, nil, nil
+				}
 			}
 		}
 		if origAdminURL != "" {
-			var adminList xxljobv1alpha1.XxlJobAdminList
-			if err := reader.List(ctx, &adminList, client.InNamespace(namespace)); err != nil {
-				return nil, nil, err
+			matchedAdmin, cli, err := resolveReachablePreviousAdminClient(
+				ctx, r.Client, reader, r.ClientFactory,
+				namespace, origAdminURL, savedMeta, origAdminName,
+			)
+			if matchedAdmin != nil && origAdminUID != "" && matchedAdmin.UID != "" && string(matchedAdmin.UID) != origAdminUID {
+				return nil, nil, nil
 			}
-			var matched *xxljobv1alpha1.XxlJobAdmin
-			var deletingMatch *xxljobv1alpha1.XxlJobAdmin
-			for i := range adminList.Items {
-				item := &adminList.Items[i]
-				if strings.TrimRight(ResolveAdminURL(item), "/") != origAdminURL {
-					continue
-				}
-				if item.DeletionTimestamp.IsZero() {
-					matched = item
-					break
-				}
-				if deletingMatch == nil {
-					deletingMatch = item
-				}
-			}
-			if matched == nil {
-				matched = deletingMatch
-			}
-			if matched != nil {
-				adminCR, cli, err := ResolveAdminAndClientWithReader(
+			if matchedAdmin != nil && isSameManagedAdminDBUpdate(matchedAdmin, origAdminURL, savedMeta) {
+				updatedAdmin, updatedCli, updatedErr := ResolveAdminAndClientWithReader(
 					ctx, r.Client, reader, r.ClientFactory,
-					xxljobv1alpha1.LocalObjectReference{Name: matched.Name},
+					xxljobv1alpha1.LocalObjectReference{Name: matchedAdmin.Name},
 					namespace,
 				)
-				if adminCR == nil {
-					adminCR = matched
-				}
-				return cli, adminCR, err
+				return updatedCli, updatedAdmin, updatedErr
+			}
+			if matchedAdmin != nil && (isRetiredManagedAdminEndpoint(matchedAdmin, origAdminURL, savedMeta) ||
+				(strings.TrimRight(ResolveAdminURL(matchedAdmin), "/") == origAdminURL && isAdminInstanceOrDBReplaced(matchedAdmin, savedMeta))) {
+				return nil, nil, nil
+			}
+			if matchedAdmin != nil || err != nil {
+				return cli, matchedAdmin, err
 			}
 		}
 		// Originating XxlJobAdmin CR was removed from the namespace; never misroute logId onto a different Admin.

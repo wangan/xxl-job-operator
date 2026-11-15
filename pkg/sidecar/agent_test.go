@@ -1237,3 +1237,363 @@ func TestBoostEndgameSidecarCoverEarlyOutOfOrderAndTokenCRLF(t *testing.T) {
 		t.Fatalf("expected logs/logJobID/seenLogs bounded by MaxLogEntries=3, got logs=%d logJobID=%d seen=%d", logsLen, logJobIDLen, seenLen)
 	}
 }
+
+func TestSidecarStreamResponseBodyErrorsAndFlushContextDeadline(t *testing.T) {
+	var cbMu sync.Mutex
+	callbacksByLog := make(map[int64]xxlclient.HandleCallbackParam)
+	handlerCompletedAtCallback := make(map[int64]bool)
+	var stream320Completed atomic.Bool
+
+	blockAdminCB := make(chan struct{})
+	var gateAdminCB atomic.Bool
+	adminEnteredCB := make(chan struct{}, 4)
+
+	adminSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/callback" {
+			var params []xxlclient.HandleCallbackParam
+			_ = json.NewDecoder(r.Body).Decode(&params)
+			if gateAdminCB.Load() {
+				select {
+				case adminEnteredCB <- struct{}{}:
+				default:
+				}
+				<-blockAdminCB
+			}
+			cbMu.Lock()
+			for _, p := range params {
+				callbacksByLog[p.LogID] = p
+				handlerCompletedAtCallback[p.LogID] = stream320Completed.Load()
+			}
+			cbMu.Unlock()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":200}`))
+	}))
+	defer adminSrv.Close()
+
+	unblockTimeoutHandler := make(chan struct{})
+	defer close(unblockTimeoutHandler)
+
+	bizMux := http.NewServeMux()
+	// (a) 200 OK headers + partial chunk flushed, then stalls past ExecutorTimeout=1s
+	bizMux.HandleFunc("/job/hang-after-200", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("started\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		select {
+		case <-r.Context().Done():
+		case <-unblockTimeoutHandler:
+		}
+	})
+	// (b) 200 OK chunked response truncated mid-stream without terminating 0-length chunk
+	bizMux.HandleFunc("/job/midstream-eof", func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			http.Error(w, "hijack unsupported", http.StatusInternalServerError)
+			return
+		}
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			return
+		}
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nhalf\r\n")
+		_ = buf.Flush()
+		_ = conn.Close()
+	})
+	// (c) >256 KiB streaming response: writes 320 KiB, sleeps 80ms, marks completion, writes tail
+	bizMux.HandleFunc("/job/large-stream", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		chunk := bytes.Repeat([]byte("A"), 64*1024)
+		for i := 0; i < 5; i++ { // 320 KiB > MaxSingleLogBytes (256 KiB)
+			_, _ = w.Write(chunk)
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(80 * time.Millisecond)
+		stream320Completed.Store(true)
+		_, _ = w.Write([]byte("TAIL\n"))
+	})
+	// (d) Non-2xx response larger than MaxSingleLogBytes
+	bizMux.HandleFunc("/job/large-error", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write(bytes.Repeat([]byte("E"), 300*1024))
+	})
+
+	bizLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen biz: %v", err)
+	}
+	bizSrv := &http.Server{Handler: bizMux}
+	go func() { _ = bizSrv.Serve(bizLn) }()
+	defer func() { _ = bizSrv.Close() }()
+	targetPort := bizLn.Addr().(*net.TCPAddr).Port
+
+	cbDir := t.TempDir()
+	ag, err := NewAgent(Config{
+		AdminURL:          adminSrv.URL,
+		AccessToken:       "stream-test-token",
+		AppName:           "stream-exec",
+		PodIP:             "127.0.0.1",
+		TargetHTTPPort:    targetPort,
+		CallbackDir:       cbDir,
+		CallbackRetryWait: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	agentSrv := httptest.NewServer(ag.Handler())
+	defer agentSrv.Close()
+
+	triggerAndWait := func(p xxlclient.TriggerParam) xxlclient.HandleCallbackParam {
+		t.Helper()
+		b, _ := json.Marshal(p)
+		req, _ := http.NewRequest(http.MethodPost, agentSrv.URL+"/run", bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(xxlclient.AccessTokenHeader, "stream-test-token")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST /run failed: %v", err)
+		}
+		defer resp.Body.Close()
+		var ret xxlclient.ReturnT
+		_ = json.NewDecoder(resp.Body).Decode(&ret)
+		if ret.Code != xxlclient.SuccessCode {
+			t.Fatalf("expected /run 200 acceptance, got %+v", ret)
+		}
+		deadline := time.Now().Add(4 * time.Second)
+		for time.Now().Before(deadline) {
+			cbMu.Lock()
+			cb, ok := callbacksByLog[p.LogID]
+			cbMu.Unlock()
+			if ok {
+				return cb
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for callback of logId=%d", p.LogID)
+		return xxlclient.HandleCallbackParam{}
+	}
+
+	readLog := func(logID int64) string {
+		t.Helper()
+		b, _ := json.Marshal(xxlclient.LogParam{LogID: logID, FromLineNum: 1})
+		req, _ := http.NewRequest(http.MethodPost, agentSrv.URL+"/log", bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(xxlclient.AccessTokenHeader, "stream-test-token")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST /log failed: %v", err)
+		}
+		defer resp.Body.Close()
+		var ret xxlclient.ReturnT
+		_ = json.NewDecoder(resp.Body).Decode(&ret)
+		var lr xxlclient.LogResult
+		_ = json.Unmarshal(ret.Content, &lr)
+		return lr.LogContent
+	}
+
+	// Subcase (a): 200 OK headers flushed, then body read times out -> MUST report TimeoutCode (502), never 200!
+	cbTimeout := triggerAndWait(xxlclient.TriggerParam{
+		JobID:           11,
+		ExecutorHandler: "hang-after-200",
+		ExecutorTimeout: 1,
+		LogID:           8101,
+	})
+	if cbTimeout.HandleCode != xxlclient.TimeoutCode {
+		t.Fatalf("expected TimeoutCode (%d) when 200 OK body stalls past ExecutorTimeout, got %+v",
+			xxlclient.TimeoutCode, cbTimeout)
+	}
+	if gotLog := readLog(8101); !strings.Contains(gotLog, "started") {
+		t.Fatalf("expected partial streamed log 'started' retained on timeout, got %q", gotLog)
+	}
+
+	// Subcase (b): 200 OK chunked body truncated mid-stream -> MUST report FailCode (500), never 200!
+	cbEOF := triggerAndWait(xxlclient.TriggerParam{
+		JobID:           12,
+		ExecutorHandler: "midstream-eof",
+		ExecutorTimeout: 5,
+		LogID:           8102,
+	})
+	if cbEOF.HandleCode != xxlclient.FailCode {
+		t.Fatalf("expected FailCode (%d) on mid-stream chunked truncation after 200 OK, got %+v",
+			xxlclient.FailCode, cbEOF)
+	}
+	if gotLog := readLog(8102); !strings.Contains(gotLog, "half") {
+		t.Fatalf("expected partial streamed log 'half' retained on unexpected EOF, got %q", gotLog)
+	}
+
+	// Subcase (c): >256 KiB streaming response must NOT callback early before handler finishes writing full body,
+	// while in-memory log remains bounded at MaxSingleLogBytes (256 KiB).
+	cbLarge := triggerAndWait(xxlclient.TriggerParam{
+		JobID:           13,
+		ExecutorHandler: "large-stream",
+		ExecutorTimeout: 5,
+		LogID:           8103,
+	})
+	if cbLarge.HandleCode != xxlclient.SuccessCode {
+		t.Fatalf("expected SuccessCode for completed >256KiB stream, got %+v", cbLarge)
+	}
+	cbMu.Lock()
+	completedBeforeCB := handlerCompletedAtCallback[8103]
+	cbMu.Unlock()
+	if !completedBeforeCB {
+		t.Fatalf("sidecar reported 200 callback BEFORE business handler finished streaming response body > MaxSingleLogBytes")
+	}
+	ag.mu.Lock()
+	inMemLen := len(ag.logs[8103])
+	ag.mu.Unlock()
+	if inMemLen != MaxSingleLogBytes {
+		t.Fatalf("expected in-memory retained log capped at MaxSingleLogBytes (%d), got %d", MaxSingleLogBytes, inMemLen)
+	}
+	largeLog := readLog(8103)
+	if len(strings.TrimSuffix(largeLog, "\n")) != MaxSingleLogBytes || strings.Contains(largeLog, "TAIL") {
+		t.Fatalf("expected /log content capped at MaxSingleLogBytes (%d) without overflow tail, got len=%d",
+			MaxSingleLogBytes, len(strings.TrimSuffix(largeLog, "\n")))
+	}
+
+	// Subcase (d): >256 KiB 500 error body -> FailCode
+	cbErrLarge := triggerAndWait(xxlclient.TriggerParam{
+		JobID:           14,
+		ExecutorHandler: "large-error",
+		ExecutorTimeout: 5,
+		LogID:           8104,
+	})
+	if cbErrLarge.HandleCode != xxlclient.FailCode {
+		t.Fatalf("expected FailCode for >256KiB HTTP 500 response, got %+v", cbErrLarge)
+	}
+
+	// Subcase (e): FlushSpooledCallbacksContext must respect ctx deadline while replayMu is held by an in-flight replay!
+	spooled := []xxlclient.HandleCallbackParam{{LogID: 8199, HandleCode: xxlclient.SuccessCode, HandleMsg: "spooled"}}
+	spoolBytes, _ := json.Marshal(spooled)
+	if err := os.WriteFile(filepath.Join(cbDir, "cb-8199.json"), spoolBytes, 0o600); err != nil {
+		t.Fatalf("write spool file: %v", err)
+	}
+	gateAdminCB.Store(true)
+	bgReplayDone := make(chan struct{})
+	go func() {
+		defer close(bgReplayDone)
+		ag.replaySpooledCallbacks()
+	}()
+	select {
+	case <-adminEnteredCB:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for background replaySpooledCallbacks to enter gated Admin /api/callback")
+	}
+
+	flushStart := time.Now()
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 35*time.Millisecond)
+	ag.FlushSpooledCallbacksContext(shortCtx)
+	shortCancel()
+	elapsed := time.Since(flushStart)
+	if elapsed > 300*time.Millisecond {
+		t.Fatalf("FlushSpooledCallbacksContext ignored ctx deadline while waiting on replayMu: took %v", elapsed)
+	}
+
+	// Unblock gated Admin callback and verify background replay finishes cleanly
+	gateAdminCB.Store(false)
+	close(blockAdminCB)
+	select {
+	case <-bgReplayDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for background replaySpooledCallbacks to finish")
+	}
+
+	// Subcase (f): StartDrain() (/preStop) MUST cancel an in-flight hung background replay so
+	// FlushSpooledCallbacksContext immediately acquires replayMu and flushes newly-spooled callbacks!
+	blockDrainGate := make(chan struct{})
+	defer func() {
+		select {
+		case <-blockDrainGate:
+		default:
+			close(blockDrainGate)
+		}
+	}()
+	var hangFirstAttempt atomic.Bool
+	hangFirstAttempt.Store(true)
+	drainEnteredCB := make(chan struct{}, 2)
+
+	drainAdminSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/callback" {
+			var params []xxlclient.HandleCallbackParam
+			_ = json.NewDecoder(r.Body).Decode(&params)
+			if hangFirstAttempt.CompareAndSwap(true, false) {
+				select {
+				case drainEnteredCB <- struct{}{}:
+				default:
+				}
+				select {
+				case <-r.Context().Done():
+					return
+				case <-blockDrainGate:
+				}
+			}
+			cbMu.Lock()
+			for _, p := range params {
+				callbacksByLog[p.LogID] = p
+			}
+			cbMu.Unlock()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":200}`))
+	}))
+	defer drainAdminSrv.Close()
+
+	cbDirDrain := t.TempDir()
+	agDrain, err := NewAgent(Config{
+		AdminURL:          drainAdminSrv.URL,
+		AccessToken:       "stream-test-token",
+		AppName:           "stream-exec-drain",
+		PodIP:             "127.0.0.1",
+		TargetHTTPPort:    targetPort,
+		CallbackDir:       cbDirDrain,
+		CallbackRetryWait: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent drain: %v", err)
+	}
+
+	spoolStuck, _ := json.Marshal([]xxlclient.HandleCallbackParam{{LogID: 8201, HandleCode: xxlclient.SuccessCode, HandleMsg: "stuck-bg"}})
+	if err := os.WriteFile(filepath.Join(cbDirDrain, "cb-8201.json"), spoolStuck, 0o600); err != nil {
+		t.Fatalf("write cb-8201: %v", err)
+	}
+	stuckDone := make(chan struct{})
+	go func() {
+		defer close(stuckDone)
+		agDrain.replaySpooledCallbacks()
+	}()
+	select {
+	case <-drainEnteredCB:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for background replay to hang on drainAdminSrv")
+	}
+
+	// Write a second spooled callback completed during drain, then call StartDrain() + FlushSpooledCallbacksContext
+	spoolFresh, _ := json.Marshal([]xxlclient.HandleCallbackParam{{LogID: 8202, HandleCode: xxlclient.SuccessCode, HandleMsg: "drained-fresh"}})
+	if err := os.WriteFile(filepath.Join(cbDirDrain, "cb-8202.json"), spoolFresh, 0o600); err != nil {
+		t.Fatalf("write cb-8202: %v", err)
+	}
+
+	preStopStart := time.Now()
+	agDrain.StartDrain()
+	flushDrainCtx, flushDrainCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	agDrain.FlushSpooledCallbacksContext(flushDrainCtx)
+	flushDrainCancel()
+	if took := time.Since(preStopStart); took > 500*time.Millisecond {
+		t.Fatalf("expected StartDrain() to abort hung background replay immediately, took %v", took)
+	}
+	select {
+	case <-stuckDone:
+	case <-time.After(1 * time.Second):
+		t.Fatalf("expected hung background replay goroutine to exit after StartDrain()")
+	}
+	cbMu.Lock()
+	_, got8201 := callbacksByLog[8201]
+	_, got8202 := callbacksByLog[8202]
+	cbMu.Unlock()
+	if !got8201 || !got8202 {
+		t.Fatalf("expected FlushSpooledCallbacksContext after StartDrain() to deliver both 8201 (%v) and 8202 (%v)", got8201, got8202)
+	}
+}

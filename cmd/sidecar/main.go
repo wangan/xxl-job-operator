@@ -17,10 +17,10 @@ import (
 
 func main() {
 	adminURL := getEnv("XXL_JOB_ADMIN_ADDRESSES", "http://xxl-job-admin:8080/xxl-job-admin")
-	// Never default to "default_token" (fixes R5-P0-1)
-	accessToken := strings.TrimSpace(getEnv("XXL_JOB_ACCESS_TOKEN", getEnv("XXL_JOB_ACCESSTOKEN", "")))
-	if accessToken == "" || accessToken == "default_token" {
-		log.Fatalf("Refusing to start sidecar with empty or default_token XXL_JOB_ACCESS_TOKEN")
+	// Never default to "default_token" and strip CR/LF identically to sidecar.NewAgent before validation (fixes R5-P0-1)
+	accessToken, prevToken, sharedSecret, tokErr := resolveSidecarTokensFromEnv(os.Getenv)
+	if tokErr != nil {
+		log.Fatalf("%v", tokErr)
 	}
 
 	appName := getEnv("XXL_JOB_EXECUTOR_APPNAME", "default-sidecar-executor")
@@ -33,8 +33,6 @@ func main() {
 	}
 	enableGlue := strings.EqualFold(strings.TrimSpace(os.Getenv("XXL_JOB_SIDECAR_ENABLE_GLUE")), "true")
 	deregisterBeforeDrain := strings.EqualFold(strings.TrimSpace(os.Getenv("XXL_JOB_DEREGISTER_BEFORE_DRAIN")), "true")
-	sharedSecret := strings.TrimSpace(os.Getenv("XXL_JOB_SIDECAR_SHARED_SECRET"))
-	prevToken := strings.TrimSpace(os.Getenv("XXL_JOB_PREVIOUS_ACCESS_TOKEN"))
 	// Default callback spool directory is placed on the sidecar-private /xxl-job/spool volume (fixes R7-P1-1).
 	callbackDir := strings.TrimSpace(getEnv("XXL_JOB_SIDECAR_CALLBACK_DIR", "/xxl-job/spool/callbacks"))
 
@@ -111,6 +109,22 @@ func main() {
 	srvCtx, srvCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer srvCancel()
 	_ = srv.Shutdown(srvCtx)
+}
+
+func resolveSidecarTokensFromEnv(getenv func(string) string) (accessToken, prevToken, sharedSecret string, err error) {
+	accessToken = sidecar.SanitizeAccessToken(getenv("XXL_JOB_ACCESS_TOKEN"))
+	if accessToken == "" {
+		accessToken = sidecar.SanitizeAccessToken(getenv("XXL_JOB_ACCESSTOKEN"))
+	}
+	if accessToken == "" || accessToken == "default_token" {
+		return "", "", "", fmt.Errorf("Refusing to start sidecar with empty or default_token XXL_JOB_ACCESS_TOKEN")
+	}
+	prevToken = sidecar.SanitizeAccessToken(getenv("XXL_JOB_PREVIOUS_ACCESS_TOKEN"))
+	if prevToken == "default_token" {
+		prevToken = ""
+	}
+	sharedSecret = sidecar.SanitizeAccessToken(getenv("XXL_JOB_SIDECAR_SHARED_SECRET"))
+	return accessToken, prevToken, sharedSecret, nil
 }
 
 func getEnv(key, fallback string) string {

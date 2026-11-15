@@ -47,6 +47,7 @@ type XxlJobTaskReconciler struct {
 // +kubebuilder:rbac:groups=xxljob.io,resources=xxljobtasks/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=xxljob.io,resources=xxljobtasks/finalizers,verbs=update
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs/finalizers,verbs=update
 
 func (r *XxlJobTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -87,7 +88,7 @@ func (r *XxlJobTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				if execErr != nil {
 					if apierrors.IsNotFound(execErr) || execNS != task.Namespace {
 						logger.Info("Referenced XxlJobExecutor unavailable or invalid; attempting cleanup via recorded Status.AdminURL if available")
-						if cleanErr := r.cleanupTaskOnPreviousAdmin(ctx, reader, task.Namespace, task.Status.AdminURL, task.Status.JobGroupID, task.Status.JobID, ownerKey); cleanErr != nil {
+						if cleanErr := r.cleanupTaskOnPreviousAdmin(ctx, reader, &task, "", task.Status.AdminURL, task.Status.JobGroupID, task.Status.JobID, ownerKey); cleanErr != nil {
 							logger.Error(cleanErr, "Failed to clean up task on recorded XxlJobAdmin during deletion, will retry", "recordedAdminURL", task.Status.AdminURL)
 							return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 						}
@@ -95,27 +96,58 @@ func (r *XxlJobTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 						return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 					}
 				} else {
+					fallbackAdminName := ""
+					if execCR.Spec.AdminRef.Namespace == "" || execCR.Spec.AdminRef.Namespace == task.Namespace {
+						fallbackAdminName = execCR.Spec.AdminRef.Name
+					}
 					adminCR, xxlCli, err := ResolveAdminAndClientWithReader(ctx, r.Client, reader, r.ClientFactory, execCR.Spec.AdminRef, execCR.Namespace)
 					if err != nil {
+						if task.Status.AdminURL != "" && (task.Status.JobID > 0 || task.Status.JobGroupID > 0) {
+							delTaskMeta := extractSyncedAdminEndpointMeta(task.Status.Conditions)
+							migratingPrev := execCR.Spec.AdminRef.Namespace != "" && execCR.Spec.AdminRef.Namespace != task.Namespace
+							if !migratingPrev && fallbackAdminName != "" {
+								if mig, migErr := isMigratingFromPreviousAdmin(ctx, reader, execCR.Namespace, fallbackAdminName, task.Status.AdminURL, delTaskMeta); migErr == nil && mig {
+									migratingPrev = true
+								}
+							}
+							if migratingPrev {
+								if cleanErr := r.cleanupTaskOnPreviousAdmin(ctx, reader, &task, fallbackAdminName, task.Status.AdminURL, task.Status.JobGroupID, task.Status.JobID, ownerKey); cleanErr != nil {
+									logger.Error(cleanErr, "Failed to clean up task on previous XxlJobAdmin during deletion while target Admin is unavailable, will retry", "recordedAdminURL", task.Status.AdminURL)
+									return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+								}
+								task.Status.JobID = 0
+								task.Status.JobGroupID = 0
+								task.Status.AdminURL = ""
+								task.Status.LastExecutionJobName = ""
+								meta.RemoveStatusCondition(&task.Status.Conditions, ConditionAdminEndpointSynced)
+								_ = r.Status().Update(ctx, &task)
+							}
+						}
 						logger.Error(err, "Unable to resolve XxlJobAdmin during Task deletion; add annotation xxljob.io/force-delete=true to bypass")
 						return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 					}
 					currentAdminURL := ResolveAdminURL(adminCR)
 					// Guard against cross-Admin ID collision on deletion (fixes R7-P1-4 & R8-P1-8):
-					// If Status.AdminURL was recorded against a different Admin, clean up the old job on that previous
-					// Admin (if its CR still exists in the namespace) and only remove by ownerKey on the current Admin.
-					sameAdmin := task.Status.AdminURL == "" || strings.TrimRight(task.Status.AdminURL, "/") == strings.TrimRight(currentAdminURL, "/")
+					// If Status.AdminURL was recorded against a different Admin (or a replaced DB / recreated Admin UID),
+					// clean up the old job on that previous Admin (when distinct) and only remove by ownerKey on the current Admin.
+					delTaskMeta := extractSyncedAdminEndpointMeta(task.Status.Conditions)
+					adminReplaced := isAdminInstanceOrDBReplaced(adminCR, delTaskMeta)
+					sameAdmin := !adminReplaced && (task.Status.AdminURL == "" ||
+						strings.TrimRight(task.Status.AdminURL, "/") == strings.TrimRight(currentAdminURL, "/") ||
+						isSameManagedAdminDBUpdate(adminCR, task.Status.AdminURL, delTaskMeta))
 					if sameAdmin {
 						if err := r.removeOwnedTaskFromAdmin(ctx, xxlCli, &task, execCR.Status.JobGroupID, ownerKey); err != nil {
 							logger.Error(err, "Failed to remove JobInfo from XXL-JOB Admin during deletion, will retry", "jobId", task.Status.JobID)
 							return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 						}
 					} else {
-						if err := r.cleanupTaskOnPreviousAdmin(ctx, reader, task.Namespace, task.Status.AdminURL, task.Status.JobGroupID, task.Status.JobID, ownerKey); err != nil {
-							logger.Error(err, "Failed to clean up task on previous XxlJobAdmin during deletion, will retry", "recordedAdminURL", task.Status.AdminURL)
-							return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+						if task.Status.AdminURL != "" && strings.TrimRight(task.Status.AdminURL, "/") != strings.TrimRight(currentAdminURL, "/") {
+							if err := r.cleanupTaskOnPreviousAdmin(ctx, reader, &task, fallbackAdminName, task.Status.AdminURL, task.Status.JobGroupID, task.Status.JobID, ownerKey); err != nil {
+								logger.Error(err, "Failed to clean up task on previous XxlJobAdmin during deletion, will retry", "recordedAdminURL", task.Status.AdminURL)
+								return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+							}
 						}
-						if execCR.Status.JobGroupID > 0 {
+						if execCR.Status.JobGroupID > 0 && !isAdminInstanceOrDBReplaced(adminCR, extractSyncedAdminEndpointMeta(execCR.Status.Conditions)) {
 							ownerOnlyTask := xxljobv1alpha1.XxlJobTask{ObjectMeta: task.ObjectMeta}
 							if err := r.removeOwnedTaskFromAdmin(ctx, xxlCli, &ownerOnlyTask, execCR.Status.JobGroupID, ownerKey); err != nil {
 								logger.Error(err, "Failed to remove JobInfo by ownerKey from current XXL-JOB Admin during deletion, will retry")
@@ -129,13 +161,6 @@ func (r *XxlJobTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			if err := r.cleanupActiveTaskJobs(ctx, reader, &task); err != nil {
 				logger.Error(err, "Failed to clean up active batch Jobs during XxlJobTask deletion, will retry")
 				return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
-			}
-			if task.Status.JobID > 0 {
-				clearSerialQueueDepth(
-					task.Namespace,
-					proxyexecutor.SanitizeLabel(task.Spec.ExecutorRef.Name),
-					strconv.Itoa(task.Status.JobID),
-				)
 			}
 
 			controllerutil.RemoveFinalizer(&task, TaskFinalizer)
@@ -154,22 +179,32 @@ func (r *XxlJobTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	ownerKey := fmt.Sprintf("%s/%s", task.Namespace, task.Name)
 	prevAdminURL := strings.TrimRight(strings.TrimSpace(task.Status.AdminURL), "/")
 	prevAdminCleaned := false
+	fallbackExecAdminName := ""
+	if execErr == nil && (execCR.Spec.AdminRef.Namespace == "" || execCR.Spec.AdminRef.Namespace == task.Namespace) {
+		fallbackExecAdminName = execCR.Spec.AdminRef.Name
+	}
 	cleanPreviousTaskIfNeeded := func() (*ctrl.Result, error) {
 		if prevAdminURL == "" || (task.Status.JobID <= 0 && task.Status.JobGroupID <= 0) {
 			return nil, nil
 		}
-		if cleanErr := r.cleanupTaskOnPreviousAdmin(ctx, reader, task.Namespace, prevAdminURL, task.Status.JobGroupID, task.Status.JobID, ownerKey); cleanErr != nil {
+		if cleanErr := r.cleanupTaskOnPreviousAdmin(ctx, reader, &task, fallbackExecAdminName, prevAdminURL, task.Status.JobGroupID, task.Status.JobID, ownerKey); cleanErr != nil {
 			logger.Error(cleanErr, "Failed to clean up task on previous XxlJobAdmin during cross-Admin migration, will retry",
 				"previousAdminURL", prevAdminURL, "previousJobId", task.Status.JobID)
 			r.updateErrorStatus(ctx, &task, fmt.Sprintf("Failed to clean up task on previous XxlJobAdmin (%s): %v", prevAdminURL, cleanErr))
 			res := ctrl.Result{RequeueAfter: 5 * time.Second}
 			return &res, nil
 		}
-		prevAdminCleaned = prevAdminCleaned || task.Status.JobID != 0 || task.Status.JobGroupID != 0 || task.Status.AdminURL != "" || task.Status.LastExecutionJobName != ""
+		prevAdminCleaned = prevAdminCleaned ||
+			task.Status.JobID != 0 ||
+			task.Status.JobGroupID != 0 ||
+			task.Status.AdminURL != "" ||
+			task.Status.LastExecutionJobName != "" ||
+			meta.FindStatusCondition(task.Status.Conditions, ConditionAdminEndpointSynced) != nil
 		task.Status.JobID = 0
 		task.Status.JobGroupID = 0
 		task.Status.AdminURL = ""
 		task.Status.LastExecutionJobName = ""
+		meta.RemoveStatusCondition(&task.Status.Conditions, ConditionAdminEndpointSynced)
 		prevAdminURL = ""
 		return nil, nil
 	}
@@ -209,13 +244,14 @@ func (r *XxlJobTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// If the task's target executor points to a different XxlJobAdmin than Status.AdminURL, stop and delete the old
 	// task on the previous Admin BEFORE resolving the new Admin or waiting for the target executor to sync JobGroupID,
 	// preventing orphan CRON triggers on the old Admin and preventing old Admin deletion deadlocks.
+	prevTaskMeta := extractSyncedAdminEndpointMeta(task.Status.Conditions)
 	if prevAdminURL != "" && (task.Status.JobID > 0 || task.Status.JobGroupID > 0) {
 		execAdminNS := execCR.Spec.AdminRef.Namespace
 		if execAdminNS == "" {
 			execAdminNS = execCR.Namespace
 		}
 		if execAdminNS == task.Namespace {
-			migratingPrevAdmin, migCheckErr := isMigratingFromPreviousAdmin(ctx, reader, execCR.Namespace, execCR.Spec.AdminRef.Name, prevAdminURL)
+			migratingPrevAdmin, migCheckErr := isMigratingFromPreviousAdmin(ctx, reader, execCR.Namespace, execCR.Spec.AdminRef.Name, prevAdminURL, prevTaskMeta)
 			if migCheckErr != nil {
 				return ctrl.Result{}, migCheckErr
 			}
@@ -226,6 +262,7 @@ func (r *XxlJobTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 					}
 					return ctrl.Result{}, cleanErr
 				}
+				prevTaskMeta = nil
 			}
 		}
 	}
@@ -236,19 +273,26 @@ func (r *XxlJobTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	adminURL := ResolveAdminURL(adminCR)
+	taskAdminReplaced := isAdminInstanceOrDBReplaced(adminCR, prevTaskMeta)
+	sameManagedDB := !taskAdminReplaced && isSameManagedAdminDBUpdate(adminCR, prevAdminURL, prevTaskMeta)
 
-	if prevAdminURL != "" && prevAdminURL != strings.TrimRight(adminURL, "/") && (task.Status.JobID > 0 || task.Status.JobGroupID > 0) {
+	if prevAdminURL != "" && prevAdminURL != strings.TrimRight(adminURL, "/") && !sameManagedDB && (task.Status.JobID > 0 || task.Status.JobGroupID > 0) {
 		if res, cleanErr := cleanPreviousTaskIfNeeded(); cleanErr != nil || res != nil {
 			if res != nil {
 				return *res, nil
 			}
 			return ctrl.Result{}, cleanErr
 		}
+		prevTaskMeta = nil
+		taskAdminReplaced = false
 	}
 
 	execAdminURL := strings.TrimRight(strings.TrimSpace(execCR.Status.AdminURL), "/")
-	if execCR.Status.JobGroupID <= 0 || !execCR.Status.Synced || !isExecutorAppNameSynced(&execCR) ||
-		(execAdminURL != "" && execAdminURL != strings.TrimRight(adminURL, "/")) {
+	execMeta := extractSyncedAdminEndpointMeta(execCR.Status.Conditions)
+	execAlignedWithAdmin := !isAdminInstanceOrDBReplaced(adminCR, execMeta) && (execAdminURL == "" ||
+		execAdminURL == strings.TrimRight(adminURL, "/") ||
+		isSameManagedAdminDBUpdate(adminCR, execAdminURL, execMeta))
+	if execCR.Status.JobGroupID <= 0 || !execCR.Status.Synced || !isExecutorAppNameSynced(&execCR) || !execAlignedWithAdmin {
 		r.updateErrorStatus(ctx, &task, fmt.Sprintf("Waiting for XxlJobExecutor %s/%s to sync JobGroupID", execCR.Namespace, execCR.Name), prevAdminCleaned)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
@@ -267,8 +311,24 @@ func (r *XxlJobTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 	}
 
+	effectiveJobID := task.Status.JobID
+	effectivePrevJobGroup := task.Status.JobGroupID
+	effectivePrevAdminURL := task.Status.AdminURL
+	if taskAdminReplaced {
+		xxlCli.InvalidateGroupSnapshot(0)
+		xxlCli.InvalidateGroupSnapshot(execCR.Status.JobGroupID)
+		if task.Status.JobGroupID > 0 {
+			xxlCli.InvalidateGroupSnapshot(task.Status.JobGroupID)
+		}
+		effectiveJobID = 0
+		effectivePrevJobGroup = 0
+		effectivePrevAdminURL = ""
+	} else if sameManagedDB {
+		effectivePrevAdminURL = adminURL
+	}
+
 	desiredInfo := xxlclient.JobInfo{
-		ID:                     task.Status.JobID,
+		ID:                     effectiveJobID,
 		JobGroup:               execCR.Status.JobGroupID,
 		JobDesc:                task.Spec.JobDesc,
 		Author:                 task.Spec.Author,
@@ -287,8 +347,8 @@ func (r *XxlJobTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		GlueRemark:             task.Spec.GlueRemark,
 		ChildJobID:             task.Spec.ChildJobID,
 		AllowGlueTypeRecreate:  hasAllowGlueTypeRecreateAnnotation(task.Annotations),
-		PreviousJobGroup:       task.Status.JobGroupID,
-		PreviousAdminURL:       task.Status.AdminURL,
+		PreviousJobGroup:       effectivePrevJobGroup,
+		PreviousAdminURL:       effectivePrevAdminURL,
 		OwnerKey:               ownerKey,
 		AdoptJobID:             adoptJobID,
 	}
@@ -302,9 +362,20 @@ func (r *XxlJobTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	msg := fmt.Sprintf("Synced with XXL-JOB Admin (jobId=%d, jobGroupId=%d, triggerStatus=%d)",
 		syncedInfo.ID, execCR.Status.JobGroupID, syncedInfo.TriggerStatus)
 
+	prevSyncedMeta := extractSyncedAdminEndpointMeta(task.Status.Conditions)
+	adminUIDChanged := prevSyncedMeta != nil && prevSyncedMeta.AdminUID != "" && adminCR != nil && adminCR.UID != "" &&
+		prevSyncedMeta.AdminUID != string(adminCR.UID)
+	adminReplacedOnSync := isAdminInstanceOrDBReplaced(adminCR, prevSyncedMeta)
+
 	resetLastExec := task.Status.LastExecutionJobName != "" &&
 		((task.Status.JobID != 0 && task.Status.JobID != syncedInfo.ID) ||
-			(task.Status.AdminURL != "" && strings.TrimRight(task.Status.AdminURL, "/") != strings.TrimRight(adminURL, "/")))
+			(task.Status.AdminURL != "" && !sameManagedDB && strings.TrimRight(task.Status.AdminURL, "/") != strings.TrimRight(adminURL, "/")) ||
+			adminUIDChanged ||
+			adminReplacedOnSync)
+
+	endpointMetaMsg := encodeSyncedAdminEndpointMeta(adminCR, adminURL)
+	prevEndpointCond := meta.FindStatusCondition(task.Status.Conditions, ConditionAdminEndpointSynced)
+	endpointCondChanged := endpointMetaMsg != "" && (prevEndpointCond == nil || prevEndpointCond.Status != metav1.ConditionTrue || prevEndpointCond.Message != endpointMetaMsg)
 
 	// Only write Status when changed (fixes P0-1)
 	statusChanged := task.Status.JobID != syncedInfo.ID ||
@@ -313,7 +384,8 @@ func (r *XxlJobTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		resetLastExec ||
 		!task.Status.Synced ||
 		task.Status.TriggerStatus != syncedInfo.TriggerStatus ||
-		task.Status.Message != msg
+		task.Status.Message != msg ||
+		endpointCondChanged
 
 	if statusChanged {
 		now := metav1.Now()
@@ -334,6 +406,15 @@ func (r *XxlJobTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			Message:            msg,
 			LastTransitionTime: now,
 		})
+		if endpointMetaMsg != "" {
+			meta.SetStatusCondition(&task.Status.Conditions, metav1.Condition{
+				Type:               ConditionAdminEndpointSynced,
+				Status:             metav1.ConditionTrue,
+				Reason:             "EndpointSynced",
+				Message:            endpointMetaMsg,
+				LastTransitionTime: now,
+			})
+		}
 
 		if err := r.Status().Update(ctx, &task); err != nil {
 			return ctrl.Result{}, err
@@ -425,47 +506,35 @@ func (r *XxlJobTaskReconciler) removeOwnedTaskFromAdmin(
 func (r *XxlJobTaskReconciler) cleanupTaskOnPreviousAdmin(
 	ctx context.Context,
 	reader client.Reader,
-	namespace, prevAdminURL string,
+	task *xxljobv1alpha1.XxlJobTask,
+	fallbackAdminName, prevAdminURL string,
 	prevJobGroup, prevJobID int,
 	ownerKey string,
 ) error {
 	prevAdminURL = strings.TrimRight(strings.TrimSpace(prevAdminURL), "/")
-	if prevAdminURL == "" || (prevJobID <= 0 && prevJobGroup <= 0) {
+	if task == nil || prevAdminURL == "" || (prevJobID <= 0 && prevJobGroup <= 0) {
 		return nil
 	}
-	var adminList xxljobv1alpha1.XxlJobAdminList
-	if err := r.List(ctx, &adminList, client.InNamespace(namespace)); err != nil {
-		return err
-	}
-	var matchedAdmin *xxljobv1alpha1.XxlJobAdmin
-	var deletingMatch *xxljobv1alpha1.XxlJobAdmin
-	for i := range adminList.Items {
-		item := &adminList.Items[i]
-		if strings.TrimRight(ResolveAdminURL(item), "/") != prevAdminURL {
-			continue
-		}
-		if item.DeletionTimestamp.IsZero() {
-			matchedAdmin = item
-			break
-		}
-		if deletingMatch == nil {
-			deletingMatch = item
-		}
-	}
-	if matchedAdmin == nil {
-		matchedAdmin = deletingMatch
-	}
-	if matchedAdmin == nil {
+	savedMeta := extractSyncedAdminEndpointMeta(task.Status.Conditions)
+	matchedAdmin, prevCli, err := resolveReachablePreviousAdminClient(
+		ctx, r.Client, reader, r.ClientFactory,
+		task.Namespace, prevAdminURL, savedMeta, fallbackAdminName,
+	)
+	if matchedAdmin != nil && isRetiredManagedAdminEndpoint(matchedAdmin, prevAdminURL, savedMeta) {
 		return nil
 	}
-	bypassPrev := !matchedAdmin.DeletionTimestamp.IsZero() && shouldBypassRemoteCleanup(ctx, reader, matchedAdmin)
-	_, prevCli, err := ResolveAdminAndClientWithReader(ctx, r.Client, reader, r.ClientFactory,
-		xxljobv1alpha1.LocalObjectReference{Name: matchedAdmin.Name}, namespace)
+	if matchedAdmin == nil && err == nil {
+		return nil
+	}
+	bypassPrev := matchedAdmin != nil && !matchedAdmin.DeletionTimestamp.IsZero() && shouldBypassRemoteCleanup(ctx, reader, matchedAdmin)
 	if err != nil {
 		if bypassPrev {
 			return nil
 		}
 		return err
+	}
+	if prevCli == nil {
+		return nil
 	}
 	findOnPrev := func() (*xxlclient.JobInfo, error) {
 		if prevJobID > 0 {
@@ -524,6 +593,49 @@ func (r *XxlJobTaskReconciler) cleanupTaskOnPreviousAdmin(
 	return nil
 }
 
+func jobMatchesDeletedTaskFallback(j *batchv1.Job, task *xxljobv1alpha1.XxlJobTask, taskMeta *syncedAdminEndpointMeta) bool {
+	if j == nil || task == nil {
+		return false
+	}
+	expectedExec := strings.TrimSpace(task.Spec.ExecutorRef.Name)
+	if expectedExec != "" {
+		if j.Annotations != nil {
+			if execAnnot := strings.TrimSpace(j.Annotations[proxyexecutor.AnnotationExecutorName]); execAnnot != "" && execAnnot != expectedExec {
+				return false
+			}
+		}
+		if j.Labels != nil {
+			if execLbl := strings.TrimSpace(j.Labels[proxyexecutor.LabelExecutorName]); execLbl != "" && execLbl != proxyexecutor.SanitizeLabel(expectedExec) {
+				return false
+			}
+		}
+	}
+	taskAdminURL := strings.TrimRight(strings.TrimSpace(task.Status.AdminURL), "/")
+	if j.Annotations != nil {
+		jobAdminUID := strings.TrimSpace(j.Annotations[proxyexecutor.AnnotationAdminUID])
+		if taskMeta != nil && taskMeta.AdminUID != "" && jobAdminUID != "" && taskMeta.AdminUID != jobAdminUID {
+			return false
+		}
+		jobDBHash := strings.TrimSpace(j.Annotations[proxyexecutor.AnnotationAdminDatasourceHash])
+		if taskMeta != nil && taskMeta.DatasourceHash != "" && jobDBHash != "" && taskMeta.DatasourceHash != jobDBHash {
+			return false
+		}
+		jobAdminURL := strings.TrimRight(strings.TrimSpace(j.Annotations[proxyexecutor.AnnotationAdminURL]), "/")
+		if taskAdminURL != "" && jobAdminURL != "" && jobAdminURL != taskAdminURL {
+			jobAdminName := strings.TrimSpace(j.Annotations[proxyexecutor.AnnotationAdminName])
+			sameManaged := taskMeta != nil &&
+				taskMeta.AdminName != "" &&
+				(jobAdminName == "" || jobAdminName == taskMeta.AdminName) &&
+				taskMeta.DatasourceHash != "" &&
+				jobDBHash == taskMeta.DatasourceHash
+			if !sameManaged {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // cleanupActiveTaskJobs suspends and deletes all incomplete batch/v1.Jobs for this task across any executor or historical jobId in the namespace (fixes R6-P2-1, R6-P2-14, R9-P1-2).
 func (r *XxlJobTaskReconciler) cleanupActiveTaskJobs(ctx context.Context, reader client.Reader, task *xxljobv1alpha1.XxlJobTask) error {
 	matchLabels := client.MatchingLabels{
@@ -533,20 +645,22 @@ func (r *XxlJobTaskReconciler) cleanupActiveTaskJobs(ctx context.Context, reader
 	if err := reader.List(ctx, &jobList, client.InNamespace(task.Namespace), matchLabels); err != nil {
 		return err
 	}
-	policy := metav1.DeletePropagationBackground
+	policy := metav1.DeletePropagationForeground
 	suspendTrue := true
 	liveQueues := make(map[[2]string]bool)
+	candidateClearQueues := make(map[[2]string]bool)
+	taskMeta := extractSyncedAdminEndpointMeta(task.Status.Conditions)
 	for i := range jobList.Items {
 		j := &jobList.Items[i]
 		taskNameAnnot := ""
 		if j.Annotations != nil {
-			taskNameAnnot = j.Annotations[proxyexecutor.AnnotationTaskName]
+			taskNameAnnot = strings.TrimSpace(j.Annotations[proxyexecutor.AnnotationTaskName])
 		}
 		belongsToTask := false
 		if taskNameAnnot != "" {
 			belongsToTask = (taskNameAnnot == task.Name)
 		} else if task.Status.JobID > 0 && j.Labels != nil && j.Labels[proxyexecutor.LabelJobID] == strconv.Itoa(task.Status.JobID) {
-			belongsToTask = true
+			belongsToTask = jobMatchesDeletedTaskFallback(j, task, taskMeta)
 		}
 		if !belongsToTask {
 			if j.DeletionTimestamp.IsZero() && j.Spec.Suspend != nil && *j.Spec.Suspend && j.Labels != nil {
@@ -558,16 +672,16 @@ func (r *XxlJobTaskReconciler) cleanupActiveTaskJobs(ctx context.Context, reader
 			continue
 		}
 		if j.Labels != nil && j.Labels[proxyexecutor.LabelExecutorName] != "" && j.Labels[proxyexecutor.LabelJobID] != "" {
-			clearSerialQueueDepth(j.Namespace, j.Labels[proxyexecutor.LabelExecutorName], j.Labels[proxyexecutor.LabelJobID])
+			candidateClearQueues[[2]string{j.Labels[proxyexecutor.LabelExecutorName], j.Labels[proxyexecutor.LabelJobID]}] = true
 		}
 		succeeded, failed, _ := proxyexecutor.EvaluateJobCompletion(j)
 		if !j.DeletionTimestamp.IsZero() || succeeded || failed {
 			continue
 		}
 		if j.Spec.Suspend == nil || !*j.Spec.Suspend {
-			patchCopy := j.DeepCopy()
-			patchCopy.Spec.Suspend = &suspendTrue
-			_ = r.Update(ctx, patchCopy)
+			patch := client.MergeFrom(j.DeepCopy())
+			j.Spec.Suspend = &suspendTrue
+			_ = r.Patch(ctx, j, patch)
 		}
 		if err := r.Delete(ctx, j, &client.DeleteOptions{PropagationPolicy: &policy}); err != nil && !apierrors.IsNotFound(err) {
 			return err
@@ -575,10 +689,14 @@ func (r *XxlJobTaskReconciler) cleanupActiveTaskJobs(ctx context.Context, reader
 	}
 	if task.Status.JobID > 0 {
 		jobIDStr := strconv.Itoa(task.Status.JobID)
+		candidateClearQueues[[2]string{proxyexecutor.SanitizeLabel(task.Spec.ExecutorRef.Name), jobIDStr}] = true
 		for _, execLabel := range activeSerialQueueExecutorsForJobID(task.Namespace, jobIDStr) {
-			if !liveQueues[[2]string{execLabel, jobIDStr}] {
-				clearSerialQueueDepth(task.Namespace, execLabel, jobIDStr)
-			}
+			candidateClearQueues[[2]string{execLabel, jobIDStr}] = true
+		}
+	}
+	for qk := range candidateClearQueues {
+		if !liveQueues[qk] {
+			clearSerialQueueDepth(task.Namespace, qk[0], qk[1])
 		}
 	}
 	return nil
@@ -595,6 +713,7 @@ func (r *XxlJobTaskReconciler) updateErrorStatus(ctx context.Context, task *xxlj
 			target.Status.JobGroupID = 0
 			target.Status.AdminURL = ""
 			target.Status.LastExecutionJobName = ""
+			meta.RemoveStatusCondition(&target.Status.Conditions, ConditionAdminEndpointSynced)
 		}
 		target.Status.Synced = false
 		target.Status.Message = msg
@@ -650,12 +769,17 @@ func (r *XxlJobTaskReconciler) mapAdminToTasks(ctx context.Context, obj client.O
 	if !ok {
 		return nil
 	}
-	candidateURLs := make(map[string]bool, 2)
+	candidateURLs := make(map[string]bool, 4)
 	if u := strings.TrimRight(ResolveAdminURL(adminCR), "/"); u != "" {
 		candidateURLs[u] = true
 	}
 	if su := strings.TrimRight(strings.TrimSpace(adminCR.Status.AdminURL), "/"); su != "" {
 		candidateURLs[su] = true
+	}
+	for _, pu := range extractPreviousAdminURLs(adminCR) {
+		if pu != "" {
+			candidateURLs[pu] = true
+		}
 	}
 	var execList xxljobv1alpha1.XxlJobExecutorList
 	_ = r.List(ctx, &execList, client.InNamespace(adminCR.Namespace))
@@ -738,13 +862,22 @@ func executorStatusChangedPredicate() predicate.Predicate {
 			if !ok1 || !ok2 {
 				return false
 			}
+			oldEndpointMsg := ""
+			if c := meta.FindStatusCondition(oldExec.Status.Conditions, ConditionAdminEndpointSynced); c != nil {
+				oldEndpointMsg = c.Message
+			}
+			newEndpointMsg := ""
+			if c := meta.FindStatusCondition(newExec.Status.Conditions, ConditionAdminEndpointSynced); c != nil {
+				newEndpointMsg = c.Message
+			}
 			return oldExec.Status.JobGroupID != newExec.Status.JobGroupID ||
 				oldExec.Status.AdminURL != newExec.Status.AdminURL ||
 				oldExec.Status.Synced != newExec.Status.Synced ||
 				oldExec.Spec.AdminRef != newExec.Spec.AdminRef ||
 				oldExec.Spec.AppName != newExec.Spec.AppName ||
 				oldExec.DeletionTimestamp.IsZero() != newExec.DeletionTimestamp.IsZero() ||
-				extractSyncedExecutorAppName(oldExec) != extractSyncedExecutorAppName(newExec)
+				extractSyncedExecutorAppName(oldExec) != extractSyncedExecutorAppName(newExec) ||
+				oldEndpointMsg != newEndpointMsg
 		},
 		DeleteFunc: func(e event.DeleteEvent) bool {
 			return true

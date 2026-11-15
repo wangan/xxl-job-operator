@@ -3,9 +3,12 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +20,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -3893,6 +3897,2467 @@ func TestBoostEndgameControllerConvergence(t *testing.T) {
 		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: cbJobDeadAdmin.Name}, &afterDeadJob)
 		if controllerutil.ContainsFinalizer(&afterDeadJob, proxyexecutor.JobCallbackFinalizer) {
 			t.Fatalf("expected JobCallbackFinalizer removed immediately when originating Admin is force-deleted")
+		}
+	})
+}
+
+func TestCodexReviewFixesForegroundDeleteInPlaceURLTokenNormAndServiceDNS(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = xxljobv1alpha1.AddToScheme(scheme)
+
+	// Subtest 1: RBAC manifest jobs/finalizers + Controller DeletePropagationForeground (Issue #1)
+	t.Run("Issue1_RBACJobsFinalizersAndControllerForegroundDelete", func(t *testing.T) {
+		rbacBytes, err := os.ReadFile(filepath.Join("..", "..", "config", "manager", "manager.yaml"))
+		if err != nil {
+			t.Fatalf("read config/manager/manager.yaml: %v", err)
+		}
+		if !strings.Contains(string(rbacBytes), "jobs/finalizers") {
+			t.Fatalf("expected config/manager/manager.yaml ClusterRole to grant batch jobs/finalizers update permission")
+		}
+
+		srv, _, _, _, _, _ := setupTestAdminServer(t, nil)
+		defer srv.Close()
+
+		var delMu sync.Mutex
+		deletedPolicies := make(map[string]metav1.DeletionPropagation)
+
+		admin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "fg-admin", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srv.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "fg-tok"},
+			},
+			Status: xxljobv1alpha1.XxlJobAdminStatus{AdminURL: srv.URL},
+		}
+		execCR := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "fg-exec", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: "fg-admin"},
+				AppName:  "fg-app",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+			Status: xxljobv1alpha1.XxlJobExecutorStatus{JobGroupID: 1, AdminURL: srv.URL, Synced: true},
+		}
+		taskCR := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "fg-task",
+				Namespace:  "default",
+				Finalizers: []string{TaskFinalizer},
+			},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: "fg-exec"},
+				JobDesc:         "FG Task",
+				Author:          "ops",
+				ScheduleType:    "CRON",
+				ScheduleConf:    "0 * * * * ?",
+				ExecutorHandler: "fgHandler",
+			},
+			Status: xxljobv1alpha1.XxlJobTaskStatus{JobID: 500, JobGroupID: 1, AdminURL: srv.URL, Synced: true},
+		}
+
+		suspendTrue := true
+		suspendFalse := false
+		staleSuspendedJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "fg-stale-suspended-job",
+				Namespace:         "default",
+				CreationTimestamp: metav1.NewTime(time.Now().Add(-2 * time.Minute)),
+				Finalizers:        []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: "fg-exec",
+					proxyexecutor.LabelJobID:        "500",
+					proxyexecutor.LabelLogID:        "9101",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationTaskName:      "fg-task",
+					proxyexecutor.AnnotationExecutorName:  "fg-exec",
+					proxyexecutor.AnnotationAdminName:     "fg-admin",
+					proxyexecutor.AnnotationAdminURL:      srv.URL,
+					proxyexecutor.AnnotationLogID:         "9101",
+					proxyexecutor.AnnotationBlockStrategy: "DISCARD_LATER",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendTrue},
+		}
+		failedCreateJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "fg-failed-create-job",
+				Namespace:  "default",
+				UID:        types.UID("uid-fc-job"),
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: "fg-exec",
+					proxyexecutor.LabelJobID:        "500",
+					proxyexecutor.LabelLogID:        "9102",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationTaskName:     "fg-task",
+					proxyexecutor.AnnotationExecutorName: "fg-exec",
+					proxyexecutor.AnnotationAdminName:    "fg-admin",
+					proxyexecutor.AnnotationAdminURL:     srv.URL,
+					proxyexecutor.AnnotationLogID:        "9102",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+		}
+		fcEvent := &corev1.Event{
+			ObjectMeta: metav1.ObjectMeta{Name: "fc-ev-1", Namespace: "default"},
+			InvolvedObject: corev1.ObjectReference{
+				Kind:      "Job",
+				Namespace: "default",
+				Name:      failedCreateJob.Name,
+				UID:       failedCreateJob.UID,
+			},
+			Type:    corev1.EventTypeWarning,
+			Reason:  "FailedCreate",
+			Message: "pods \"fg-failed-create-job-abc\" is forbidden: violates PodSecurity \"restricted:latest\"",
+			Count:   2,
+		}
+		activeTaskJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "fg-active-task-job",
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: "fg-exec",
+					proxyexecutor.LabelJobID:        "500",
+					proxyexecutor.LabelLogID:        "9103",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationTaskNamespace: "default",
+					proxyexecutor.AnnotationTaskName:      "fg-task",
+					proxyexecutor.AnnotationExecutorName:  "fg-exec",
+					proxyexecutor.AnnotationAdminName:     "fg-admin",
+					proxyexecutor.AnnotationAdminURL:      srv.URL,
+					proxyexecutor.AnnotationLogID:         "9103",
+				},
+			},
+			Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{Active: 1},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(admin, execCR, taskCR, staleSuspendedJob, failedCreateJob, fcEvent, activeTaskJob).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Delete: func(ctx context.Context, cli client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					if job, ok := obj.(*batchv1.Job); ok {
+						delOpts := &client.DeleteOptions{}
+						delOpts.ApplyOptions(opts)
+						delMu.Lock()
+						if delOpts.PropagationPolicy != nil {
+							deletedPolicies[job.Name] = *delOpts.PropagationPolicy
+						} else {
+							deletedPolicies[job.Name] = ""
+						}
+						delMu.Unlock()
+					}
+					return cli.Delete(ctx, obj, opts...)
+				},
+			}).
+			Build()
+
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: staleSuspendedJob.Name}}); err != nil {
+			t.Fatalf("reconcile staleSuspendedJob: %v", err)
+		}
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: failedCreateJob.Name}}); err != nil {
+			t.Fatalf("reconcile failedCreateJob: %v", err)
+		}
+
+		taskRec := &XxlJobTaskReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		_ = k8sCli.Delete(ctx, taskCR)
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+			t.Fatalf("reconcile deleting taskCR: %v", err)
+		}
+
+		delMu.Lock()
+		defer delMu.Unlock()
+		for _, jn := range []string{staleSuspendedJob.Name, failedCreateJob.Name, activeTaskJob.Name} {
+			if deletedPolicies[jn] != metav1.DeletePropagationForeground {
+				t.Fatalf("expected controller Delete on %s to pass DeletePropagationForeground, got %q", jn, deletedPolicies[jn])
+			}
+		}
+	})
+
+	// Subtest 2: In-place XxlJobAdmin ExternalURL modification (Issue #4)
+	t.Run("Issue4_InPlaceAdminURLModificationCleansOldEndpointAndRoutesInFlightCallbacks", func(t *testing.T) {
+		var failOldServer atomic.Bool
+		srvOldRaw, muOld, regOld, groupsOld, jobsOld, cbsOld := setupTestAdminServer(t, nil)
+		defer srvOldRaw.Close()
+		srvOld := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if failOldServer.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte("transient old admin outage"))
+				return
+			}
+			srvOldRaw.Config.Handler.ServeHTTP(w, r)
+		}))
+		defer srvOld.Close()
+
+		srvNew, muNew, _, groupsNew, jobsNew, cbsNew := setupTestAdminServer(t, nil)
+		defer srvNew.Close()
+
+		admin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "inplace-admin",
+				Namespace: "default",
+				UID:       types.UID("uid-inplace-admin"),
+			},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srvOld.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "inplace-tok"},
+			},
+		}
+		execCR := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "inplace-exec", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: "inplace-admin"},
+				AppName:  "inplace-app",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+		}
+		taskCR := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "inplace-task", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: "inplace-exec"},
+				JobDesc:         "Inplace URL Task",
+				Author:          "ops",
+				ScheduleType:    "CRON",
+				ScheduleConf:    "0 * * * * ?",
+				ExecutorHandler: "inplaceHandler",
+				TriggerStatus:   true,
+				K8sJobTemplate:  &xxljobv1alpha1.K8sJobTemplateSpec{Image: "alpine:3.19"},
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(admin, execCR, taskCR).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+			Build()
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		execRec := &XxlJobExecutorReconciler{Client: k8sCli, Scheme: scheme, DefaultProxyExecutorAddr: "http://proxy.default.svc:9999"}
+		taskRec := &XxlJobTaskReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+
+		// Initial sync on srvOld
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: admin.Name}}); err != nil {
+			t.Fatalf("initial admin reconcile: %v", err)
+		}
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("initial exec reconcile: %v", err)
+		}
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+			t.Fatalf("initial task reconcile: %v", err)
+		}
+		muOld.Lock()
+		if len(groupsOld) != 1 || len(jobsOld) != 1 {
+			muOld.Unlock()
+			t.Fatalf("expected 1 group and 1 job on srvOld, got groups=%d jobs=%d", len(groupsOld), len(jobsOld))
+		}
+		muOld.Unlock()
+
+		// Spawn an in-flight batch/v1.Job triggered by srvOld BEFORE editing Spec.ExternalURL
+		inFlightJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "inplace-inflight-job",
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: execCR.Name,
+					proxyexecutor.LabelJobID:        "500",
+					proxyexecutor.LabelLogID:        "66001",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationTaskNamespace: "default",
+					proxyexecutor.AnnotationTaskName:      taskCR.Name,
+					proxyexecutor.AnnotationExecutorName:  execCR.Name,
+					proxyexecutor.AnnotationAdminName:     admin.Name,
+					proxyexecutor.AnnotationAdminURL:      srvOld.URL,
+					proxyexecutor.AnnotationAdminUID:      string(admin.UID),
+					proxyexecutor.AnnotationLogID:         "66001",
+				},
+			},
+			Status: batchv1.JobStatus{
+				Succeeded:  1,
+				Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+			},
+		}
+		_ = k8sCli.Create(ctx, inFlightJob)
+		_ = k8sCli.Status().Update(ctx, inFlightJob)
+
+		// Edit admin.Spec.ExternalURL in place -> srvNew.URL, and reconcile XxlJobAdminReconciler FIRST!
+		var curAdmin xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: admin.Name}, &curAdmin)
+		curAdmin.Spec.ExternalURL = srvNew.URL
+		curAdmin.Generation++
+		_ = k8sCli.Update(ctx, &curAdmin)
+
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: admin.Name}}); err != nil {
+			t.Fatalf("admin reconcile after in-place ExternalURL edit: %v", err)
+		}
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: admin.Name}, &curAdmin)
+		if curAdmin.Status.AdminURL != srvNew.URL {
+			t.Fatalf("expected Status.AdminURL=%s, got %s", srvNew.URL, curAdmin.Status.AdminURL)
+		}
+		prevCond := meta.FindStatusCondition(curAdmin.Status.Conditions, ConditionPreviousAdminURLs)
+		if prevCond == nil || !strings.Contains(prevCond.Message, srvOld.URL) {
+			t.Fatalf("expected ConditionPreviousAdminURLs to record %s, got %+v", srvOld.URL, prevCond)
+		}
+
+		// While srvOld transiently returns 500, Task migration MUST requeue without creating duplicate schedule on srvNew!
+		failOldServer.Store(true)
+		retryRes, retryErr := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}})
+		if retryErr == nil && retryRes.RequeueAfter == 0 {
+			t.Fatalf("expected task reconcile to retry (RequeueAfter > 0 or err != nil) when previous Admin URL returns transient 500, got res=%+v", retryRes)
+		}
+		var failedTask xxljobv1alpha1.XxlJobTask
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: taskCR.Name}, &failedTask)
+		if failedTask.Status.Synced {
+			t.Fatalf("expected task Status.Synced=false while previous Admin cleanup is failing")
+		}
+		muNew.Lock()
+		newJobsDuringOutage := len(jobsNew)
+		muNew.Unlock()
+		if newJobsDuringOutage != 0 {
+			t.Fatalf("expected 0 jobs created on srvNew before srvOld cleanup succeeds, got %d", newJobsDuringOutage)
+		}
+
+		// Restore srvOld:
+		// 1) In-flight Job callback MUST be delivered to srvOld (NOT srvNew!), even though admin.Status.AdminURL is srvNew!
+		failOldServer.Store(false)
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: inFlightJob.Name}}); err != nil {
+			t.Fatalf("in-flight callback reconcile: %v", err)
+		}
+		muOld.Lock()
+		gotOldCBs := len(*cbsOld)
+		muOld.Unlock()
+		muNew.Lock()
+		gotNewCBs := len(*cbsNew)
+		muNew.Unlock()
+		if gotOldCBs != 1 || gotNewCBs != 0 {
+			t.Fatalf("expected in-flight callback routed to srvOld (1) and not srvNew (0), got old=%d new=%d", gotOldCBs, gotNewCBs)
+		}
+
+		// 2) Reconcile Executor & Task -> old JobInfo, registry, and JobGroup removed from srvOld; new group & job synced on srvNew!
+		// First reconcile Task (removes old JobInfo from srvOld; waits for Executor to sync on srvNew),
+		// then Executor (removes old JobGroup & registry from srvOld and creates new JobGroup on srvNew), then Task again!
+		_, _ = taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}})
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("exec reconcile to srvNew: %v", err)
+		}
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+			t.Fatalf("task reconcile to srvNew: %v", err)
+		}
+
+		muOld.Lock()
+		remOldJobs := len(jobsOld)
+		remOldGroups := len(groupsOld)
+		remOldRegs := len(regOld["inplace-app"])
+		muOld.Unlock()
+		if remOldJobs != 0 || remOldGroups != 0 || remOldRegs != 0 {
+			t.Fatalf("expected srvOld completely cleaned after in-place URL edit, got jobs=%d groups=%d regs=%d",
+				remOldJobs, remOldGroups, remOldRegs)
+		}
+		muNew.Lock()
+		newGroupsCnt := len(groupsNew)
+		newJobsCnt := len(jobsNew)
+		muNew.Unlock()
+		if newGroupsCnt != 1 || newJobsCnt != 1 {
+			t.Fatalf("expected 1 group and 1 job synced on srvNew, got groups=%d jobs=%d", newGroupsCnt, newJobsCnt)
+		}
+
+		// 3) Simulate Operator restart (clearing in-memory endpointAuthCache) AFTER Executor & Task migrated to srvNew,
+		// and verify a long-running in-flight Job from srvOld STILL delivers callback to srvOld via ConditionPreviousAdminURLs!
+		endpointAuthMu.Lock()
+		endpointAuthCache = make(map[string]cachedEndpointAuthSnapshot)
+		endpointAuthOrder = nil
+		endpointAuthMu.Unlock()
+
+		lateInFlightJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "inplace-late-inflight-job",
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: execCR.Name,
+					proxyexecutor.LabelJobID:        "500",
+					proxyexecutor.LabelLogID:        "66002",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName: execCR.Name,
+					proxyexecutor.AnnotationAdminName:    admin.Name,
+					proxyexecutor.AnnotationAdminURL:     srvOld.URL,
+					proxyexecutor.AnnotationAdminUID:     string(admin.UID),
+					proxyexecutor.AnnotationLogID:        "66002",
+				},
+			},
+			Status: batchv1.JobStatus{
+				Succeeded:  1,
+				Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+			},
+		}
+		_ = k8sCli.Create(ctx, lateInFlightJob)
+		_ = k8sCli.Status().Update(ctx, lateInFlightJob)
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: lateInFlightJob.Name}}); err != nil {
+			t.Fatalf("late in-flight callback reconcile after cache flush: %v", err)
+		}
+		muOld.Lock()
+		gotLateOldCBs := len(*cbsOld)
+		muOld.Unlock()
+		if gotLateOldCBs != 2 {
+			t.Fatalf("expected late in-flight callback routed to srvOld via ConditionPreviousAdminURLs (total=2), got %d", gotLateOldCBs)
+		}
+
+		// 4) Switching ExternalURL back to srvOld deduplicates current URL out of ConditionPreviousAdminURLs and records srvNew
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: admin.Name}, &curAdmin)
+		curAdmin.Spec.ExternalURL = srvOld.URL
+		curAdmin.Generation++
+		_ = k8sCli.Update(ctx, &curAdmin)
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: admin.Name}}); err != nil {
+			t.Fatalf("admin reconcile switching back to srvOld: %v", err)
+		}
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: admin.Name}, &curAdmin)
+		prevCondAfterSwitchBack := meta.FindStatusCondition(curAdmin.Status.Conditions, ConditionPreviousAdminURLs)
+		if prevCondAfterSwitchBack == nil || strings.Contains(prevCondAfterSwitchBack.Message, srvOld.URL) || !strings.Contains(prevCondAfterSwitchBack.Message, srvNew.URL) {
+			t.Fatalf("expected ConditionPreviousAdminURLs to contain only %s after switching back to %s, got %+v",
+				srvNew.URL, srvOld.URL, prevCondAfterSwitchBack)
+		}
+	})
+
+	// Subtest 3: AccessTokenSecretRef CRLF/whitespace normalization in Admin container + empty token rejection (Issue #5)
+	t.Run("Issue5_AccessTokenSecretRefContainerNormalizationAndEmptyRejection", func(t *testing.T) {
+		srv, _, _, _, _, _ := setupTestAdminServer(t, nil)
+		defer srv.Close()
+
+		dbSec := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "norm-db-sec", Namespace: "default"},
+			Data:       map[string][]byte{"password": []byte("dbpass")},
+		}
+		tokSec := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "norm-tok-sec", Namespace: "default"},
+			Data:       map[string][]byte{"token": []byte("  \tsec-admin-tok\r\n  ")},
+		}
+		admin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "norm-admin", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Image: "xuxueli/xxl-job-admin:2.4.1",
+				Datasource: xxljobv1alpha1.DatasourceSpec{
+					URL:      "jdbc:mysql://mysql:3306/xxl_job",
+					Username: "root",
+					PasswordSecretRef: &xxljobv1alpha1.SecretKeyReference{
+						Name: "norm-db-sec",
+						Key:  "password",
+					},
+				},
+				Auth: xxljobv1alpha1.AuthSpec{
+					AccessTokenSecretRef: &xxljobv1alpha1.SecretKeyReference{
+						Name: "norm-tok-sec",
+						Key:  "token",
+					},
+				},
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(dbSec, tokSec, admin).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}).
+			Build()
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: admin.Name}}); err != nil {
+			t.Fatalf("reconcile in-cluster admin with CRLF-padded Secret token: %v", err)
+		}
+
+		var deploy appsv1.Deployment
+		if err := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: admin.Name}, &deploy); err != nil {
+			t.Fatalf("get admin deployment: %v", err)
+		}
+		cmdSlice := deploy.Spec.Template.Spec.Containers[0].Command
+		if len(cmdSlice) < 3 || cmdSlice[0] != "/bin/sh" || cmdSlice[1] != "-c" {
+			t.Fatalf("expected /bin/sh -c container Command wrapper on Admin Deployment, got %+v", cmdSlice)
+		}
+
+		// Execute the exact container Command wrapper with a stub `java` binary in PATH and verify normalized env vars!
+		binDir := t.TempDir()
+		stubJava := filepath.Join(binDir, "java")
+		stubScript := "#!/bin/sh\nprintf '%s|%s|%s' \"$XXL_JOB_ACCESSTOKEN\" \"$XXL_JOB_ACCESS_TOKEN\" \"$*\"\n"
+		if err := os.WriteFile(stubJava, []byte(stubScript), 0o755); err != nil {
+			t.Fatalf("write stub java: %v", err)
+		}
+		shEnv := []string{
+			"PATH=" + binDir + ":" + os.Getenv("PATH"),
+			"JAVA_OPTS=-Xmx256m",
+		}
+		for _, ev := range deploy.Spec.Template.Spec.Containers[0].Env {
+			if ev.ValueFrom != nil && ev.ValueFrom.SecretKeyRef != nil && ev.ValueFrom.SecretKeyRef.Name == tokSec.Name {
+				shEnv = append(shEnv, ev.Name+"="+string(tokSec.Data[ev.ValueFrom.SecretKeyRef.Key]))
+			} else if ev.Value != "" {
+				shEnv = append(shEnv, ev.Name+"="+ev.Value)
+			}
+		}
+		shCmd := exec.Command(cmdSlice[0], cmdSlice[1:]...)
+		shCmd.Env = shEnv
+		out, err := shCmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("execute buildAdminContainerCommand failed: %v (out=%q)", err, string(out))
+		}
+		expectedOut := "sec-admin-tok|sec-admin-tok|-Xmx256m -jar /app.jar --server.port=8080 --server.servlet.context-path=/xxl-job-admin"
+		if string(out) != expectedOut {
+			t.Fatalf("expected normalized Admin java invocation %q, got %q", expectedOut, string(out))
+		}
+
+		// Verify whitespace-only Secret is rejected by BOTH XxlJobAdminReconciler and ResolveAdminAndClientWithReader
+		tokSec.Data["token"] = []byte("  \r\n\t  ")
+		_ = k8sCli.Update(ctx, tokSec)
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: admin.Name}}); err == nil {
+			t.Fatalf("expected XxlJobAdminReconciler to reject whitespace-only AccessTokenSecretRef")
+		}
+		if _, _, err := ResolveAdminAndClientWithReader(ctx, k8sCli, k8sCli, nil, xxljobv1alpha1.LocalObjectReference{Name: admin.Name}, "default"); err == nil {
+			t.Fatalf("expected ResolveAdminAndClientWithReader to reject whitespace-only AccessTokenSecretRef")
+		}
+	})
+
+	// Subtest 4: UseServiceDNS backend-status-linked registry maintenance & heartbeats (Issue #6)
+	t.Run("Issue6_UseServiceDNSBackendLinkedRegistryAndHeartbeats", func(t *testing.T) {
+		var regCalls atomic.Int32
+		srvRaw, mu, registries, groups, _, _ := setupTestAdminServer(t, nil)
+		defer srvRaw.Close()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/registry" {
+				regCalls.Add(1)
+			}
+			srvRaw.Config.Handler.ServeHTTP(w, r)
+		}))
+		defer srv.Close()
+
+		admin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "dns-admin", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srv.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "dns-tok"},
+			},
+			Status: xxljobv1alpha1.XxlJobAdminStatus{AdminURL: srv.URL},
+		}
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: "dns-exec-svc", Namespace: "default"},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{"app": "dns-worker"},
+				Ports:    []corev1.ServicePort{{Port: 9999}},
+			},
+		}
+		execCR := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "dns-exec", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef:      xxljobv1alpha1.LocalObjectReference{Name: "dns-admin"},
+				AppName:       "dns-worker-app",
+				Mode:          xxljobv1alpha1.ExecutorModeResident,
+				UseServiceDNS: true,
+				ServiceName:   "dns-exec-svc",
+				ExecutorPort:  9999,
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(admin, svc, execCR).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}).
+			Build()
+
+		execRec := &XxlJobExecutorReconciler{Client: k8sCli, Scheme: scheme, DefaultProxyExecutorAddr: "http://proxy.default.svc:9999"}
+		hbRunner := &RegistryHeartbeatRunner{Client: k8sCli, APIReader: k8sCli}
+		dnsURL := "http://dns-exec-svc.default.svc.cluster.local:9999/"
+
+		// Phase 1: 0 backends -> sentinel address_list, ConditionServiceBackendActive=False, 0 registry heartbeats
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("Phase 1 reconcile (0 backends): %v", err)
+		}
+		_ = hbRunner.RunOnce(ctx)
+		if regCalls.Load() != 0 {
+			t.Fatalf("expected 0 /api/registry calls when Service has 0 backends, got %d", regCalls.Load())
+		}
+		var curExec xxljobv1alpha1.XxlJobExecutor
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: execCR.Name}, &curExec)
+		cond := meta.FindStatusCondition(curExec.Status.Conditions, ConditionServiceBackendActive)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "NoActiveBackends" {
+			t.Fatalf("expected ConditionServiceBackendActive=False/NoActiveBackends, got %+v", cond)
+		}
+		mu.Lock()
+		grp1 := groups[curExec.Status.JobGroupID]
+		mu.Unlock()
+		if !strings.Contains(grp1.AddressList, proxyexecutor.UnavailableExecutorSentinel) {
+			t.Fatalf("expected _unavailable sentinel in address_list when 0 backends, got %q", grp1.AddressList)
+		}
+
+		// Phase 2: 1 ready backend Pod + Endpoints -> dnsURL in address_list & registered + heartbeated by RunOnce
+		backendPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "dns-worker-0",
+				Namespace: "default",
+				Labels:    map[string]string{"app": "dns-worker"},
+			},
+			Status: corev1.PodStatus{
+				Phase:      corev1.PodRunning,
+				PodIP:      "10.244.1.25",
+				Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+			},
+		}
+		ep := &corev1.Endpoints{
+			ObjectMeta: metav1.ObjectMeta{Name: "dns-exec-svc", Namespace: "default"},
+			Subsets: []corev1.EndpointSubset{{
+				Addresses: []corev1.EndpointAddress{{
+					IP:        "10.244.1.25",
+					TargetRef: &corev1.ObjectReference{Kind: "Pod", Namespace: "default", Name: "dns-worker-0"},
+				}},
+			}},
+		}
+		_ = k8sCli.Create(ctx, backendPod)
+		_ = k8sCli.Create(ctx, ep)
+
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("Phase 2 reconcile (1 ready backend): %v", err)
+		}
+		beforeHB := regCalls.Load()
+		if beforeHB == 0 {
+			t.Fatalf("expected Reconcile to register %s in /api/registry when backend becomes ready", dnsURL)
+		}
+		if err := hbRunner.RunOnce(ctx); err != nil {
+			t.Fatalf("Phase 2 RunOnce: %v", err)
+		}
+		if regCalls.Load() <= beforeHB {
+			t.Fatalf("expected RegistryHeartbeatRunner.RunOnce to refresh %s heartbeat (%d -> %d)", dnsURL, beforeHB, regCalls.Load())
+		}
+		mu.Lock()
+		isRegistered := registries["dns-worker-app"][dnsURL]
+		grp2 := groups[curExec.Status.JobGroupID]
+		mu.Unlock()
+		if !isRegistered || grp2.AddressList != dnsURL {
+			t.Fatalf("expected dnsURL registered=%v and address_list=%q, got %q", isRegistered, dnsURL, grp2.AddressList)
+		}
+
+		// Phase 3: Backend transitions to draining (PodReady=False, NotReadyAddresses) ->
+		// address_list switches immediately to _unavailable sentinel, while keep-alive heartbeat continues!
+		backendPod.Status.Conditions = []corev1.PodCondition{{
+			Type:               corev1.PodReady,
+			Status:             corev1.ConditionFalse,
+			LastTransitionTime: metav1.Now(),
+		}}
+		_ = k8sCli.Status().Update(ctx, backendPod)
+		ep.Subsets = []corev1.EndpointSubset{{
+			NotReadyAddresses: []corev1.EndpointAddress{{
+				IP:        "10.244.1.25",
+				TargetRef: &corev1.ObjectReference{Kind: "Pod", Namespace: "default", Name: "dns-worker-0"},
+			}},
+		}}
+		_ = k8sCli.Update(ctx, ep)
+
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("Phase 3 reconcile (draining backend): %v", err)
+		}
+		beforeDrainHB := regCalls.Load()
+		_ = hbRunner.RunOnce(ctx)
+		if regCalls.Load() <= beforeDrainHB {
+			t.Fatalf("expected RegistryHeartbeatRunner.RunOnce to keep-alive heartbeat %s during drain", dnsURL)
+		}
+		mu.Lock()
+		grp3 := groups[curExec.Status.JobGroupID]
+		stillRegDuringDrain := registries["dns-worker-app"][dnsURL]
+		mu.Unlock()
+		if !strings.Contains(grp3.AddressList, proxyexecutor.UnavailableExecutorSentinel) || !stillRegDuringDrain {
+			t.Fatalf("expected sentinel address_list (%q) + active registry keep-alive (%v) during drain", grp3.AddressList, stillRegDuringDrain)
+		}
+
+		// Phase 4: Last backend exits -> RunOnce stops heartbeating immediately AND Reconcile removes dnsURL from xxl_job_registry!
+		_ = k8sCli.Delete(ctx, backendPod)
+		ep.Subsets = nil
+		_ = k8sCli.Update(ctx, ep)
+
+		callsBeforeEmptyHB := regCalls.Load()
+		_ = hbRunner.RunOnce(ctx)
+		if regCalls.Load() != callsBeforeEmptyHB {
+			t.Fatalf("expected RegistryHeartbeatRunner.RunOnce to skip heartbeat immediately when 0 backends remain")
+		}
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("Phase 4 reconcile (0 backends after exit): %v", err)
+		}
+		mu.Lock()
+		regAfterExit := registries["dns-worker-app"][dnsURL]
+		mu.Unlock()
+		if regAfterExit {
+			t.Fatalf("expected %s removed from xxl_job_registry via /api/registryRemove when all backends exited", dnsURL)
+		}
+
+		// Phase 5: ServiceTypeExternalName (no Selector, no Endpoints object) MUST be treated as active (readyCount=1)!
+		extSvc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext-dns-svc", Namespace: "default"},
+			Spec: corev1.ServiceSpec{
+				Type:         corev1.ServiceTypeExternalName,
+				ExternalName: "executor.corp.internal",
+			},
+		}
+		_ = k8sCli.Create(ctx, extSvc)
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: execCR.Name}, &curExec)
+		curExec.Spec.ServiceName = "ext-dns-svc"
+		_ = k8sCli.Update(ctx, &curExec)
+
+		extDNSURL := "http://ext-dns-svc.default.svc.cluster.local:9999/"
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("Phase 5 reconcile (ExternalName service): %v", err)
+		}
+		beforeExtHB := regCalls.Load()
+		if err := hbRunner.RunOnce(ctx); err != nil {
+			t.Fatalf("Phase 5 RunOnce (ExternalName): %v", err)
+		}
+		if regCalls.Load() <= beforeExtHB {
+			t.Fatalf("expected RunOnce to heartbeat ExternalName Service %s", extDNSURL)
+		}
+		mu.Lock()
+		grpExt := groups[curExec.Status.JobGroupID]
+		regExt := registries["dns-worker-app"][extDNSURL]
+		mu.Unlock()
+		if grpExt.AddressList != extDNSURL || !regExt {
+			t.Fatalf("expected ExternalName Service address_list=%q and registered=%v, got %q", extDNSURL, regExt, grpExt.AddressList)
+		}
+	})
+
+	// Subtest 5: Inline AccessToken preserves native ENTRYPOINT, resolvePreviousAdminClient guards,
+	// and XxlJobTask deletion cleans previous Admin on broken target ref + scopes LabelJobID fallback to AdminURL
+	t.Run("ReviewRound2_InlineEntrypoint_PrevClientGuards_And_TaskDeletionIsolation", func(t *testing.T) {
+		// (a) Inline AccessToken (no AccessTokenSecretRef) MUST leave Containers[0].Command nil
+		dbSecInline := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "inline-db-sec", Namespace: "default"},
+			Data:       map[string][]byte{"password": []byte("dbpass")},
+		}
+		adminInline := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "inline-admin", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Image: "custom/distroless-xxl-admin:2.4.1",
+				Datasource: xxljobv1alpha1.DatasourceSpec{
+					URL:               "jdbc:mysql://mysql:3306/xxl_job",
+					Username:          "root",
+					PasswordSecretRef: &xxljobv1alpha1.SecretKeyReference{Name: "inline-db-sec", Key: "password"},
+				},
+				Auth: xxljobv1alpha1.AuthSpec{
+					AccessToken: "  inline-tok\r\n ",
+				},
+			},
+		}
+		k8sInline := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(dbSecInline, adminInline).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}).
+			Build()
+		inlineRec := &XxlJobAdminReconciler{Client: k8sInline, APIReader: k8sInline, Scheme: scheme}
+		if _, err := inlineRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminInline.Name}}); err != nil {
+			t.Fatalf("reconcile inline-token admin: %v", err)
+		}
+		var inlineDeploy appsv1.Deployment
+		if err := k8sInline.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminInline.Name}, &inlineDeploy); err != nil {
+			t.Fatalf("get inline admin deployment: %v", err)
+		}
+		if len(inlineDeploy.Spec.Template.Spec.Containers[0].Command) != 0 {
+			t.Fatalf("expected Containers[0].Command to remain unset when AccessTokenSecretRef is nil, got %+v",
+				inlineDeploy.Spec.Template.Spec.Containers[0].Command)
+		}
+
+		// (b) resolvePreviousAdminClient rejects whitespace-only AccessTokenSecretRef & resolves pre-upgrade svc host via fallbackAdminName
+		emptyTokSec := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "prev-ws-sec", Namespace: "default"},
+			Data:       map[string][]byte{"token": []byte(" \t\r\n ")},
+		}
+		prevAdmin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "pre-upg-admin", Namespace: "default", UID: types.UID("uid-pre")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Port: 8081, // edited in place from 8080 -> 8081 while Status.AdminURL was empty pre-upgrade
+				Auth: xxljobv1alpha1.AuthSpec{
+					AccessTokenSecretRef: &xxljobv1alpha1.SecretKeyReference{Name: "prev-ws-sec", Key: "token"},
+				},
+			},
+		}
+		k8sPrev := fake.NewClientBuilder().WithScheme(scheme).WithObjects(emptyTokSec, prevAdmin).Build()
+		oldInternalURL := "http://pre-upg-admin.default.svc.cluster.local:8080/xxl-job-admin"
+		matchedPrev, prevCli, prevErr := resolvePreviousAdminClient(ctx, k8sPrev, k8sPrev, nil, "default", oldInternalURL, nil, "pre-upg-admin")
+		if matchedPrev == nil || prevErr == nil || prevCli != nil {
+			t.Fatalf("expected resolvePreviousAdminClient to match pre-upg-admin via fallbackAdminName and reject whitespace-only Secret, got admin=%v cli=%v err=%v",
+				matchedPrev, prevCli, prevErr)
+		}
+		emptyTokSec.Data["token"] = []byte("valid-prev-tok\n")
+		_ = k8sPrev.Update(ctx, emptyTokSec)
+		matchedPrev2, prevCli2, prevErr2 := resolvePreviousAdminClient(ctx, k8sPrev, k8sPrev, nil, "default", oldInternalURL, nil, "pre-upg-admin")
+		if prevErr2 != nil || matchedPrev2 == nil || prevCli2 == nil {
+			t.Fatalf("expected resolvePreviousAdminClient to succeed once Secret has non-empty token, got admin=%v cli=%v err=%v",
+				matchedPrev2, prevCli2, prevErr2)
+		}
+
+		// (c) XxlJobTask deletion when execCR.Spec.AdminRef points to a missing Admin still cleans previous Admin schedule immediately,
+		// AND cleanupActiveTaskJobs scopes LabelJobID fallback to task.Status.AdminURL + executor!
+		srvA, muA, _, _, jobsA, _ := setupTestAdminServer(t, nil)
+		defer srvA.Close()
+
+		adminTaskA := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-del-admin-a", Namespace: "default", UID: types.UID("uid-del-a")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srvA.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "del-tok"},
+			},
+			Status: xxljobv1alpha1.XxlJobAdminStatus{AdminURL: srvA.URL},
+		}
+		execTask := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-del-exec", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: "task-del-admin-a"},
+				AppName:  "task-del-app",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+		}
+		taskDel := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-del-mig", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: "task-del-exec"},
+				JobDesc:         "Delete During Broken Migration",
+				Author:          "ops",
+				ScheduleType:    "CRON",
+				ScheduleConf:    "0 * * * * ?",
+				TriggerStatus:   true,
+				ExecutorHandler: "delHandler",
+			},
+		}
+		k8sDel := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(adminTaskA, execTask, taskDel).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+			Build()
+
+		execRecDel := &XxlJobExecutorReconciler{Client: k8sDel, APIReader: k8sDel, Scheme: scheme, DefaultProxyExecutorAddr: "http://proxy.default.svc:9999"}
+		taskRecDel := &XxlJobTaskReconciler{Client: k8sDel, APIReader: k8sDel, Scheme: scheme}
+		_, _ = execRecDel.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execTask.Name}})
+		_, _ = taskRecDel.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskDel.Name}})
+
+		var syncedDelTask xxljobv1alpha1.XxlJobTask
+		_ = k8sDel.Get(ctx, types.NamespacedName{Namespace: "default", Name: taskDel.Name}, &syncedDelTask)
+		oldJobID := syncedDelTask.Status.JobID
+		if oldJobID <= 0 {
+			t.Fatalf("expected task-del-mig synced on admin-a, got status=%+v", syncedDelTask.Status)
+		}
+
+		// Create 2 active Jobs WITHOUT AnnotationTaskName sharing LabelJobID=oldJobID:
+		// 1) jobOwnedOldAdmin from srvA.URL -> MUST be deleted when task-del-mig is deleted
+		// 2) jobForeignAdmin from http://foreign-admin:8080/xxl-job-admin -> MUST NOT be deleted!
+		jobIDStr := strconv.Itoa(oldJobID)
+		suspendFalse := false
+		jobOwnedOldAdmin := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "job-owned-old-admin",
+				Namespace: "default",
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel(execTask.Name),
+					proxyexecutor.LabelJobID:        jobIDStr,
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName: execTask.Name,
+					proxyexecutor.AnnotationAdminURL:     srvA.URL,
+				},
+			},
+			Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{Active: 1},
+		}
+		jobForeignAdmin := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "job-foreign-admin",
+				Namespace: "default",
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel(execTask.Name),
+					proxyexecutor.LabelJobID:        jobIDStr,
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName: execTask.Name,
+					proxyexecutor.AnnotationAdminURL:     "http://foreign-admin:8080/xxl-job-admin",
+				},
+			},
+			Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{Active: 1},
+		}
+		_ = k8sDel.Create(ctx, jobOwnedOldAdmin)
+		_ = k8sDel.Create(ctx, jobForeignAdmin)
+
+		// Point execTask.Spec.AdminRef to a nonexistent "missing-target-admin", then delete task-del-mig!
+		var curExecDel xxljobv1alpha1.XxlJobExecutor
+		_ = k8sDel.Get(ctx, types.NamespacedName{Namespace: "default", Name: execTask.Name}, &curExecDel)
+		curExecDel.Spec.AdminRef.Name = "missing-target-admin"
+		_ = k8sDel.Update(ctx, &curExecDel)
+
+		_ = k8sDel.Delete(ctx, &syncedDelTask)
+		// First reconcile: target Admin is missing, yet task-del-mig MUST immediately stop & delete oldJobID on srvA!
+		_, _ = taskRecDel.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskDel.Name}})
+		muA.Lock()
+		_, stillOnAdminA := jobsA[oldJobID]
+		muA.Unlock()
+		if stillOnAdminA {
+			t.Fatalf("expected XxlJobTask deletion to immediately remove jobId=%d from previous healthy Admin even when target AdminRef is missing", oldJobID)
+		}
+
+		// Restore AdminRef (or set force-delete) so deletion completes cleanupActiveTaskJobs; restore status fields on a fresh task
+		// to test cleanupActiveTaskJobs scoping directly as well:
+		testScopeTask := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "task-del-mig", Namespace: "default"},
+			Spec:       taskDel.Spec,
+			Status: xxljobv1alpha1.XxlJobTaskStatus{
+				JobID:    oldJobID,
+				AdminURL: srvA.URL,
+			},
+		}
+		if err := taskRecDel.cleanupActiveTaskJobs(ctx, k8sDel, testScopeTask); err != nil {
+			t.Fatalf("cleanupActiveTaskJobs: %v", err)
+		}
+		if err := k8sDel.Get(ctx, types.NamespacedName{Namespace: "default", Name: "job-owned-old-admin"}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("expected job-owned-old-admin (%s) to be deleted by cleanupActiveTaskJobs, got err=%v", srvA.URL, err)
+		}
+		if err := k8sDel.Get(ctx, types.NamespacedName{Namespace: "default", Name: "job-foreign-admin"}, &batchv1.Job{}); err != nil {
+			t.Fatalf("expected job-foreign-admin (different AdminURL) NOT to be deleted by cleanupActiveTaskJobs, got err=%v", err)
+		}
+	})
+}
+
+func TestRound2SyncedEndpointJSONManagedTransitionsRestartAuthAndHardening(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = xxljobv1alpha1.AddToScheme(scheme)
+
+	// Subtest 1: Real end-to-end ConditionAdminEndpointSynced JSON wire format written by controllers and consumed by ProxyExecutor
+	t.Run("EndToEndControllerToProxyExecutorSyncedEndpointJSON", func(t *testing.T) {
+		srvA, _, _, _, _, _ := setupTestAdminServer(t, nil)
+		defer srvA.Close()
+		srvB, _, _, _, _, _ := setupTestAdminServer(t, nil)
+		defer srvB.Close()
+
+		adminA := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "e2e-admin-a", Namespace: "default", UID: types.UID("uid-e2e-a")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srvA.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "e2e-tok"},
+			},
+		}
+		adminB := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "e2e-admin-b", Namespace: "default", UID: types.UID("uid-e2e-b")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srvB.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "e2e-tok"},
+			},
+		}
+		execCR := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "e2e-proxy-exec", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: "e2e-admin-a"},
+				AppName:  "e2e-proxy-app",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+		}
+		taskCR := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "e2e-proxy-task", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: "e2e-proxy-exec"},
+				JobDesc:         "E2E JSON Wire Format Task",
+				Author:          "ops",
+				ScheduleType:    "CRON",
+				ScheduleConf:    "0 * * * * ?",
+				ExecutorHandler: "e2eHandler",
+				K8sJobTemplate: &xxljobv1alpha1.K8sJobTemplateSpec{
+					Image:   "alpine:3.19",
+					Command: []string{"/bin/sh", "-c"},
+					Args:    []string{"echo ok"},
+				},
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(adminA, adminB, execCR, taskCR).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+			Build()
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		execRec := &XxlJobExecutorReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, DefaultProxyExecutorAddr: "http://proxy.default.svc:9999"}
+		taskRec := &XxlJobTaskReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+
+		for _, n := range []string{adminA.Name, adminB.Name} {
+			for i := 0; i < 2; i++ {
+				if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: n}}); err != nil {
+					t.Fatalf("reconcile admin %s: %v", n, err)
+				}
+			}
+		}
+		for i := 0; i < 2; i++ {
+			if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+				t.Fatalf("reconcile exec: %v", err)
+			}
+		}
+		for i := 0; i < 2; i++ {
+			if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+				t.Fatalf("reconcile task: %v", err)
+			}
+		}
+
+		var syncedTask xxljobv1alpha1.XxlJobTask
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: taskCR.Name}, &syncedTask)
+		jobID := syncedTask.Status.JobID
+		if jobID <= 0 {
+			t.Fatalf("expected positive JobID after real controller reconcile, got %+v", syncedTask.Status)
+		}
+
+		proxySrv := proxyexecutor.NewServer(k8sCli, ":0", "default", "")
+		proxySrv.ValidateToken = func(vCtx context.Context, ns, execName, tok string) error {
+			return ValidateExecutorAccessToken(vCtx, k8sCli, k8sCli, ns, execName, tok)
+		}
+		ts := httptest.NewServer(proxySrv.Handler())
+		defer ts.Close()
+
+		postRun := func(p xxlclient.TriggerParam) xxlclient.ReturnT {
+			t.Helper()
+			b, _ := json.Marshal(p)
+			req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/proxy/default/%s/run", ts.URL, execCR.Name), strings.NewReader(string(b)))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(xxlclient.AccessTokenHeader, "e2e-tok")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("POST /run failed: %v", err)
+			}
+			defer resp.Body.Close()
+			var ret xxlclient.ReturnT
+			_ = json.NewDecoder(resp.Body).Decode(&ret)
+			return ret
+		}
+
+		// 1) Pre-reconcile Spec.AdminRef switch (e2e-admin-a -> e2e-admin-b BEFORE controller reconciles Status.AdminURL):
+		// ProxyExecutor MUST decode real JSON ConditionAdminEndpointSynced written by XxlJobTaskReconciler and stamp e2e-admin-a + uid-e2e-a!
+		var liveExec xxljobv1alpha1.XxlJobExecutor
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: execCR.Name}, &liveExec)
+		liveExec.Spec.AdminRef.Name = "e2e-admin-b"
+		_ = k8sCli.Update(ctx, &liveExec)
+
+		if ret := postRun(xxlclient.TriggerParam{
+			JobID:                 jobID,
+			ExecutorHandler:       "e2eHandler",
+			ExecutorBlockStrategy: "SERIAL_EXECUTION",
+			LogID:                 701,
+			LogDateTime:           1700000000701,
+		}); !ret.IsSuccess() {
+			t.Fatalf("expected pre-reconcile SERIAL trigger to succeed, got %+v", ret)
+		}
+		var preRecJob batchv1.Job
+		if err := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: proxyexecutor.BuildJobName(execCR.Name, jobID, 701)}, &preRecJob); err != nil {
+			t.Fatalf("get preRecJob: %v", err)
+		}
+		if preRecJob.Annotations[proxyexecutor.AnnotationAdminName] != "e2e-admin-a" ||
+			preRecJob.Annotations[proxyexecutor.AnnotationAdminUID] != "uid-e2e-a" ||
+			preRecJob.Annotations[proxyexecutor.AnnotationAdminURL] != strings.TrimRight(srvA.URL, "/") {
+			t.Fatalf("expected pre-reconcile Job to stamp full JSON-decoded admin-a origin, got %+v", preRecJob.Annotations)
+		}
+
+		// 2) Complete controller migration to e2e-admin-b, simulate GC'd LastExecutionJobName=999999 on uid-e2e-b,
+		// then recreate same-name/same-URL e2e-admin-b with new UID uid-e2e-b-v2 before controller reconciles Task:
+		// COVER_EARLY logId=5 MUST read uid-e2e-b from real JSON ConditionAdminEndpointSynced and NOT be discarded!
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("migrate exec to admin-b: %v", err)
+		}
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+			t.Fatalf("migrate task to admin-b: %v", err)
+		}
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: taskCR.Name}, &syncedTask)
+		jobIDOnB := syncedTask.Status.JobID
+		syncedTask.Status.LastExecutionJobName = proxyexecutor.BuildJobName(execCR.Name, jobIDOnB, 999999)
+		_ = k8sCli.Status().Update(ctx, &syncedTask)
+
+		var curAdminB xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: "e2e-admin-b"}, &curAdminB)
+		curAdminB.Finalizers = nil
+		_ = k8sCli.Update(ctx, &curAdminB)
+		_ = k8sCli.Delete(ctx, &curAdminB)
+		recreatedB := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "e2e-admin-b", Namespace: "default", UID: types.UID("uid-e2e-b-v2")},
+			Spec:       adminB.Spec,
+			Status:     curAdminB.Status,
+		}
+		_ = k8sCli.Create(ctx, recreatedB)
+		purgeExecutorTokenCache("default", execCR.Name)
+
+		if ret := postRun(xxlclient.TriggerParam{
+			JobID:                 jobIDOnB,
+			ExecutorHandler:       "e2eHandler",
+			ExecutorBlockStrategy: "COVER_EARLY",
+			LogID:                 5,
+			LogDateTime:           1700000005000,
+		}); !ret.IsSuccess() {
+			t.Fatalf("expected COVER_EARLY logId=5 on recreated same-URL Admin (uid-e2e-b-v2) to succeed over real controller JSON, got %+v", ret)
+		}
+	})
+
+	// Subtest 2: Managed XxlJobAdmin in-place Spec.Port / Spec.ContextPath edit (same DB) vs Datasource.URL change
+	t.Run("ManagedAdminInPlacePortAndContextPathSmoothTransitionAndCallbackRouting", func(t *testing.T) {
+		sharedBackend, sharedMu, sharedReg, sharedGroups, sharedJobs, sharedCBs := setupTestAdminServer(t, nil)
+		defer sharedBackend.Close()
+
+		secondDBBackend, secondMu, _, secondGroups, secondJobs, _ := setupTestAdminServer(t, nil)
+		defer secondDBBackend.Close()
+
+		oldClusterURL := "http://mgr-inp-admin.default.svc.cluster.local:8080/xxl-job-admin"
+		newClusterURL := "http://mgr-inp-admin.default.svc.cluster.local:8081/scheduler"
+		thirdClusterURL := "http://mgr-inp-admin.default.svc.cluster.local:8082/scheduler"
+
+		var activePort int32 = 8080
+		var activePath = "/xxl-job-admin"
+		var activeDB = "db1"
+		var deadOldEndpointHits atomic.Int32
+
+		routerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			activeRoute := fmt.Sprintf("/port%d%s", atomic.LoadInt32(&activePort), activePath)
+			if !strings.HasPrefix(r.URL.Path, activeRoute+"/") && r.URL.Path != activeRoute {
+				deadOldEndpointHits.Add(1)
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = w.Write([]byte("connection refused on replaced in-cluster Service port/contextPath"))
+				return
+			}
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = strings.TrimPrefix(r.URL.Path, activeRoute)
+			if r2.URL.Path == "" {
+				r2.URL.Path = "/"
+			}
+			if activeDB == "db1" {
+				sharedBackend.Config.Handler.ServeHTTP(w, r2)
+			} else {
+				secondDBBackend.Config.Handler.ServeHTTP(w, r2)
+			}
+		}))
+		defer routerSrv.Close()
+
+		factory := func(cfg xxlclient.Config) (*xxlclient.Client, error) {
+			var routePrefix string
+			switch strings.TrimRight(cfg.BaseURL, "/") {
+			case oldClusterURL:
+				routePrefix = "/port8080/xxl-job-admin"
+			case newClusterURL:
+				routePrefix = "/port8081/scheduler"
+			case thirdClusterURL:
+				routePrefix = "/port8082/scheduler"
+			default:
+				return nil, fmt.Errorf("unexpected BaseURL %q", cfg.BaseURL)
+			}
+			routedCfg := cfg
+			routedCfg.BaseURL = routerSrv.URL + routePrefix
+			return xxlclient.NewClient(routedCfg)
+		}
+
+		managedAdmin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "mgr-inp-admin", Namespace: "default", UID: types.UID("uid-mgr-inp")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Image:       "xuxueli/xxl-job-admin:2.4.1",
+				Port:        8080,
+				ContextPath: "/xxl-job-admin",
+				Datasource: xxljobv1alpha1.DatasourceSpec{
+					URL:      "jdbc:mysql://mysql:3306/xxl_job",
+					Username: "root",
+					Password: "pwd",
+				},
+				Auth: xxljobv1alpha1.AuthSpec{AccessToken: "mgr-inp-tok"},
+			},
+		}
+		execCR := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "mgr-inp-exec", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: "mgr-inp-admin"},
+				AppName:  "mgr-inp-app",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+		}
+		taskCR := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "mgr-inp-task", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: "mgr-inp-exec"},
+				JobDesc:         "Managed InPlace Port Edit Task",
+				Author:          "ops",
+				ScheduleType:    "CRON",
+				ScheduleConf:    "0 * * * * ?",
+				TriggerStatus:   true,
+				ExecutorHandler: "mgrInpHandler",
+				K8sJobTemplate: &xxljobv1alpha1.K8sJobTemplateSpec{
+					Image:   "alpine:3.19",
+					Command: []string{"/bin/sh", "-c"},
+					Args:    []string{"echo ok"},
+				},
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(managedAdmin, execCR, taskCR).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+			Build()
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		execRec := &XxlJobExecutorReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: factory, DefaultProxyExecutorAddr: "http://proxy.default.svc:9999"}
+		taskRec := &XxlJobTaskReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: factory}
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: factory}
+		hbRunner := &RegistryHeartbeatRunner{Client: k8sCli, APIReader: k8sCli, ClientFactory: factory}
+
+		for i := 0; i < 2; i++ {
+			if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: managedAdmin.Name}}); err != nil {
+				t.Fatalf("initial admin reconcile: %v", err)
+			}
+		}
+		var dep appsv1.Deployment
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: managedAdmin.Name}, &dep)
+		dep.Status.ReadyReplicas = 1
+		_ = k8sCli.Status().Update(ctx, &dep)
+		_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: managedAdmin.Name}})
+
+		for i := 0; i < 2; i++ {
+			if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+				t.Fatalf("initial exec reconcile: %v", err)
+			}
+		}
+		for i := 0; i < 2; i++ {
+			if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+				t.Fatalf("initial task reconcile: %v", err)
+			}
+		}
+
+		var syncedExec xxljobv1alpha1.XxlJobExecutor
+		var syncedTask xxljobv1alpha1.XxlJobTask
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: execCR.Name}, &syncedExec)
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: taskCR.Name}, &syncedTask)
+		initialGroupID := syncedExec.Status.JobGroupID
+		initialJobID := syncedTask.Status.JobID
+		if initialGroupID <= 0 || initialJobID <= 0 {
+			t.Fatalf("expected initialGroupID>0 and initialJobID>0, got group=%d job=%d", initialGroupID, initialJobID)
+		}
+
+		// Spawn an in-flight batch/v1.Job BEFORE modifying Spec.Port and Spec.ContextPath
+		proxySrv := proxyexecutor.NewServer(k8sCli, ":0", "default", "")
+		proxySrv.ValidateToken = func(vCtx context.Context, ns, execName, tok string) error {
+			return ValidateExecutorAccessToken(vCtx, k8sCli, k8sCli, ns, execName, tok)
+		}
+		ts := httptest.NewServer(proxySrv.Handler())
+		defer ts.Close()
+		trigBody, _ := json.Marshal(xxlclient.TriggerParam{
+			JobID:           initialJobID,
+			ExecutorHandler: "mgrInpHandler",
+			LogID:           8801,
+			LogDateTime:     1700000008801,
+		})
+		req, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/proxy/default/%s/run", ts.URL, execCR.Name), strings.NewReader(string(trigBody)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(xxlclient.AccessTokenHeader, "mgr-inp-tok")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("trigger in-flight job before port edit: %v", err)
+		}
+		resp.Body.Close()
+		inFlightJobName := proxyexecutor.BuildJobName(execCR.Name, initialJobID, 8801)
+
+		// Now modify Spec.Port (8080 -> 8081) and Spec.ContextPath (/xxl-job-admin -> /scheduler) in place with unchanged Datasource.URL!
+		var curAdmin xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: managedAdmin.Name}, &curAdmin)
+		curAdmin.Spec.Port = 8081
+		curAdmin.Spec.ContextPath = "/scheduler"
+		curAdmin.Generation++
+		_ = k8sCli.Update(ctx, &curAdmin)
+
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: managedAdmin.Name}}); err != nil {
+			t.Fatalf("reconcile admin after port/contextPath edit: %v", err)
+		}
+		// Immediately switch live cluster Service port/path to 8081 + /scheduler (old 8080/xxl-job-admin now refuses connections!)
+		atomic.StoreInt32(&activePort, 8081)
+		activePath = "/scheduler"
+
+		// Heartbeat runner BEFORE ExecutorReconciler runs must still heartbeat to updated 8081/scheduler
+		sharedMu.Lock()
+		clear(sharedReg)
+		sharedMu.Unlock()
+		hbRunner.RunOnce(ctx)
+		sharedMu.Lock()
+		hbDelivered := len(sharedReg["mgr-inp-app"]) > 0
+		sharedMu.Unlock()
+		if !hbDelivered {
+			t.Fatalf("expected RegistryHeartbeatRunner to keep heartbeating during same-DB managed Port/ContextPath transition")
+		}
+
+		// Reconcile Executor & Task: MUST NOT hit dead 8080/xxl-job-admin and MUST preserve existing JobGroupID & JobID in shared DB!
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("reconcile exec after port/contextPath edit: %v", err)
+		}
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+			t.Fatalf("reconcile task after port/contextPath edit: %v", err)
+		}
+		if hits := deadOldEndpointHits.Load(); hits != 0 {
+			t.Fatalf("expected 0 requests to dead old cluster Service port/path, got %d", hits)
+		}
+
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: execCR.Name}, &syncedExec)
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: taskCR.Name}, &syncedTask)
+		if syncedExec.Status.AdminURL != newClusterURL || syncedExec.Status.JobGroupID != initialGroupID || !syncedExec.Status.Synced {
+			t.Fatalf("expected Executor to smoothly switch to %s preserving JobGroupID=%d, got %+v", newClusterURL, initialGroupID, syncedExec.Status)
+		}
+		if syncedTask.Status.AdminURL != newClusterURL || syncedTask.Status.JobID != initialJobID || !syncedTask.Status.Synced {
+			t.Fatalf("expected Task to smoothly switch to %s preserving JobID=%d, got %+v", newClusterURL, initialJobID, syncedTask.Status)
+		}
+		sharedMu.Lock()
+		_, groupStillPresent := sharedGroups[initialGroupID]
+		_, jobStillPresent := sharedJobs[initialJobID]
+		sharedMu.Unlock()
+		if !groupStillPresent || !jobStillPresent {
+			t.Fatalf("expected shared DB JobGroup (%v) and JobInfo (%v) never to be deleted across Port/ContextPath edit", groupStillPresent, jobStillPresent)
+		}
+
+		// Complete the in-flight Job created BEFORE the port/contextPath edit: callback MUST route to updated 8081/scheduler!
+		var inFlightJob batchv1.Job
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: inFlightJobName}, &inFlightJob)
+		inFlightJob.Status.Succeeded = 1
+		inFlightJob.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+		_ = k8sCli.Status().Update(ctx, &inFlightJob)
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: inFlightJobName}}); err != nil {
+			t.Fatalf("callback reconcile for in-flight job across port edit: %v", err)
+		}
+		if hits := deadOldEndpointHits.Load(); hits != 0 {
+			t.Fatalf("expected callback NOT to hit dead old port, got %d hits", hits)
+		}
+		sharedMu.Lock()
+		gotCBCount := len(*sharedCBs)
+		var gotCBLogID int64
+		if gotCBCount > 0 {
+			gotCBLogID = (*sharedCBs)[0].LogID
+		}
+		sharedMu.Unlock()
+		if gotCBCount != 1 || gotCBLogID != 8801 {
+			t.Fatalf("expected in-flight callback logId=8801 delivered to updated managed endpoint, got count=%d logId=%d", gotCBCount, gotCBLogID)
+		}
+
+		// Contrast: Modifying Spec.Port (8081 -> 8082) AND Spec.Datasource.URL (db1 -> db2) MUST reset IDs and register in db2 without deadlocking on dead 8081!
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: managedAdmin.Name}, &curAdmin)
+		curAdmin.Spec.Port = 8082
+		curAdmin.Spec.Datasource.URL = "jdbc:mysql://mysql-v2:3306/xxl_job_v2"
+		curAdmin.Generation++
+		_ = k8sCli.Update(ctx, &curAdmin)
+		_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: managedAdmin.Name}})
+		activeDB = "db2"
+		atomic.StoreInt32(&activePort, 8082)
+
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("reconcile exec after Datasource.URL + Port change: %v", err)
+		}
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+			t.Fatalf("reconcile task after Datasource.URL + Port change: %v", err)
+		}
+		if hits := deadOldEndpointHits.Load(); hits != 0 {
+			t.Fatalf("expected 0 requests to dead port 8081 when Datasource.URL also changed, got %d", hits)
+		}
+		secondMu.Lock()
+		db2Groups := len(secondGroups)
+		db2Jobs := len(secondJobs)
+		secondMu.Unlock()
+		if db2Groups != 1 || db2Jobs != 1 {
+			t.Fatalf("expected fresh JobGroup and JobInfo created in new Datasource DB, got groups=%d jobs=%d", db2Groups, db2Jobs)
+		}
+	})
+
+	// Subtest 3: Managed XxlJobAdmin switching to pure external mode (ExternalURL != "" && Image == "") never deadlocks on deleted Service
+	t.Run("ManagedToPureExternalModeSwitchNeverDeadlocksOnDeletedClusterService", func(t *testing.T) {
+		srvExt, muExt, _, extGroups, extJobs, extCBs := setupTestAdminServer(t, nil)
+		defer srvExt.Close()
+
+		oldSvcURL := "http://mode-switch-admin.default.svc.cluster.local:8080/xxl-job-admin"
+		switchAdmin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "mode-switch-admin", Namespace: "default", UID: types.UID("uid-mode-switch")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Image: "xuxueli/xxl-job-admin:2.4.1",
+				Datasource: xxljobv1alpha1.DatasourceSpec{
+					URL:      "jdbc:mysql://mysql:3306/xxl_job",
+					Username: "root",
+					Password: "pwd",
+				},
+				Auth: xxljobv1alpha1.AuthSpec{AccessToken: "switch-tok"},
+			},
+		}
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(switchAdmin).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+			Build()
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		for i := 0; i < 2; i++ {
+			if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: switchAdmin.Name}}); err != nil {
+				t.Fatalf("reconcile managed switchAdmin: %v", err)
+			}
+		}
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: switchAdmin.Name}, switchAdmin)
+		syncedMetaMsg := encodeSyncedAdminEndpointMeta(switchAdmin, oldSvcURL)
+
+		execCR := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "mode-switch-exec",
+				Namespace:  "default",
+				Finalizers: []string{ExecutorFinalizer},
+			},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: switchAdmin.Name},
+				AppName:  "mode-switch-app",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+			Status: xxljobv1alpha1.XxlJobExecutorStatus{
+				JobGroupID:          77,
+				AdminURL:            oldSvcURL,
+				RegisteredAddresses: []string{"http://proxy.default.svc:9999/proxy/default/mode-switch-exec/"},
+				Synced:              true,
+				Conditions: []metav1.Condition{{
+					Type:               ConditionAdminEndpointSynced,
+					Status:             metav1.ConditionTrue,
+					Reason:             "EndpointSynced",
+					Message:            syncedMetaMsg,
+					LastTransitionTime: metav1.Now(),
+				}},
+			},
+		}
+		taskCR := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "mode-switch-task",
+				Namespace:  "default",
+				Finalizers: []string{TaskFinalizer},
+			},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: execCR.Name},
+				JobDesc:         "Mode Switch Task",
+				Author:          "ops",
+				ScheduleType:    "CRON",
+				ScheduleConf:    "0 * * * * ?",
+				TriggerStatus:   true,
+				ExecutorHandler: "switchHandler",
+			},
+			Status: xxljobv1alpha1.XxlJobTaskStatus{
+				JobID:      999,
+				JobGroupID: 77,
+				AdminURL:   oldSvcURL,
+				Synced:     true,
+				Conditions: []metav1.Condition{{
+					Type:               ConditionAdminEndpointSynced,
+					Status:             metav1.ConditionTrue,
+					Reason:             "EndpointSynced",
+					Message:            syncedMetaMsg,
+					LastTransitionTime: metav1.Now(),
+				}},
+			},
+		}
+		suspendFalse := false
+		orphanOldSvcJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "xxljob-modeswitch-999-55",
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel(execCR.Name),
+					proxyexecutor.LabelJobID:        "999",
+					proxyexecutor.LabelLogID:        "55",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationTaskNamespace:       "default",
+					proxyexecutor.AnnotationTaskName:            taskCR.Name,
+					proxyexecutor.AnnotationExecutorName:        execCR.Name,
+					proxyexecutor.AnnotationAdminName:           switchAdmin.Name,
+					proxyexecutor.AnnotationAdminUID:            string(switchAdmin.UID),
+					proxyexecutor.AnnotationAdminURL:            oldSvcURL,
+					proxyexecutor.AnnotationAdminDatasourceHash: proxyexecutor.DatasourceURLHash("jdbc:mysql://mysql:3306/xxl_job"),
+					proxyexecutor.AnnotationLogID:               "55",
+					proxyexecutor.AnnotationLogDateTime:         "1700000000055",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{
+				Succeeded:  1,
+				Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+			},
+		}
+		_ = k8sCli.Create(ctx, execCR)
+		_ = k8sCli.Create(ctx, taskCR)
+		_ = k8sCli.Create(ctx, orphanOldSvcJob)
+
+		// Switch XxlJobAdmin to pure ExternalURL mode (ExternalURL != "" && Image == "") -> deletes Deployment & Service!
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: switchAdmin.Name}, switchAdmin)
+		switchAdmin.Spec.Image = ""
+		switchAdmin.Spec.ExternalURL = srvExt.URL
+		switchAdmin.Generation++
+		_ = k8sCli.Update(ctx, switchAdmin)
+
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: switchAdmin.Name}}); err != nil {
+			t.Fatalf("reconcile admin on pure external switch: %v", err)
+		}
+		if err := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: switchAdmin.Name}, &corev1.Service{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("expected owned Service deleted on pure external switch, got %v", err)
+		}
+
+		// Note: ClientFactory is nil (uses real HTTP client), so ANY attempt to dial mode-switch-admin.default.svc.cluster.local would fail!
+		execRec := &XxlJobExecutorReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, DefaultProxyExecutorAddr: "http://proxy.default.svc:9999"}
+		taskRec := &XxlJobTaskReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("exec reconcile after pure external switch must not deadlock on deleted Service: %v", err)
+		}
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+			t.Fatalf("task reconcile after pure external switch must not deadlock on deleted Service: %v", err)
+		}
+
+		var gotExec xxljobv1alpha1.XxlJobExecutor
+		var gotTask xxljobv1alpha1.XxlJobTask
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: execCR.Name}, &gotExec)
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: taskCR.Name}, &gotTask)
+		if !gotExec.Status.Synced || gotExec.Status.AdminURL != strings.TrimRight(srvExt.URL, "/") {
+			t.Fatalf("expected Executor migrated to external URL %s without deadlock, got %+v", srvExt.URL, gotExec.Status)
+		}
+		if !gotTask.Status.Synced || gotTask.Status.AdminURL != strings.TrimRight(srvExt.URL, "/") {
+			t.Fatalf("expected Task migrated to external URL %s without deadlock, got %+v", srvExt.URL, gotTask.Status)
+		}
+		muExt.Lock()
+		extGCount := len(extGroups)
+		extJCount := len(extJobs)
+		muExt.Unlock()
+		if extGCount != 1 || extJCount != 1 {
+			t.Fatalf("expected JobGroup and JobInfo registered on external Admin, got groups=%d jobs=%d", extGCount, extJCount)
+		}
+
+		// Reconcile the completed Job from the deleted internal Service: must NOT deadlock on DNS and must NOT misroute callback to srvExt!
+		res, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: orphanOldSvcJob.Name}})
+		if err != nil || res.RequeueAfter != 0 {
+			t.Fatalf("expected callback reconcile on decommissioned internal Service Job to finish cleanly without retry, got res=%+v err=%v", res, err)
+		}
+		var cleanedJob batchv1.Job
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: orphanOldSvcJob.Name}, &cleanedJob)
+		if controllerutil.ContainsFinalizer(&cleanedJob, proxyexecutor.JobCallbackFinalizer) {
+			t.Fatalf("expected JobCallbackFinalizer released on decommissioned internal Service Job")
+		}
+		muExt.Lock()
+		extCBCount := len(*extCBs)
+		muExt.Unlock()
+		if extCBCount != 0 {
+			t.Fatalf("expected 0 callbacks misrouted to new external Admin, got %d", extCBCount)
+		}
+	})
+
+	// Subtest 4: Operator restart (endpointAuthCache cleared) when old Admin had empty Username (default "admin") & nil SecretRefs
+	// and new Spec simultaneously modified ExternalURL + Username + PasswordSecretRef + AccessTokenSecretRef
+	t.Run("OperatorRestartAuthFallbackPreservesDefaultUsernameAndNilSecretRefs", func(t *testing.T) {
+		srvOldRaw, muOld, _, groupsOld, jobsOld, cbsOld := setupTestAdminServer(t, nil)
+		defer srvOldRaw.Close()
+		var oldAuthFailures atomic.Int32
+		srvOld := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/login" {
+				_ = r.ParseForm()
+				if r.FormValue("userName") != "admin" || r.FormValue("password") != "123456" {
+					oldAuthFailures.Add(1)
+					w.WriteHeader(http.StatusUnauthorized)
+					_, _ = w.Write([]byte("wrong login credentials on srvOld"))
+					return
+				}
+			}
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				if r.Header.Get(xxlclient.AccessTokenHeader) != "old-inline-tok" {
+					oldAuthFailures.Add(1)
+					w.WriteHeader(http.StatusForbidden)
+					_, _ = w.Write([]byte("wrong access token on srvOld"))
+					return
+				}
+			}
+			srvOldRaw.Config.Handler.ServeHTTP(w, r)
+		}))
+		defer srvOld.Close()
+
+		srvNewRaw, muNew, _, groupsNew, jobsNew, _ := setupTestAdminServer(t, nil)
+		defer srvNewRaw.Close()
+		srvNew := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/login" {
+				_ = r.ParseForm()
+				if r.FormValue("userName") != "new-super-admin" || r.FormValue("password") != "new-secret-pwd" {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+			}
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				if r.Header.Get(xxlclient.AccessTokenHeader) != "new-secret-tok" {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+			}
+			srvNewRaw.Config.Handler.ServeHTTP(w, r)
+		}))
+		defer srvNew.Close()
+
+		newCredSec := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "new-admin-creds", Namespace: "default"},
+			Data: map[string][]byte{
+				"password": []byte("new-secret-pwd"),
+				"token":    []byte("new-secret-tok"),
+			},
+		}
+		adminCR := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "restart-auth-admin", Namespace: "default", UID: types.UID("uid-restart-auth")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srvOld.URL,
+				Auth: xxljobv1alpha1.AuthSpec{
+					// Intentionally empty Username (default "admin") and nil PasswordSecretRef/AccessTokenSecretRef!
+					AccessToken: "old-inline-tok",
+				},
+			},
+		}
+		execCR := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "restart-auth-exec", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: adminCR.Name},
+				AppName:  "restart-auth-app",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+		}
+		taskCR := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "restart-auth-task", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: execCR.Name},
+				JobDesc:         "Restart Auth Recovery Task",
+				Author:          "ops",
+				ScheduleType:    "CRON",
+				ScheduleConf:    "0 * * * * ?",
+				TriggerStatus:   true,
+				ExecutorHandler: "restartHandler",
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(newCredSec, adminCR, execCR, taskCR).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+			Build()
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		execRec := &XxlJobExecutorReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, DefaultProxyExecutorAddr: "http://proxy.default.svc:9999"}
+		taskRec := &XxlJobTaskReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+
+		for i := 0; i < 2; i++ {
+			_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}})
+			_, _ = execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}})
+			_, _ = taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}})
+		}
+
+		suspendFalse := false
+		inFlightOldJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "xxljob-restartauth-500-91",
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel(execCR.Name),
+					proxyexecutor.LabelJobID:        "500",
+					proxyexecutor.LabelLogID:        "91",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName: execCR.Name,
+					proxyexecutor.AnnotationAdminName:    adminCR.Name,
+					proxyexecutor.AnnotationAdminUID:     string(adminCR.UID),
+					proxyexecutor.AnnotationAdminURL:     srvOld.URL,
+					proxyexecutor.AnnotationLogID:        "91",
+					proxyexecutor.AnnotationLogDateTime:  "1700000000091",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{
+				Succeeded:  1,
+				Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+			},
+		}
+		_ = k8sCli.Create(ctx, inFlightOldJob)
+
+		// Simultaneously edit ExternalURL AND switch Username="new-super-admin" + PasswordSecretRef + AccessTokenSecretRef
+		// (keeping inline AccessToken="old-inline-tok" untouched as fallback when AccessTokenSecretRef is nil on old meta)
+		var liveAdmin xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminCR.Name}, &liveAdmin)
+		liveAdmin.Spec.ExternalURL = srvNew.URL
+		liveAdmin.Spec.Auth.Username = "new-super-admin"
+		liveAdmin.Spec.Auth.Password = "inline-new-pwd-that-must-not-leak"
+		liveAdmin.Spec.Auth.PasswordSecretRef = &xxljobv1alpha1.SecretKeyReference{Name: newCredSec.Name, Key: "password"}
+		liveAdmin.Spec.Auth.AccessTokenSecretRef = &xxljobv1alpha1.SecretKeyReference{Name: newCredSec.Name, Key: "token"}
+		liveAdmin.Generation++
+		_ = k8sCli.Update(ctx, &liveAdmin)
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}}); err != nil {
+			t.Fatalf("reconcile admin after ExternalURL+Auth update: %v", err)
+		}
+
+		// Simulate Operator restart: wipe in-memory endpointAuthCache and clientCache completely!
+		endpointAuthMu.Lock()
+		clear(endpointAuthCache)
+		endpointAuthOrder = nil
+		endpointAuthMu.Unlock()
+		clientCacheMu.Lock()
+		clear(clientCache)
+		clear(clientCacheByAdmin)
+		clientCacheOrder = nil
+		clientCacheMu.Unlock()
+
+		// Reconcile Task, Executor, and Callback after simulated Operator restart:
+		// MUST authenticate to srvOld with Username="admin", Password="123456" (PasswordSecretRef=nil), Token="old-inline-tok" (AccessTokenSecretRef=nil)!
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+			t.Fatalf("task reconcile after restart failed (leaked new credentials onto old endpoint?): %v", err)
+		}
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("exec reconcile after restart failed (leaked new credentials onto old endpoint?): %v", err)
+		}
+		// Run second task reconcile now that Executor has synced JobGroupID on srvNew
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+			t.Fatalf("second task reconcile on srvNew failed: %v", err)
+		}
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: inFlightOldJob.Name}}); err != nil {
+			t.Fatalf("callback reconcile after restart failed: %v", err)
+		}
+
+		if failures := oldAuthFailures.Load(); failures != 0 {
+			t.Fatalf("expected 0 auth failures on srvOld after Operator restart, got %d (new Username/SecretRef leaked!)", failures)
+		}
+		muOld.Lock()
+		remOldGroups := len(groupsOld)
+		remOldJobs := len(jobsOld)
+		gotOldCBs := len(*cbsOld)
+		muOld.Unlock()
+		if remOldGroups != 0 || remOldJobs != 0 || gotOldCBs != 1 {
+			t.Fatalf("expected srvOld cleaned (groups=%d, jobs=%d) and 1 in-flight callback delivered (cbs=%d)", remOldGroups, remOldJobs, gotOldCBs)
+		}
+		muNew.Lock()
+		gotNewGroups := len(groupsNew)
+		gotNewJobs := len(jobsNew)
+		muNew.Unlock()
+		if gotNewGroups != 1 || gotNewJobs != 1 {
+			t.Fatalf("expected srvNew populated with migrated JobGroup (%d) and JobInfo (%d)", gotNewGroups, gotNewJobs)
+		}
+	})
+
+	// Subtest 5: K8sJobCallbackReconciler holds finalizer/serial queue while FinalizerDeleteDependents is present,
+	// and buildAdminContainerCommand passes -DLOG_HOME="$LOG_HOME" when LOG_HOME is set
+	t.Run("CallbackForegroundDeletionFinalizerGuardAndBuildAdminLogHome", func(t *testing.T) {
+		srv, mu, _, _, _, cbs := setupTestAdminServer(t, nil)
+		defer srv.Close()
+
+		admin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "fg-cb-admin", Namespace: "default", UID: types.UID("uid-fg-cb")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srv.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "fg-cb-tok"},
+			},
+			Status: xxljobv1alpha1.XxlJobAdminStatus{AdminURL: srv.URL},
+		}
+		now := metav1.Now()
+		suspendFalse := false
+		suspendTrue := true
+		delJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              proxyexecutor.BuildJobName("fg-cb-exec", 44, 1),
+				Namespace:         "default",
+				DeletionTimestamp: &now,
+				Finalizers:        []string{proxyexecutor.JobCallbackFinalizer, metav1.FinalizerDeleteDependents},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel("fg-cb-exec"),
+					proxyexecutor.LabelJobID:        "44",
+					proxyexecutor.LabelLogID:        "1",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:  "fg-cb-exec",
+					proxyexecutor.AnnotationAdminName:     admin.Name,
+					proxyexecutor.AnnotationAdminUID:      string(admin.UID),
+					proxyexecutor.AnnotationAdminURL:      srv.URL,
+					proxyexecutor.AnnotationLogID:         "1",
+					proxyexecutor.AnnotationLogDateTime:   "1700000000001",
+					proxyexecutor.AnnotationBlockStrategy: "SERIAL_EXECUTION",
+				},
+			},
+			Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{Active: 0, Terminating: nil},
+		}
+		nextJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName("fg-cb-exec", 44, 2),
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel("fg-cb-exec"),
+					proxyexecutor.LabelJobID:        "44",
+					proxyexecutor.LabelLogID:        "2",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:  "fg-cb-exec",
+					proxyexecutor.AnnotationAdminName:     admin.Name,
+					proxyexecutor.AnnotationAdminUID:      string(admin.UID),
+					proxyexecutor.AnnotationAdminURL:      srv.URL,
+					proxyexecutor.AnnotationLogID:         "2",
+					proxyexecutor.AnnotationLogDateTime:   "1700000000002",
+					proxyexecutor.AnnotationBlockStrategy: "SERIAL_EXECUTION",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendTrue},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(admin, delJob, nextJob).
+			WithStatusSubresource(&batchv1.Job{}).
+			Build()
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+
+		// Reconcile while FinalizerDeleteDependents ("foregroundDeletion") is still present:
+		// Callback is delivered once, JobCallbackFinalizer is retained (RequeueAfter > 0), and nextJob stays suspended!
+		res1, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: delJob.Name}})
+		if err != nil || res1.RequeueAfter == 0 {
+			t.Fatalf("expected RequeueAfter > 0 while foregroundDeletion finalizer is still present, got res=%+v err=%v", res1, err)
+		}
+		var checkNext batchv1.Job
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: nextJob.Name}, &checkNext)
+		if checkNext.Spec.Suspend == nil || !*checkNext.Spec.Suspend {
+			t.Fatalf("expected next SERIAL_EXECUTION Job to stay suspended while foregroundDeletion is still present")
+		}
+		mu.Lock()
+		cbLen := len(*cbs)
+		mu.Unlock()
+		if cbLen != 1 {
+			t.Fatalf("expected 1 callback delivered for deleting Job, got %d", cbLen)
+		}
+
+		// Simulate GC removing FinalizerDeleteDependents once dependent Pods are deleted:
+		var liveDel batchv1.Job
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: delJob.Name}, &liveDel)
+		liveDel.Finalizers = []string{proxyexecutor.JobCallbackFinalizer}
+		_ = k8sCli.Update(ctx, &liveDel)
+
+		res2, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: delJob.Name}})
+		if err != nil || res2.RequeueAfter != 0 {
+			t.Fatalf("expected clean completion once foregroundDeletion is removed, got res=%+v err=%v", res2, err)
+		}
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: nextJob.Name}, &checkNext)
+		if checkNext.Spec.Suspend != nil && *checkNext.Spec.Suspend {
+			t.Fatalf("expected next SERIAL_EXECUTION Job to unsuspend once foregroundDeletion was removed")
+		}
+
+		// Verify buildAdminContainerCommand passes -DLOG_HOME="$LOG_HOME" as a single argument even with spaces in LOG_HOME
+		binDir := t.TempDir()
+		stubJava := filepath.Join(binDir, "java")
+		stubScript := "#!/bin/sh\nfor arg in \"$@\"; do printf '[%s]' \"$arg\"; done\n"
+		if err := os.WriteFile(stubJava, []byte(stubScript), 0o755); err != nil {
+			t.Fatalf("write stub java: %v", err)
+		}
+		cmdSlice := buildAdminContainerCommand()
+		shCmd := exec.Command(cmdSlice[0], cmdSlice[1:]...)
+		shCmd.Env = []string{
+			"PATH=" + binDir + ":" + os.Getenv("PATH"),
+			"JAVA_OPTS=-Xms128m",
+			"LOG_HOME=/data/xxl logs",
+			"PARAMS=--server.port=8080",
+		}
+		out, err := shCmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("execute buildAdminContainerCommand with LOG_HOME: %v (out=%q)", err, string(out))
+		}
+		expectedArgs := "[-Xms128m][-DLOG_HOME=/data/xxl logs][-jar][/app.jar][--server.port=8080]"
+		if string(out) != expectedArgs {
+			t.Fatalf("expected java args %q, got %q", expectedArgs, string(out))
+		}
+	})
+}
+
+func TestAdversarialReviewManagedSameURLDBSwapHybridAndRestartAuthRotation(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = xxljobv1alpha1.AddToScheme(scheme)
+
+	// Subtest 1: Same-URL Spec.Datasource.URL replacement on a managed XxlJobAdmin (db1 -> db2, Port & ContextPath unchanged)
+	// MUST NOT delete unrelated JobGroup IDs in db2, MUST NOT overwrite unmarked manual JobInfo IDs in db2,
+	// MUST reset LastExecutionJobName, and MUST NOT misroute in-flight db1 callbacks into db2!
+	t.Run("SameURLManagedDatasourceSwapNeverCorruptsUnrelatedRowsOrCallbacksInNewDB", func(t *testing.T) {
+		srvDB1, _, _, _, _, _ := setupTestAdminServer(t, nil)
+		defer srvDB1.Close()
+		srvDB2, mu2, _, groups2, jobs2, cbs2 := setupTestAdminServer(t, nil)
+		defer srvDB2.Close()
+
+		// Seed db1 via client so nextGroupID advances and execCR gets JobGroupID=3 and taskCR gets JobID=500
+		seedCli1, _ := xxlclient.NewClient(xxlclient.Config{BaseURL: srvDB1.URL, Username: "admin", Password: "123456", AccessToken: "sameurl-tok"})
+		_, _ = seedCli1.EnsureJobGroup(ctx, xxlclient.JobGroup{AppName: "seed-1", Title: "Seed 1", AddressType: 1, AddressList: "http://127.0.0.1:9999/"})
+		_, _ = seedCli1.EnsureJobGroup(ctx, xxlclient.JobGroup{AppName: "seed-2", Title: "Seed 2", AddressType: 1, AddressList: "http://127.0.0.1:9999/"})
+
+		// Seed db2 via client with 3 unrelated JobGroups (so id=3 in db2 is "unrelated-critical-group" and nextGroupID=4!)
+		// AND an unmarked manual task at id=500 ("Manual Billing Job" without [xjt:...] tag)!
+		seedCli2, _ := xxlclient.NewClient(xxlclient.Config{BaseURL: srvDB2.URL, Username: "admin", Password: "123456", AccessToken: "sameurl-tok"})
+		_, _ = seedCli2.EnsureJobGroup(ctx, xxlclient.JobGroup{AppName: "db2-other-1", Title: "DB2 Other 1", AddressType: 1, AddressList: "http://127.0.0.1:9999/"})
+		_, _ = seedCli2.EnsureJobGroup(ctx, xxlclient.JobGroup{AppName: "db2-other-2", Title: "DB2 Other 2", AddressType: 1, AddressList: "http://127.0.0.1:9999/"})
+		_, _ = seedCli2.EnsureJobGroup(ctx, xxlclient.JobGroup{AppName: "unrelated-critical-group", Title: "Critical Group", AddressType: 1, AddressList: "http://127.0.0.1:9999/"})
+		_, _ = seedCli2.AddJobInfo(ctx, xxlclient.JobInfo{
+			JobGroup:        3,
+			JobDesc:         "Manual Billing Job",
+			Author:          "finance",
+			ScheduleType:    "CRON",
+			ScheduleConf:    "0 0 1 * * ?",
+			ExecutorHandler: "manualBilling",
+			GlueType:        "BEAN",
+		})
+
+		db1URL := "jdbc:mysql://mysql-db1:3306/xxl_job"
+		db2URL := "jdbc:mysql://mysql-db2:3306/xxl_job_v2"
+		svcURL := "http://sameurl-db-admin.default.svc.cluster.local:8080/xxl-job-admin"
+
+		var activeBackend atomic.Int32
+		activeBackend.Store(1)
+
+		adminCR := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "sameurl-db-admin", Namespace: "default", UID: types.UID("uid-sameurl-db")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Image:       "xuxueli/xxl-job-admin:2.4.1",
+				Port:        8080,
+				ContextPath: "/xxl-job-admin",
+				Datasource:  xxljobv1alpha1.DatasourceSpec{URL: db1URL, Username: "root", Password: "pwd"},
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "sameurl-tok"},
+			},
+		}
+		execCR := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "sameurl-db-exec", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: adminCR.Name},
+				AppName:  "my-managed-app",
+				Title:    "My Managed App",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+		}
+		taskCR := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "sameurl-db-task", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: execCR.Name},
+				JobDesc:         "Managed Declarative Task",
+				Author:          "sre",
+				ScheduleType:    "CRON",
+				ScheduleConf:    "0 */5 * * * ?",
+				ExecutorHandler: "managedHandler",
+			},
+		}
+		delTaskCR := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "sameurl-del-task", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: execCR.Name},
+				JobDesc:         "Task Deleted After DB Swap",
+				Author:          "sre",
+				ScheduleType:    "CRON",
+				ScheduleConf:    "0 */10 * * * ?",
+				ExecutorHandler: "delHandler",
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(adminCR, execCR, taskCR, delTaskCR).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+			Build()
+
+		routingFactory := func(cfg xxlclient.Config) (*xxlclient.Client, error) {
+			if strings.TrimRight(cfg.BaseURL, "/") != svcURL {
+				return nil, fmt.Errorf("unexpected baseURL %s", cfg.BaseURL)
+			}
+			cp := cfg
+			if activeBackend.Load() == 1 {
+				cp.BaseURL = srvDB1.URL
+			} else {
+				cp.BaseURL = srvDB2.URL
+			}
+			return xxlclient.NewClient(cp)
+		}
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		execRec := &XxlJobExecutorReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: routingFactory}
+		taskRec := &XxlJobTaskReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: routingFactory}
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: routingFactory}
+
+		for i := 0; i < 2; i++ {
+			_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}})
+			_, _ = execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}})
+			_, _ = taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}})
+			_, _ = taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: delTaskCR.Name}})
+		}
+
+		var syncedExec xxljobv1alpha1.XxlJobExecutor
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: execCR.Name}, &syncedExec)
+		if syncedExec.Status.JobGroupID != 3 {
+			t.Fatalf("expected db1 JobGroupID=3, got %d", syncedExec.Status.JobGroupID)
+		}
+		var syncedTask xxljobv1alpha1.XxlJobTask
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: taskCR.Name}, &syncedTask)
+		if syncedTask.Status.JobID != 500 {
+			t.Fatalf("expected db1 JobID=500, got %d", syncedTask.Status.JobID)
+		}
+		syncedTask.Status.LastExecutionJobName = proxyexecutor.BuildJobName(execCR.Name, 500, 999999)
+		_ = k8sCli.Status().Update(ctx, &syncedTask)
+
+		// Also seed an unmarked manual job at delTaskCR.Status.JobID (501) in db2 via client so nextJobID advances to 502!
+		var syncedDelTask xxljobv1alpha1.XxlJobTask
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: delTaskCR.Name}, &syncedDelTask)
+		seededDelID, _ := seedCli2.AddJobInfo(ctx, xxlclient.JobInfo{
+			JobGroup:        3,
+			JobDesc:         "Unmarked Manual Job In Group 3",
+			Author:          "ops",
+			ScheduleType:    "CRON",
+			ScheduleConf:    "0 0 2 * * ?",
+			ExecutorHandler: "manualOps",
+			GlueType:        "BEAN",
+		})
+		if seededDelID != syncedDelTask.Status.JobID {
+			t.Fatalf("expected seeded manual job ID=%d in db2 to collide with delTaskCR JobID=%d", seededDelID, syncedDelTask.Status.JobID)
+		}
+
+		// Create an in-flight Job from db1 before swapping Datasource.URL
+		suspendFalse := false
+		db1Job := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName(execCR.Name, 500, 7001),
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel(execCR.Name),
+					proxyexecutor.LabelJobID:        "500",
+					proxyexecutor.LabelLogID:        "7001",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:        execCR.Name,
+					proxyexecutor.AnnotationAdminName:           adminCR.Name,
+					proxyexecutor.AnnotationAdminUID:            string(adminCR.UID),
+					proxyexecutor.AnnotationAdminURL:            svcURL,
+					proxyexecutor.AnnotationAdminDatasourceHash: proxyexecutor.DatasourceURLHash(db1URL),
+					proxyexecutor.AnnotationLogID:               "7001",
+					proxyexecutor.AnnotationLogDateTime:         "1700000007001",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{
+				Succeeded:  1,
+				Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+			},
+		}
+		_ = k8sCli.Create(ctx, db1Job)
+
+		// Swap ONLY Spec.Datasource.URL (db1 -> db2) on sameurl-db-admin (Port=8080 and ContextPath="/xxl-job-admin" unchanged!)
+		var liveAdmin xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminCR.Name}, &liveAdmin)
+		liveAdmin.Spec.Datasource.URL = db2URL
+		liveAdmin.Generation++
+		_ = k8sCli.Update(ctx, &liveAdmin)
+		activeBackend.Store(2)
+
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}}); err != nil {
+			t.Fatalf("reconcile admin after Datasource.URL swap: %v", err)
+		}
+
+		// Delete delTaskCR BEFORE Executor reconciles against db2: MUST NOT delete unmarked manual job in db2!
+		_ = k8sCli.Delete(ctx, &syncedDelTask)
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: delTaskCR.Name}}); err != nil {
+			t.Fatalf("reconcile deleting task after Datasource.URL swap: %v", err)
+		}
+
+		// Reconcile taskCR BEFORE execCR syncs db2: taskCR MUST wait for execCR to sync JobGroupID on db2!
+		waitRes, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}})
+		if err != nil || waitRes.RequeueAfter == 0 {
+			t.Fatalf("expected taskCR to wait for execCR to sync against db2 first, got res=%+v err=%v", waitRes, err)
+		}
+
+		// Now reconcile execCR and taskCR on db2
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("reconcile execCR on db2: %v", err)
+		}
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+			t.Fatalf("reconcile taskCR on db2: %v", err)
+		}
+
+		// Reconcile db1Job callback: MUST NOT deliver db1 logId=7001 into db2!
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: db1Job.Name}}); err != nil {
+			t.Fatalf("reconcile db1Job callback after db swap: %v", err)
+		}
+
+		mu2.Lock()
+		unrelatedGroup3, hasGroup3 := groups2[3]
+		manualJob500, hasManual500 := jobs2[500]
+		manualDelID, hasManualDelID := jobs2[syncedDelTask.Status.JobID]
+		gotDB2CBs := len(*cbs2)
+		mu2.Unlock()
+
+		if !hasGroup3 || unrelatedGroup3.AppName != "unrelated-critical-group" {
+			t.Fatalf("CRITICAL BUG: unrelated JobGroup 3 in db2 was deleted or overwritten: has=%v grp=%+v", hasGroup3, unrelatedGroup3)
+		}
+		if !hasManual500 || manualJob500.JobDesc != "Manual Billing Job" || manualJob500.ExecutorHandler != "manualBilling" {
+			t.Fatalf("CRITICAL BUG: unmarked manual JobInfo 500 in db2 was overwritten: has=%v job=%+v", hasManual500, manualJob500)
+		}
+		if !hasManualDelID || manualDelID.JobDesc != "Unmarked Manual Job In Group 3" {
+			t.Fatalf("CRITICAL BUG: deleting taskCR deleted unmarked manual job %d in db2: has=%v job=%+v", syncedDelTask.Status.JobID, hasManualDelID, manualDelID)
+		}
+		if gotDB2CBs != 0 {
+			t.Fatalf("CRITICAL BUG: in-flight db1 callback was misrouted into db2 (%d callbacks)", gotDB2CBs)
+		}
+
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: execCR.Name}, &syncedExec)
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: taskCR.Name}, &syncedTask)
+		if syncedExec.Status.JobGroupID != 4 {
+			t.Fatalf("expected execCR to create its own JobGroupID=4 in db2, got %d", syncedExec.Status.JobGroupID)
+		}
+		if syncedTask.Status.JobID == 500 || syncedTask.Status.JobID <= 0 {
+			t.Fatalf("expected taskCR to create a new JobInfo distinct from manual 500 in db2, got %d", syncedTask.Status.JobID)
+		}
+		if syncedTask.Status.LastExecutionJobName != "" {
+			t.Fatalf("expected LastExecutionJobName from db1 to be reset on db2 sync, got %q", syncedTask.Status.LastExecutionJobName)
+		}
+	})
+
+	// Subtest 2: Hybrid Managed Mode (ExternalURL != "" && Image != "") <-> Cluster-Local <-> Pure External (Image == "")
+	t.Run("HybridManagedTransitionsAndHybridToPureExternalSwitch", func(t *testing.T) {
+		srvManaged, muMgr, _, mgrGroups, mgrJobs, mgrCBs := setupTestAdminServer(t, nil)
+		defer srvManaged.Close()
+		srvExt, muExt, _, extGroups, extJobs, _ := setupTestAdminServer(t, nil)
+		defer srvExt.Close()
+
+		svcURL := "http://hybrid-admin.default.svc.cluster.local:8080/xxl-job-admin"
+		hybridV1 := "https://xxl-v1.corp.internal/xxl-job-admin"
+		hybridV2 := "https://xxl-v2.corp.internal/xxl-job-admin"
+
+		var currentLiveManagedURL atomic.Value
+		currentLiveManagedURL.Store(svcURL)
+		var retiredURLHits atomic.Int32
+
+		adminCR := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "hybrid-admin", Namespace: "default", UID: types.UID("uid-hybrid-1")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Image:      "xuxueli/xxl-job-admin:2.4.1",
+				Datasource: xxljobv1alpha1.DatasourceSpec{URL: "jdbc:mysql://mysql:3306/xxl_job", Username: "root", Password: "pwd"},
+				Auth:       xxljobv1alpha1.AuthSpec{AccessToken: "hybrid-tok"},
+			},
+		}
+		execCR := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "hybrid-exec", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: adminCR.Name},
+				AppName:  "hybrid-app",
+				Title:    "Hybrid App",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+		}
+		taskCR := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "hybrid-task", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: execCR.Name},
+				JobDesc:         "Hybrid Task",
+				Author:          "ops",
+				ScheduleType:    "CRON",
+				ScheduleConf:    "0 */5 * * * ?",
+				ExecutorHandler: "hybridHandler",
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(adminCR, execCR, taskCR).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+			Build()
+
+		factory := func(cfg xxlclient.Config) (*xxlclient.Client, error) {
+			u := strings.TrimRight(cfg.BaseURL, "/")
+			if u == strings.TrimRight(srvExt.URL, "/") {
+				return xxlclient.NewClient(cfg)
+			}
+			live := currentLiveManagedURL.Load().(string)
+			if u == live {
+				cp := cfg
+				cp.BaseURL = srvManaged.URL
+				return xxlclient.NewClient(cp)
+			}
+			retiredURLHits.Add(1)
+			return nil, fmt.Errorf("dial retired endpoint %s: connection refused", u)
+		}
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		execRec := &XxlJobExecutorReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: factory}
+		taskRec := &XxlJobTaskReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: factory}
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: factory}
+
+		for i := 0; i < 2; i++ {
+			_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}})
+			_, _ = execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}})
+			_, _ = taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}})
+		}
+
+		var syncedTask xxljobv1alpha1.XxlJobTask
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: taskCR.Name}, &syncedTask)
+		origJobID := syncedTask.Status.JobID
+
+		// Transition 1: Cluster-Local -> Hybrid V1 (ExternalURL=hybridV1, Image="xuxueli/xxl-job-admin:2.4.1", same DB)
+		var liveAdmin xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminCR.Name}, &liveAdmin)
+		liveAdmin.Spec.ExternalURL = hybridV1
+		liveAdmin.Generation++
+		_ = k8sCli.Update(ctx, &liveAdmin)
+		currentLiveManagedURL.Store(hybridV1)
+
+		_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}})
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("exec reconcile Cluster-Local -> Hybrid V1: %v", err)
+		}
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+			t.Fatalf("task reconcile Cluster-Local -> Hybrid V1: %v", err)
+		}
+
+		// Create in-flight Job stamped at Hybrid V1, then transition Hybrid V1 -> Hybrid V2 (same DB)!
+		suspendFalse := false
+		hybridJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName(execCR.Name, origJobID, 9201),
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel(execCR.Name),
+					proxyexecutor.LabelJobID:        strconv.Itoa(origJobID),
+					proxyexecutor.LabelLogID:        "9201",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:        execCR.Name,
+					proxyexecutor.AnnotationAdminName:           adminCR.Name,
+					proxyexecutor.AnnotationAdminUID:            string(adminCR.UID),
+					proxyexecutor.AnnotationAdminURL:            hybridV1,
+					proxyexecutor.AnnotationAdminDatasourceHash: proxyexecutor.DatasourceURLHash(adminCR.Spec.Datasource.URL),
+					proxyexecutor.AnnotationLogID:               "9201",
+					proxyexecutor.AnnotationLogDateTime:         "1700000009201",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{
+				Succeeded:  1,
+				Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+			},
+		}
+		_ = k8sCli.Create(ctx, hybridJob)
+
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminCR.Name}, &liveAdmin)
+		liveAdmin.Spec.ExternalURL = hybridV2
+		liveAdmin.Generation++
+		_ = k8sCli.Update(ctx, &liveAdmin)
+		currentLiveManagedURL.Store(hybridV2)
+
+		_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}})
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("exec reconcile Hybrid V1 -> Hybrid V2: %v", err)
+		}
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+			t.Fatalf("task reconcile Hybrid V1 -> Hybrid V2: %v", err)
+		}
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: hybridJob.Name}}); err != nil {
+			t.Fatalf("callback reconcile Hybrid V1 -> Hybrid V2: %v", err)
+		}
+		if hits := retiredURLHits.Load(); hits != 0 {
+			t.Fatalf("expected 0 hits to retired endpoints across Hybrid transitions, got %d", hits)
+		}
+		muMgr.Lock()
+		_, jobPreserved := mgrJobs[origJobID]
+		_, grpPreserved := mgrGroups[1]
+		gotHybridCBs := len(*mgrCBs)
+		muMgr.Unlock()
+		if !jobPreserved || !grpPreserved || gotHybridCBs != 1 {
+			t.Fatalf("expected Hybrid shared DB state preserved (grp=%v job=%v) and 1 callback routed to Hybrid V2 (%d)", grpPreserved, jobPreserved, gotHybridCBs)
+		}
+
+		// Transition 3: Hybrid V2 (ManagedInCluster=true) -> Pure External (ExternalURL=srvExt.URL, Image="")
+		// cleanupOwnedInClusterResources deletes the Deployment & Service backing Hybrid V2; MUST NOT deadlock on dead Hybrid V2!
+		currentLiveManagedURL.Store("NONE")
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminCR.Name}, &liveAdmin)
+		liveAdmin.Spec.ExternalURL = srvExt.URL
+		liveAdmin.Spec.Image = ""
+		liveAdmin.Generation++
+		_ = k8sCli.Update(ctx, &liveAdmin)
+
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}}); err != nil {
+			t.Fatalf("admin reconcile Hybrid V2 -> Pure External: %v", err)
+		}
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("exec reconcile Hybrid V2 -> Pure External deadlocked: %v", err)
+		}
+		for i := 0; i < 2; i++ {
+			if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+				t.Fatalf("task reconcile Hybrid V2 -> Pure External deadlocked: %v", err)
+			}
+		}
+		if hits := retiredURLHits.Load(); hits != 0 {
+			t.Fatalf("expected 0 hits to retired Hybrid V2 endpoint after switching to Pure External, got %d", hits)
+		}
+		muExt.Lock()
+		gotExtGroups := len(extGroups)
+		gotExtJobs := len(extJobs)
+		muExt.Unlock()
+		if gotExtGroups != 1 || gotExtJobs != 1 {
+			t.Fatalf("expected Pure External srvExt populated with migrated group (%d) and job (%d)", gotExtGroups, gotExtJobs)
+		}
+	})
+
+	// Subtest 3: Operator restart after Auth SecretRef rotation (v1 -> v2) on srvOld before Task reconciled,
+	// plus explicit Password="123456" default restoration when switching to srvNew (v3)
+	t.Run("RestartAuthFallbackPrefersFresherAdminRecordedEndpointMetaAndExplicit123456", func(t *testing.T) {
+		var expectedOldToken atomic.Value
+		expectedOldToken.Store("tok-v1")
+		var oldAuthFailures atomic.Int32
+
+		rawOld, muOld, _, groupsOld, jobsOld, _ := setupTestAdminServer(t, nil)
+		defer rawOld.Close()
+		srvOld := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/login" {
+				_ = r.ParseForm()
+				if r.FormValue("userName") != "admin" || r.FormValue("password") != "123456" {
+					oldAuthFailures.Add(1)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+			}
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				if r.Header.Get(xxlclient.AccessTokenHeader) != expectedOldToken.Load().(string) {
+					oldAuthFailures.Add(1)
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+			}
+			rawOld.Config.Handler.ServeHTTP(w, r)
+		}))
+		defer srvOld.Close()
+
+		srvNew, _, _, _, _, _ := setupTestAdminServer(t, nil)
+		defer srvNew.Close()
+
+		secV1 := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tok-sec-v1", Namespace: "default"}, Data: map[string][]byte{"token": []byte("tok-v1")}}
+		secV2 := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tok-sec-v2", Namespace: "default"}, Data: map[string][]byte{"token": []byte("tok-v2")}}
+		secV3 := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tok-sec-v3", Namespace: "default"}, Data: map[string][]byte{"token": []byte("tok-v3")}}
+
+		adminCR := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "rot-restart-admin", Namespace: "default", UID: types.UID("uid-rot-restart")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srvOld.URL,
+				Auth: xxljobv1alpha1.AuthSpec{
+					Password:             "123456", // explicit default password on srvOld
+					AccessTokenSecretRef: &xxljobv1alpha1.SecretKeyReference{Name: secV1.Name, Key: "token"},
+				},
+			},
+		}
+		execCR := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "rot-restart-exec", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: adminCR.Name},
+				AppName:  "rot-restart-app",
+				Title:    "Rot Restart App",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+		}
+		taskCR := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "rot-restart-task", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: execCR.Name},
+				JobDesc:         "Rot Restart Task",
+				Author:          "ops",
+				ScheduleType:    "CRON",
+				ScheduleConf:    "0 */5 * * * ?",
+				ExecutorHandler: "rotHandler",
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(secV1, secV2, secV3, adminCR, execCR, taskCR).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}).
+			Build()
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		execRec := &XxlJobExecutorReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		taskRec := &XxlJobTaskReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+
+		for i := 0; i < 2; i++ {
+			_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}})
+			_, _ = execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}})
+			_, _ = taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}})
+		}
+
+		// Rotate srvOld token from v1 -> v2 on Admin CR and reconcile ONLY Admin (Task & Executor still hold stale v1 in Status.Conditions!)
+		expectedOldToken.Store("tok-v2")
+		var liveAdmin xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminCR.Name}, &liveAdmin)
+		liveAdmin.Spec.Auth.AccessTokenSecretRef = &xxljobv1alpha1.SecretKeyReference{Name: secV2.Name, Key: "token"}
+		liveAdmin.Generation++
+		_ = k8sCli.Update(ctx, &liveAdmin)
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}}); err != nil {
+			t.Fatalf("reconcile admin after v1->v2 rotation: %v", err)
+		}
+
+		// Now switch Admin to srvNew with Username="new-admin", Password="new-inline-password", AccessTokenSecretRef=secV3
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminCR.Name}, &liveAdmin)
+		liveAdmin.Spec.ExternalURL = srvNew.URL
+		liveAdmin.Spec.Auth.Username = "new-admin"
+		liveAdmin.Spec.Auth.Password = "new-inline-password"
+		liveAdmin.Spec.Auth.AccessTokenSecretRef = &xxljobv1alpha1.SecretKeyReference{Name: secV3.Name, Key: "token"}
+		liveAdmin.Generation++
+		_ = k8sCli.Update(ctx, &liveAdmin)
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}}); err != nil {
+			t.Fatalf("reconcile admin after srvNew switch: %v", err)
+		}
+
+		// Simulate Operator restart: clear all in-memory caches!
+		endpointAuthMu.Lock()
+		clear(endpointAuthCache)
+		endpointAuthOrder = nil
+		endpointAuthMu.Unlock()
+		clientCacheMu.Lock()
+		clear(clientCache)
+		clear(clientCacheByAdmin)
+		clientCacheOrder = nil
+		clientCacheMu.Unlock()
+		secretCacheMu.Lock()
+		clear(secretCache)
+		secretCacheMu.Unlock()
+
+		// Reconcile Executor & Task: MUST use Admin's fresher v2 SecretRef (NOT stale v1 on Executor/Task)
+		// AND restore default "admin"/"123456" (NOT "new-admin"/"new-inline-password")!
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("exec reconcile after restart failed: %v", err)
+		}
+		for i := 0; i < 2; i++ {
+			if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+				t.Fatalf("task reconcile after restart failed: %v", err)
+			}
+		}
+		if failures := oldAuthFailures.Load(); failures != 0 {
+			t.Fatalf("expected 0 auth failures on srvOld after restart (expected v2 + admin/123456), got %d", failures)
+		}
+		muOld.Lock()
+		remOldGroups := len(groupsOld)
+		remOldJobs := len(jobsOld)
+		muOld.Unlock()
+		if remOldGroups != 0 || remOldJobs != 0 {
+			t.Fatalf("expected srvOld fully cleaned up after restart, remaining groups=%d jobs=%d", remOldGroups, remOldJobs)
 		}
 	})
 }

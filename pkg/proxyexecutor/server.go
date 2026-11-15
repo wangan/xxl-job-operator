@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,16 +47,21 @@ const (
 
 	// Annotations persisted on batch/v1.Job so callbacks and serial queues survive Operator restarts
 	// and XxlJobTask deletion (fixes R5-P2-5).
-	AnnotationTaskNamespace  = "xxljob.io/task-namespace"
-	AnnotationTaskName       = "xxljob.io/task-name"
-	AnnotationExecutorName   = "xxljob.io/executor-name"
-	AnnotationAdminName      = "xxljob.io/admin-name"
-	AnnotationAdminURL       = "xxljob.io/admin-url"
-	AnnotationLogID          = "xxljob.io/log-id"
-	AnnotationLogDateTime    = "xxljob.io/log-datetime"
-	AnnotationCallbackSent   = "xxljob.io/callback-sent"
-	AnnotationBlockStrategy  = "xxljob.io/block-strategy"
-	AnnotationFailureMessage = "xxljob.io/failure-message"
+	AnnotationTaskNamespace       = "xxljob.io/task-namespace"
+	AnnotationTaskName            = "xxljob.io/task-name"
+	AnnotationExecutorName        = "xxljob.io/executor-name"
+	AnnotationAdminName           = "xxljob.io/admin-name"
+	AnnotationAdminURL            = "xxljob.io/admin-url"
+	AnnotationAdminUID            = "xxljob.io/admin-uid"
+	AnnotationAdminDatasourceHash = "xxljob.io/admin-db-hash"
+	AnnotationLogID               = "xxljob.io/log-id"
+	AnnotationLogDateTime         = "xxljob.io/log-datetime"
+	AnnotationCallbackSent        = "xxljob.io/callback-sent"
+	AnnotationBlockStrategy       = "xxljob.io/block-strategy"
+	AnnotationFailureMessage      = "xxljob.io/failure-message"
+
+	ConditionAdminEndpointSynced = "AdminEndpointSynced"
+	ConditionPreviousAdminURLs   = "PreviousAdminURLs"
 
 	MaxLogReadBytes                 int64 = 4 * 1024 * 1024 // 4 MiB cap per /log request
 	MaxRequestBodyBytes             int64 = 1 * 1024 * 1024 // 1 MiB cap per incoming HTTP trigger body
@@ -154,7 +160,7 @@ func NewServer(k8sClient client.Client, listenAddr, defaultNamespace, accessToke
 	s := &Server{
 		ListenAddr:       listenAddr,
 		DefaultNamespace: defaultNamespace,
-		AccessToken:      strings.TrimSpace(accessToken),
+		AccessToken:      sanitizeHeaderToken(accessToken),
 		K8sClient:        k8sClient,
 		APIReader:        k8sClient,
 	}
@@ -324,7 +330,8 @@ func (s *Server) handleIdleBeat(w http.ResponseWriter, r *http.Request, rc route
 		return
 	}
 
-	running, err := s.hasRunningJob(r.Context(), rc.Namespace, rc.ExecutorName, param.JobID, "")
+	origin := s.resolveExecutorOrigin(r.Context(), rc.Namespace, rc.ExecutorName, nil, nil)
+	running, err := s.hasRunningJobForOrigin(r.Context(), rc.Namespace, rc.ExecutorName, param.JobID, "", origin)
 	if err != nil {
 		writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("list k8s jobs failed: %v", err), nil)
 		return
@@ -444,9 +451,11 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request, rc routeConte
 		blockStrategy = "SERIAL_EXECUTION"
 	}
 
+	origin := s.resolveExecutorOrigin(ctx, task.Namespace, execName, task, execPtr)
+
 	// Build and validate the candidate Job before running blockStrategy checks so that:
 	//  1. COVER_EARLY never kills running Jobs when the new trigger's template or PodSecurity is invalid, and
-	//  2. Idempotent HTTP retries for the same (jobId, logId) exclude their own deterministic k8sJob.Name from
+	//  2. Idempotent HTTP retries for the same (origin, jobId, logId) exclude their own deterministic k8sJob.Name from
 	//     hasRunningJob / killRunningJobs instead of self-discarding or self-killing (fixes R8-P1-2).
 	k8sJob, err := s.buildBatchJob(param, task)
 	if err != nil {
@@ -454,7 +463,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request, rc routeConte
 		return
 	}
 	k8sJob.Annotations[AnnotationBlockStrategy] = blockStrategy
-	stampOriginatingAdminAnnotations(k8sJob, task, execPtr)
+	stampOriginatingAdminOrigin(k8sJob, origin)
 
 	podSecLevel := "restricted"
 	if hasExecCR && execCR.Spec.PodSecurityLevel != "" {
@@ -472,28 +481,35 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request, rc routeConte
 		return
 	}
 
-	// Check whether k8sJob.Name already exists BEFORE executing DISCARD_LATER or COVER_EARLY (killRunningJobs)
-	// so a late duplicate/replay request for an older completed/failed/running logId never kills newer active Jobs (fixes R11-P1-2).
-	var existing batchv1.Job
+	// Resolve existing same-origin Job (across both primary BuildJobName and origin-disambiguated BuildJobName) or
+	// switch k8sJob.Name to the origin-scoped deterministic name when primary BuildJobName is occupied by a Job from
+	// a different XxlJobAdmin, BEFORE executing DISCARD_LATER or COVER_EARLY (fixes R11-P1-2 & cross-Admin collision).
+	originScopedName := BuildJobName(execName, param.JobID, param.LogID, origin.key())
+	matchedExisting, occupiedBaseName, findExistErr := s.findExistingTriggeredJobForOrigin(ctx, k8sJob, execName, param, origin)
+	if findExistErr != nil {
+		writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("check existing k8s job %s/%s failed: %v", k8sJob.Namespace, k8sJob.Name, findExistErr), nil)
+		return
+	}
 	jobAlreadyExists := false
-	if getErr := s.apiReader().Get(ctx, client.ObjectKey{Namespace: k8sJob.Namespace, Name: k8sJob.Name}, &existing); getErr == nil {
-		resumeClaim, handled := s.evaluateExistingTriggeredJob(w, &existing, k8sJob.Namespace, k8sJob.Name, param, blockStrategy)
+	if matchedExisting != nil {
+		resumeClaim, handled := s.evaluateExistingTriggeredJob(w, matchedExisting, k8sJob, execName, matchedExisting.Namespace, matchedExisting.Name, param, blockStrategy)
 		if handled {
 			return
 		}
 		if resumeClaim {
 			jobAlreadyExists = true
-			k8sJob = &existing
+			k8sJob = matchedExisting
 		}
-	} else if !apierrors.IsNotFound(getErr) {
-		writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("check existing k8s job %s/%s failed: %v", k8sJob.Namespace, k8sJob.Name, getErr), nil)
-		return
+	} else if occupiedBaseName {
+		if origin.hasAny() && originScopedName != k8sJob.Name {
+			k8sJob.Name = originScopedName
+		}
 	}
 
 	effectiveLogID := parseJobLogID(k8sJob)
 	switch blockStrategy {
 	case "DISCARD_LATER":
-		running, err := s.hasRunningJob(ctx, task.Namespace, execName, param.JobID, k8sJob.Name)
+		running, err := s.hasRunningJobForOrigin(ctx, task.Namespace, execName, param.JobID, k8sJob.Name, origin)
 		if err != nil {
 			writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("check running k8s jobs for DISCARD_LATER failed: %v", err), nil)
 			return
@@ -523,16 +539,39 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request, rc routeConte
 
 		if err := s.K8sClient.Create(ctx, k8sJob); err != nil {
 			if apierrors.IsAlreadyExists(err) {
+				var existing batchv1.Job
 				if getErr := s.apiReader().Get(ctx, client.ObjectKey{Namespace: k8sJob.Namespace, Name: k8sJob.Name}, &existing); getErr != nil {
 					writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("verify existing k8s job %s/%s failed: %v", k8sJob.Namespace, k8sJob.Name, getErr), nil)
 					return
 				}
-				resumeClaim, handled := s.evaluateExistingTriggeredJob(w, &existing, k8sJob.Namespace, k8sJob.Name, param, blockStrategy)
-				if handled {
-					return
-				}
-				if resumeClaim {
-					k8sJob = &existing
+				if origin.hasAny() && originScopedName != k8sJob.Name && !isSameTriggerOrigin(&existing, k8sJob, execName, param) {
+					k8sJob.Name = originScopedName
+					if retryErr := s.K8sClient.Create(ctx, k8sJob); retryErr != nil {
+						if apierrors.IsAlreadyExists(retryErr) {
+							if getErr := s.apiReader().Get(ctx, client.ObjectKey{Namespace: k8sJob.Namespace, Name: k8sJob.Name}, &existing); getErr != nil {
+								writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("verify existing k8s job %s/%s failed: %v", k8sJob.Namespace, k8sJob.Name, getErr), nil)
+								return
+							}
+							resumeClaim, handled := s.evaluateExistingTriggeredJob(w, &existing, k8sJob, execName, k8sJob.Namespace, k8sJob.Name, param, blockStrategy)
+							if handled {
+								return
+							}
+							if resumeClaim {
+								k8sJob = &existing
+							}
+						} else {
+							writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("create k8s job %s/%s failed: %v", k8sJob.Namespace, k8sJob.Name, retryErr), nil)
+							return
+						}
+					}
+				} else {
+					resumeClaim, handled := s.evaluateExistingTriggeredJob(w, &existing, k8sJob, execName, k8sJob.Namespace, k8sJob.Name, param, blockStrategy)
+					if handled {
+						return
+					}
+					if resumeClaim {
+						k8sJob = &existing
+					}
 				}
 			} else {
 				writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("create k8s job %s/%s failed: %v", k8sJob.Namespace, k8sJob.Name, err), nil)
@@ -651,7 +690,7 @@ func (s *Server) cleanupAbortedJob(ctx context.Context, createdJob *batchv1.Job)
 	if !current.DeletionTimestamp.IsZero() {
 		return
 	}
-	policy := metav1.DeletePropagationBackground
+	policy := metav1.DeletePropagationForeground
 	_ = s.K8sClient.Delete(cleanupCtx, current, &client.DeleteOptions{PropagationPolicy: &policy})
 }
 
@@ -661,8 +700,110 @@ func AdvanceSerialQueue(ctx context.Context, k8sClient client.Client, namespace,
 	return AdvanceSerialQueueWithReader(ctx, k8sClient, k8sClient, namespace, executorLabel, jobIDLabel)
 }
 
+type serialOriginPartition struct {
+	execKey      string
+	origins      []adminOrigin
+	stillRunning bool
+	suspended    []*batchv1.Job
+}
+
+func (p *serialOriginPartition) matches(execKey string, orig adminOrigin) bool {
+	if p.execKey != execKey {
+		return false
+	}
+	for _, existing := range p.origins {
+		if !sameAdminOrigin(existing, orig) {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *serialOriginPartition) recordOrigin(orig adminOrigin) {
+	for _, existing := range p.origins {
+		if existing == orig {
+			return
+		}
+	}
+	p.origins = append(p.origins, orig)
+}
+
+func unsuspendSerialPartitionHead(
+	ctx context.Context,
+	reader client.Reader,
+	writer client.Client,
+	suspended []*batchv1.Job,
+) (remaining int, unsuspendedAny bool, err error) {
+	sort.Slice(suspended, func(i, k int) bool {
+		logI := parseJobLogID(suspended[i])
+		logK := parseJobLogID(suspended[k])
+		if logI != logK {
+			return logI < logK
+		}
+		if !suspended[i].CreationTimestamp.Equal(&suspended[k].CreationTimestamp) {
+			return suspended[i].CreationTimestamp.Before(&suspended[k].CreationTimestamp)
+		}
+		return suspended[i].Name < suspended[k].Name
+	})
+
+	remaining = len(suspended)
+	for idx := range suspended {
+		head := suspended[idx].DeepCopy()
+		unsuspended := false
+		skipped := false
+		for attempt := 0; attempt < 4; attempt++ {
+			if !head.DeletionTimestamp.IsZero() || !isJobRunning(head) {
+				skipped = true
+				break
+			}
+			if head.Annotations != nil && (head.Annotations[AnnotationFailureMessage] != "" || head.Annotations[AnnotationCallbackSent] == "true") {
+				skipped = true
+				break
+			}
+			if head.Spec.Suspend == nil || !*head.Spec.Suspend {
+				unsuspended = true
+				break
+			}
+			unSuspend := false
+			head.Spec.Suspend = &unSuspend
+			updateErr := writer.Update(ctx, head)
+			if updateErr == nil {
+				unsuspended = true
+				break
+			}
+			if apierrors.IsNotFound(updateErr) {
+				skipped = true
+				break
+			}
+			if !apierrors.IsConflict(updateErr) {
+				return remaining, false, updateErr
+			}
+			var latest batchv1.Job
+			if getErr := reader.Get(ctx, client.ObjectKey{Namespace: head.Namespace, Name: head.Name}, &latest); getErr != nil {
+				if apierrors.IsNotFound(getErr) {
+					skipped = true
+					break
+				}
+				return remaining, false, getErr
+			}
+			head = &latest
+		}
+		if skipped {
+			remaining = len(suspended) - (idx + 1)
+			continue
+		}
+		if !unsuspended {
+			return remaining, false, fmt.Errorf("conflict retrying unsuspend for serial queue head %s/%s", head.Namespace, head.Name)
+		}
+		remaining = len(suspended) - (idx + 1)
+		return remaining, true, nil
+	}
+	return remaining, false, nil
+}
+
 // AdvanceSerialQueueWithReader lists Jobs directly via reader (e.g., mgr.GetAPIReader() to bypass informer cache lag)
-// and uses writer to unsuspend the single earliest suspended SERIAL_EXECUTION Job in strict logId FIFO order (fixes R4-P1-1, R6-P2-1, R6-P2-2, R8-P2-4).
+// and uses writer to unsuspend the single earliest suspended SERIAL_EXECUTION Job per (executor, originating Admin, jobId)
+// partition in strict logId FIFO order (fixes R4-P1-1, R6-P2-1, R6-P2-2, R8-P2-4, and cross-Admin SERIAL_EXECUTION isolation).
 func AdvanceSerialQueueWithReader(ctx context.Context, reader client.Reader, writer client.Client, namespace, executorLabel, jobIDLabel string) error {
 	if namespace == "" || jobIDLabel == "" {
 		return nil
@@ -688,13 +829,59 @@ func AdvanceSerialQueueWithReader(ctx context.Context, reader client.Reader, wri
 		return err
 	}
 
-	var suspended []*batchv1.Job
-	stillRunning := false
+	// Process Jobs in deterministic origin specificity order (uid, dbHash, url, name, with canonical value tie-breaking)
+	// so partial-origin Jobs (e.g. empty uid) never coalesce distinct origins or partition inconsistently based on slice order.
+	ordered := make([]*batchv1.Job, len(jobList.Items))
 	for i := range jobList.Items {
-		j := &jobList.Items[i]
+		ordered[i] = &jobList.Items[i]
+	}
+	sort.SliceStable(ordered, func(i, k int) bool {
+		return adminOriginMoreSpecific(extractJobAdminOrigin(ordered[i]), extractJobAdminOrigin(ordered[k]))
+	})
+
+	var partitions []*serialOriginPartition
+	legacyRunningByExec := make(map[string]bool)
+	legacySuspendedByExec := make(map[string][]*batchv1.Job)
+	var legacyExecOrder []string
+	seenLegacyExec := make(map[string]bool)
+
+	findOrCreatePartition := func(execKey string, orig adminOrigin) *serialOriginPartition {
+		for _, p := range partitions {
+			if p.matches(execKey, orig) {
+				p.recordOrigin(orig)
+				return p
+			}
+		}
+		p := &serialOriginPartition{
+			execKey: execKey,
+			origins: []adminOrigin{orig},
+		}
+		partitions = append(partitions, p)
+		return p
+	}
+
+	for _, j := range ordered {
+		execKey := executorLabel
+		if j.Annotations != nil {
+			if ea := strings.TrimSpace(j.Annotations[AnnotationExecutorName]); ea != "" {
+				execKey = ea
+			}
+		}
+		orig := extractJobAdminOrigin(j)
+		hasOrig := orig.hasAny()
+
+		markRunning := func() {
+			if hasOrig {
+				p := findOrCreatePartition(execKey, orig)
+				p.stillRunning = true
+			} else {
+				legacyRunningByExec[execKey] = true
+			}
+		}
+
 		if !isJobRunning(j) {
 			if HasActiveOrTerminatingPods(j) && isCompletedJobStillDrainingPods(j) {
-				stillRunning = true
+				markRunning()
 			}
 			continue
 		}
@@ -702,14 +889,14 @@ func AdvanceSerialQueueWithReader(ctx context.Context, reader client.Reader, wri
 		// before the next SERIAL_EXECUTION Job is unsuspended, unless its callback/cleanup was already bypassed (fixes R6-P2-1 & R7-P2-7).
 		if !j.DeletionTimestamp.IsZero() {
 			if HasActiveOrTerminatingPods(j) && isCompletedJobStillDrainingPods(j) {
-				stillRunning = true
+				markRunning()
 			}
 			continue
 		}
-		// Any unsuspended running Job for this jobId (even if triggered under another blockStrategy before a spec change)
+		// Any unsuspended running Job for this (executor, origin, jobId) (even if triggered under another blockStrategy before a spec change)
 		// must finish before unsuspending the next SERIAL_EXECUTION Job (fixes R8-P2-4).
 		if j.Spec.Suspend == nil || !*j.Spec.Suspend {
-			stillRunning = true
+			markRunning()
 			continue
 		}
 		// Only non-aborted SERIAL_EXECUTION Jobs belong to the serial queue (fixes R6-P2-2, R9-P1-3).
@@ -721,89 +908,74 @@ func AdvanceSerialQueueWithReader(ctx context.Context, reader client.Reader, wri
 				continue
 			}
 		}
-		suspended = append(suspended, j)
+		if hasOrig {
+			p := findOrCreatePartition(execKey, orig)
+			p.suspended = append(p.suspended, j)
+		} else {
+			if !seenLegacyExec[execKey] {
+				seenLegacyExec[execKey] = true
+				legacyExecOrder = append(legacyExecOrder, execKey)
+			}
+			legacySuspendedByExec[execKey] = append(legacySuspendedByExec[execKey], j)
+		}
 	}
 
-	if stillRunning {
-		if OnSerialQueueDepth != nil {
-			OnSerialQueueDepth(namespace, executorLabel, jobIDLabel, float64(len(suspended)))
-		}
-		return nil
-	}
-
-	if len(suspended) == 0 {
-		if OnSerialQueueDepth != nil {
-			OnSerialQueueDepth(namespace, executorLabel, jobIDLabel, 0)
-		}
-		return nil
-	}
-
-	sort.Slice(suspended, func(i, k int) bool {
-		logI := parseJobLogID(suspended[i])
-		logK := parseJobLogID(suspended[k])
-		if logI != logK {
-			return logI < logK
-		}
-		if !suspended[i].CreationTimestamp.Equal(&suspended[k].CreationTimestamp) {
-			return suspended[i].CreationTimestamp.Before(&suspended[k].CreationTimestamp)
-		}
-		return suspended[i].Name < suspended[k].Name
-	})
-
-	remainingSuspended := len(suspended)
-	for idx := range suspended {
-		head := suspended[idx].DeepCopy()
-		unsuspended := false
-		skipped := false
-		for attempt := 0; attempt < 4; attempt++ {
-			if !head.DeletionTimestamp.IsZero() || !isJobRunning(head) {
-				skipped = true
-				break
-			}
-			if head.Annotations != nil && (head.Annotations[AnnotationFailureMessage] != "" || head.Annotations[AnnotationCallbackSent] == "true") {
-				skipped = true
-				break
-			}
-			if head.Spec.Suspend == nil || !*head.Spec.Suspend {
-				unsuspended = true
-				break
-			}
-			unSuspend := false
-			head.Spec.Suspend = &unSuspend
-			err := writer.Update(ctx, head)
-			if err == nil {
-				unsuspended = true
-				break
-			}
-			if apierrors.IsNotFound(err) {
-				skipped = true
-				break
-			}
-			if !apierrors.IsConflict(err) {
-				return err
-			}
-			var latest batchv1.Job
-			if getErr := reader.Get(ctx, client.ObjectKey{Namespace: head.Namespace, Name: head.Name}, &latest); getErr != nil {
-				if apierrors.IsNotFound(getErr) {
-					skipped = true
-					break
-				}
-				return getErr
-			}
-			head = &latest
-		}
-		if skipped {
-			remainingSuspended = len(suspended) - (idx + 1)
+	var multiOriginLegacy []*serialOriginPartition
+	for _, execKey := range legacyExecOrder {
+		legSusp := legacySuspendedByExec[execKey]
+		if len(legSusp) == 0 {
 			continue
 		}
-		if !unsuspended {
-			return fmt.Errorf("conflict retrying unsuspend for serial queue head %s/%s", head.Namespace, head.Name)
+		var execParts []*serialOriginPartition
+		anyRunning := legacyRunningByExec[execKey]
+		for _, p := range partitions {
+			if p.execKey == execKey {
+				execParts = append(execParts, p)
+				if p.stillRunning {
+					anyRunning = true
+				}
+			}
 		}
-		remainingSuspended = len(suspended) - (idx + 1)
-		break
+		switch len(execParts) {
+		case 0:
+			partitions = append(partitions, &serialOriginPartition{
+				execKey:      execKey,
+				stillRunning: legacyRunningByExec[execKey],
+				suspended:    legSusp,
+			})
+		case 1:
+			// Rolling upgrade on the same Admin: fold pre-upgrade suspended Jobs into the single partition so logId FIFO is preserved.
+			execParts[0].suspended = append(execParts[0].suspended, legSusp...)
+		default:
+			multiOriginLegacy = append(multiOriginLegacy, &serialOriginPartition{
+				execKey:      execKey,
+				stillRunning: anyRunning,
+				suspended:    legSusp,
+			})
+		}
 	}
+	if len(multiOriginLegacy) > 0 {
+		partitions = append(multiOriginLegacy, partitions...)
+	}
+
+	totalRemaining := 0
+	for _, p := range partitions {
+		if p.stillRunning || legacyRunningByExec[p.execKey] || len(p.suspended) == 0 {
+			totalRemaining += len(p.suspended)
+			continue
+		}
+		rem, unsuspendedAny, err := unsuspendSerialPartitionHead(ctx, reader, writer, p.suspended)
+		if err != nil {
+			return err
+		}
+		if unsuspendedAny && len(p.origins) == 0 {
+			legacyRunningByExec[p.execKey] = true
+		}
+		totalRemaining += rem
+	}
+
 	if OnSerialQueueDepth != nil {
-		OnSerialQueueDepth(namespace, executorLabel, jobIDLabel, float64(remainingSuspended))
+		OnSerialQueueDepth(namespace, executorLabel, jobIDLabel, float64(totalRemaining))
 	}
 	return nil
 }
@@ -830,7 +1002,7 @@ func isCompletedJobStillDrainingPods(job *batchv1.Job) bool {
 		}
 	}
 	for _, f := range job.Finalizers {
-		if f == JobCallbackFinalizer {
+		if f == JobCallbackFinalizer || (!job.DeletionTimestamp.IsZero() && f == metav1.FinalizerDeleteDependents) {
 			return true
 		}
 	}
@@ -868,7 +1040,8 @@ func (s *Server) handleKill(w http.ResponseWriter, r *http.Request, rc routeCont
 	unlock := s.lockJob(rc.Namespace, rc.ExecutorName, param.JobID)
 	defer unlock()
 
-	if err := s.killRunningJobs(r.Context(), rc.Namespace, rc.ExecutorName, param.JobID, ""); err != nil {
+	origin := s.resolveExecutorOrigin(r.Context(), rc.Namespace, rc.ExecutorName, nil, nil)
+	if err := s.killRunningJobsForOrigin(r.Context(), rc.Namespace, rc.ExecutorName, param.JobID, "", origin); err != nil {
 		writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("kill k8s jobs for executor=%s/%s jobId=%d failed: %v", rc.Namespace, rc.ExecutorName, param.JobID, err), nil)
 		return
 	}
@@ -898,6 +1071,8 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request, rc routeConte
 		matchLabels,
 	}
 
+	origin := s.resolveExecutorOrigin(ctx, rc.Namespace, rc.ExecutorName, nil, nil)
+
 	// 1. Check Job status to determine IsEnd (fail closed on API error so Admin does not stop polling prematurely, fixes R6-P2-17)
 	var jobList batchv1.JobList
 	if err := s.apiReader().List(ctx, &jobList, listOpts...); err != nil {
@@ -905,9 +1080,11 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request, rc routeConte
 		return
 	}
 	var matchedJob *batchv1.Job
+	excludedJobNames := make(map[string]bool)
 	for i := range jobList.Items {
 		item := &jobList.Items[i]
-		if !matchesExecutorJobAnnotation(item, rc.ExecutorName) {
+		if !matchesExecutorJobAnnotation(item, rc.ExecutorName) || !jobMatchesExecutorOrigin(item, origin) {
+			excludedJobNames[item.Name] = true
 			continue
 		}
 		matchedJob = item
@@ -927,11 +1104,18 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request, rc routeConte
 		writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("list k8s pods for logId=%d failed: %v", param.LogID, err), nil)
 		return
 	}
-	if matchedJob != nil && len(podList.Items) > 0 {
+	if len(podList.Items) > 0 && (matchedJob != nil || len(excludedJobNames) > 0) {
 		filteredPods := podList.Items[:0]
 		for i := range podList.Items {
 			p := &podList.Items[i]
-			if p.Labels != nil && p.Labels["job-name"] != "" && p.Labels["job-name"] != matchedJob.Name {
+			podJobName := ""
+			if p.Labels != nil {
+				podJobName = p.Labels["job-name"]
+			}
+			if matchedJob != nil && podJobName != "" && podJobName != matchedJob.Name {
+				continue
+			}
+			if matchedJob == nil && podJobName != "" && excludedJobNames[podJobName] {
 				continue
 			}
 			filteredPods = append(filteredPods, *p)
@@ -1035,13 +1219,119 @@ func (s *Server) defaultFetchPodLog(ctx context.Context, namespace, podName, con
 	return string(data), nil
 }
 
+func isSameTriggerOrigin(existing, candidate *batchv1.Job, expectedExecName string, param xxlclient.TriggerParam) bool {
+	if existing == nil || candidate == nil {
+		return false
+	}
+	if !matchesExecutorJobAnnotation(existing, expectedExecName) {
+		return false
+	}
+	hasExistOrigin := jobHasAdminOrigin(existing)
+	hasCandOrigin := jobHasAdminOrigin(candidate)
+	if hasExistOrigin && hasCandOrigin {
+		return isSameOriginatingAdminJob(existing, candidate)
+	}
+	if hasExistOrigin != hasCandOrigin {
+		if !hasExistOrigin && hasCandOrigin {
+			// Allow seamless rolling-upgrade resume ONLY for an active/suspended pre-upgrade Job whose explicit
+			// non-empty AnnotationLogDateTime matches param.LogDateTime; never mistake a completed or timestamp-less
+			// historical Job for an idempotent trigger after cross-Admin migration.
+			if !existing.DeletionTimestamp.IsZero() || !isJobRunning(existing) {
+				return false
+			}
+			if existing.Annotations == nil || existing.Annotations[AnnotationCallbackSent] == "true" {
+				return false
+			}
+			actualDT := strings.TrimSpace(existing.Annotations[AnnotationLogDateTime])
+			if param.LogDateTime > 0 {
+				return actualDT != "" && actualDT == strconv.FormatInt(param.LogDateTime, 10)
+			}
+			return actualDT == "0"
+		}
+		return false
+	}
+	return true
+}
+
+func (s *Server) findExistingTriggeredJobForOrigin(
+	ctx context.Context,
+	candidate *batchv1.Job,
+	execName string,
+	param xxlclient.TriggerParam,
+	origin adminOrigin,
+) (*batchv1.Job, bool, error) {
+	baseName := candidate.Name
+	scopedName := BuildJobName(execName, param.JobID, param.LogID, origin.key())
+
+	var baseJob batchv1.Job
+	hasBase := false
+	if err := s.apiReader().Get(ctx, client.ObjectKey{Namespace: candidate.Namespace, Name: baseName}, &baseJob); err == nil {
+		hasBase = true
+		if isSameTriggerOrigin(&baseJob, candidate, execName, param) {
+			return &baseJob, false, nil
+		}
+		if !origin.hasAny() {
+			// No Admin origin available to disambiguate; let evaluateExistingTriggeredJob report the exact conflict.
+			return &baseJob, false, nil
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return nil, false, err
+	}
+
+	if scopedName != baseName {
+		var scopedJob batchv1.Job
+		if err := s.apiReader().Get(ctx, client.ObjectKey{Namespace: candidate.Namespace, Name: scopedName}, &scopedJob); err == nil {
+			return &scopedJob, hasBase, nil
+		} else if !apierrors.IsNotFound(err) {
+			return nil, hasBase, err
+		}
+	}
+
+	if param.LogID > 0 {
+		matchLabels := client.MatchingLabels{
+			LabelManagedBy:    ManagedByValue,
+			LabelExecutorName: sanitizeLabel(execName),
+			LabelJobID:        strconv.Itoa(param.JobID),
+			LabelLogID:        strconv.FormatInt(param.LogID, 10),
+		}
+		var list batchv1.JobList
+		if err := s.apiReader().List(ctx, &list, client.InNamespace(candidate.Namespace), matchLabels); err != nil {
+			return nil, hasBase, err
+		}
+		for i := range list.Items {
+			j := &list.Items[i]
+			if j.Name == baseName || j.Name == scopedName {
+				continue
+			}
+			if isSameTriggerOrigin(j, candidate, execName, param) {
+				found := *j
+				return &found, hasBase, nil
+			}
+		}
+	}
+
+	return nil, hasBase, nil
+}
+
 func (s *Server) evaluateExistingTriggeredJob(
 	w http.ResponseWriter,
 	existing *batchv1.Job,
+	candidate *batchv1.Job,
+	expectedExecName string,
 	jobNS, jobName string,
 	param xxlclient.TriggerParam,
 	blockStrategy string,
 ) (resumeClaim bool, handled bool) {
+	if !matchesExecutorJobAnnotation(existing, expectedExecName) {
+		writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("k8s job %s/%s already exists for a different executor (%q != %q)",
+			jobNS, jobName, existing.Annotations[AnnotationExecutorName], expectedExecName), nil)
+		return false, true
+	}
+	if candidate != nil && !isSameTriggerOrigin(existing, candidate, expectedExecName, param) {
+		writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("k8s job %s/%s already exists for a different originating XxlJobAdmin",
+			jobNS, jobName), nil)
+		return false, true
+	}
 	if !existing.DeletionTimestamp.IsZero() {
 		writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("k8s job %s/%s is currently being deleted", jobNS, jobName), nil)
 		return false, true
@@ -1092,7 +1382,18 @@ func isTaskConsistentWithExecutor(task *xxljobv1alpha1.XxlJobTask, execCR *xxljo
 	}
 	execAdminURL := strings.TrimRight(strings.TrimSpace(execCR.Status.AdminURL), "/")
 	taskAdminURL := strings.TrimRight(strings.TrimSpace(task.Status.AdminURL), "/")
+	execOrig := extractSyncedEndpointOrigin(execCR.Status.Conditions, execAdminURL)
+	taskOrig := extractSyncedEndpointOrigin(task.Status.Conditions, taskAdminURL)
+	if execOrig.uid != "" && taskOrig.uid != "" && execOrig.uid != taskOrig.uid {
+		return false
+	}
+	if execOrig.dbHash != "" && taskOrig.dbHash != "" && execOrig.dbHash != taskOrig.dbHash {
+		return false
+	}
 	if execAdminURL != "" && taskAdminURL != "" && taskAdminURL != execAdminURL {
+		if execOrig.hasAny() && taskOrig.hasAny() && sameManagedAdminOrigin(execOrig, taskOrig) {
+			return true
+		}
 		return false
 	}
 	return true
@@ -1149,7 +1450,7 @@ func (s *Server) claimDiscardLaterWinner(ctx context.Context, initialTask *xxljo
 		if current.Status.LastExecutionJobName != "" && current.Status.LastExecutionJobName != createdJob.Name {
 			var winnerJob batchv1.Job
 			if getErr := s.apiReader().Get(ctx, client.ObjectKey{Namespace: initialTask.Namespace, Name: current.Status.LastExecutionJobName}, &winnerJob); getErr == nil {
-				if isJobBlockingExecution(&winnerJob) {
+				if isSameOriginatingAdminJob(&winnerJob, createdJob) && isJobBlockingExecution(&winnerJob) {
 					break
 				}
 			} else if !apierrors.IsNotFound(getErr) {
@@ -1200,29 +1501,432 @@ func validateProxyExecutorCR(execCR *xxljobv1alpha1.XxlJobExecutor) error {
 	return nil
 }
 
-func stampOriginatingAdminAnnotations(job *batchv1.Job, task *xxljobv1alpha1.XxlJobTask, execCR *xxljobv1alpha1.XxlJobExecutor) {
+// SyncedAdminEndpointMeta persists non-sensitive endpoint, datasource hash, and SecretRef metadata
+// in Status.Conditions[ConditionAdminEndpointSynced] so controllers and K8sJobProxy share an identical
+// JSON schema without storing plaintext secrets in etcd.
+type SyncedAdminEndpointMeta struct {
+	AdminName              string                             `json:"adminName,omitempty"`
+	AdminUID               string                             `json:"adminUID,omitempty"`
+	AdminURL               string                             `json:"adminURL,omitempty"`
+	ManagedInCluster       bool                               `json:"managedInCluster,omitempty"`
+	DatasourceHash         string                             `json:"datasourceHash,omitempty"`
+	AuthCaptured           bool                               `json:"authCaptured,omitempty"`
+	Username               string                             `json:"username,omitempty"`
+	UsedDefaultPassword    bool                               `json:"usedDefaultPassword,omitempty"`
+	UsedDefaultAccessToken bool                               `json:"usedDefaultAccessToken,omitempty"`
+	PasswordSecretRef      *xxljobv1alpha1.SecretKeyReference `json:"passwordSecretRef,omitempty"`
+	AccessTokenSecretRef   *xxljobv1alpha1.SecretKeyReference `json:"accessTokenSecretRef,omitempty"`
+}
+
+// DatasourceURLHash computes a non-reversible hex SHA-256 prefix of a trimmed JDBC URL so controllers
+// and K8sJobProxy can detect whether an in-cluster managed XxlJobAdmin still points to the same database
+// without exposing JDBC query parameters in Status.Conditions or Job annotations.
+func DatasourceURLHash(rawURL string) string {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(trimmed))
+	return hex.EncodeToString(sum[:16])
+}
+
+// IsClusterLocalAdminServiceURL reports whether rawURL targets the cluster-internal Kubernetes Service
+// (<adminName>.<namespace>.svc.cluster.local) owned by XxlJobAdmin.
+func IsClusterLocalAdminServiceURL(rawURL, adminName, namespace string) bool {
+	rawURL = strings.TrimSpace(rawURL)
+	adminName = strings.TrimSpace(adminName)
+	namespace = strings.TrimSpace(namespace)
+	if rawURL == "" || adminName == "" || namespace == "" {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	expectedHost := fmt.Sprintf("%s.%s.svc.cluster.local", adminName, namespace)
+	return strings.EqualFold(u.Hostname(), expectedHost)
+}
+
+// EncodeSyncedAdminEndpointMeta serializes non-sensitive XxlJobAdmin endpoint identity and credential
+// reference metadata into JSON for ConditionAdminEndpointSynced.Message.
+func EncodeSyncedAdminEndpointMeta(admin *xxljobv1alpha1.XxlJobAdmin, adminURL string) string {
+	if admin == nil {
+		return ""
+	}
+	normURL := strings.TrimRight(strings.TrimSpace(adminURL), "/")
+	isPureExternal := strings.TrimSpace(admin.Spec.ExternalURL) != "" && strings.TrimSpace(admin.Spec.Image) == ""
+	managedInCluster := !isPureExternal
+	dbHash := ""
+	if !isPureExternal {
+		dbHash = DatasourceURLHash(admin.Spec.Datasource.URL)
+	}
+	trimmedPw := strings.TrimSpace(admin.Spec.Auth.Password)
+	sanitizedTok := sanitizeHeaderToken(admin.Spec.Auth.AccessToken)
+	metaObj := SyncedAdminEndpointMeta{
+		AdminName:              admin.Name,
+		AdminUID:               string(admin.UID),
+		AdminURL:               normURL,
+		ManagedInCluster:       managedInCluster,
+		DatasourceHash:         dbHash,
+		AuthCaptured:           true,
+		Username:               admin.Spec.Auth.Username,
+		UsedDefaultPassword:    admin.Spec.Auth.PasswordSecretRef == nil && (trimmedPw == "" || trimmedPw == "123456"),
+		UsedDefaultAccessToken: admin.Spec.Auth.AccessTokenSecretRef == nil && (sanitizedTok == "" || sanitizedTok == "default_token"),
+	}
+	if admin.Spec.Auth.PasswordSecretRef != nil {
+		metaObj.PasswordSecretRef = admin.Spec.Auth.PasswordSecretRef.DeepCopy()
+	}
+	if admin.Spec.Auth.AccessTokenSecretRef != nil {
+		metaObj.AccessTokenSecretRef = admin.Spec.Auth.AccessTokenSecretRef.DeepCopy()
+	}
+	raw, err := json.Marshal(metaObj)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+// DecodeSyncedAdminEndpointMeta parses ConditionAdminEndpointSynced.Message from Status.Conditions.
+func DecodeSyncedAdminEndpointMeta(conditions []metav1.Condition) *SyncedAdminEndpointMeta {
+	for i := range conditions {
+		c := &conditions[i]
+		if c.Type != ConditionAdminEndpointSynced || strings.TrimSpace(c.Message) == "" {
+			continue
+		}
+		var parsed SyncedAdminEndpointMeta
+		if err := json.Unmarshal([]byte(c.Message), &parsed); err != nil {
+			continue
+		}
+		if strings.TrimSpace(parsed.AdminName) == "" &&
+			strings.TrimSpace(parsed.AdminUID) == "" &&
+			strings.TrimSpace(parsed.AdminURL) == "" &&
+			strings.TrimSpace(parsed.DatasourceHash) == "" &&
+			!parsed.ManagedInCluster &&
+			!parsed.AuthCaptured {
+			continue
+		}
+		return &parsed
+	}
+	return nil
+}
+
+type adminOrigin struct {
+	name   string
+	url    string
+	uid    string
+	dbHash string
+}
+
+func (o adminOrigin) hasAny() bool {
+	return o.name != "" || o.url != "" || o.uid != "" || o.dbHash != ""
+}
+
+func (o adminOrigin) key() string {
+	base := CanonicalAdminOriginKey(o.name, o.url, o.uid)
+	if o.dbHash == "" {
+		return base
+	}
+	if base == "" {
+		return "db=" + o.dbHash
+	}
+	return base + "|db=" + o.dbHash
+}
+
+func adminOriginMoreSpecific(a, b adminOrigin) bool {
+	if (a.uid != "") != (b.uid != "") {
+		return a.uid != ""
+	}
+	if (a.dbHash != "") != (b.dbHash != "") {
+		return a.dbHash != ""
+	}
+	if (a.url != "") != (b.url != "") {
+		return a.url != ""
+	}
+	if (a.name != "") != (b.name != "") {
+		return a.name != ""
+	}
+	if a.uid != b.uid {
+		return a.uid < b.uid
+	}
+	if a.dbHash != b.dbHash {
+		return a.dbHash < b.dbHash
+	}
+	if a.url != b.url {
+		return a.url < b.url
+	}
+	return a.name < b.name
+}
+
+// CanonicalAdminOriginKey produces a stable identity string for an originating XxlJobAdmin
+// (incorporating CR name, normalized base URL, and CR UID when available) so Job names do not
+// collide across independent Admin instances, in-place ExternalURL edits, or recreated Admin CRs.
+func CanonicalAdminOriginKey(adminName, adminURL, adminUID string) string {
+	name := strings.TrimSpace(adminName)
+	u := strings.TrimRight(strings.TrimSpace(adminURL), "/")
+	uid := strings.TrimSpace(adminUID)
+	if name == "" && u == "" && uid == "" {
+		return ""
+	}
+	return fmt.Sprintf("name=%s|url=%s|uid=%s", name, u, uid)
+}
+
+func resolveAdminURLForOrigin(admin *xxljobv1alpha1.XxlJobAdmin) string {
+	if admin == nil {
+		return ""
+	}
+	if ext := strings.TrimRight(strings.TrimSpace(admin.Spec.ExternalURL), "/"); ext != "" {
+		return ext
+	}
+	port := admin.Spec.Port
+	if port <= 0 {
+		port = 8080
+	}
+	ctxPath := strings.TrimSpace(admin.Spec.ContextPath)
+	if ctxPath == "" {
+		ctxPath = "/xxl-job-admin"
+	} else if !strings.HasPrefix(ctxPath, "/") {
+		ctxPath = "/" + ctxPath
+	}
+	if len(ctxPath) > 1 {
+		ctxPath = strings.TrimRight(ctxPath, "/")
+	}
+	if ctxPath == "/" {
+		ctxPath = ""
+	}
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d%s", admin.Name, admin.Namespace, port, ctxPath)
+}
+
+func extractSyncedEndpointOrigin(conds []metav1.Condition, targetURL string) adminOrigin {
+	targetURL = strings.TrimRight(strings.TrimSpace(targetURL), "/")
+	parsed := DecodeSyncedAdminEndpointMeta(conds)
+	if parsed == nil {
+		return adminOrigin{}
+	}
+	o := adminOrigin{
+		name:   strings.TrimSpace(parsed.AdminName),
+		url:    strings.TrimRight(strings.TrimSpace(parsed.AdminURL), "/"),
+		uid:    strings.TrimSpace(parsed.AdminUID),
+		dbHash: strings.TrimSpace(parsed.DatasourceHash),
+	}
+	if !o.hasAny() {
+		return adminOrigin{}
+	}
+	if targetURL == "" {
+		return o
+	}
+	if o.url == targetURL {
+		return o
+	}
+	if o.url == "" && (o.name != "" || o.uid != "") {
+		o.url = targetURL
+		return o
+	}
+	return adminOrigin{}
+}
+
+func adminPreviouslyOwnedURL(admin *xxljobv1alpha1.XxlJobAdmin, targetURL string) bool {
+	targetURL = strings.TrimRight(strings.TrimSpace(targetURL), "/")
+	if admin == nil || targetURL == "" {
+		return false
+	}
+	if strings.TrimRight(strings.TrimSpace(admin.Status.AdminURL), "/") == targetURL {
+		return true
+	}
+	for i := range admin.Status.Conditions {
+		c := &admin.Status.Conditions[i]
+		if c.Type == ConditionPreviousAdminURLs {
+			for _, part := range strings.Split(c.Message, ",") {
+				if strings.TrimRight(strings.TrimSpace(part), "/") == targetURL {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (s *Server) resolveExecutorOrigin(
+	ctx context.Context,
+	namespace, executorName string,
+	task *xxljobv1alpha1.XxlJobTask,
+	execCR *xxljobv1alpha1.XxlJobExecutor,
+) adminOrigin {
+	if execCR == nil && namespace != "" && executorName != "" {
+		var fetched xxljobv1alpha1.XxlJobExecutor
+		if err := s.apiReader().Get(ctx, client.ObjectKey{Namespace: namespace, Name: executorName}, &fetched); err == nil {
+			execCR = &fetched
+		}
+	}
+	ns := namespace
+	specAdminName := ""
+	activeSyncedURL := ""
+	if task != nil {
+		if ns == "" {
+			ns = task.Namespace
+		}
+		activeSyncedURL = strings.TrimRight(strings.TrimSpace(task.Status.AdminURL), "/")
+	}
+	if execCR != nil {
+		if ns == "" {
+			ns = execCR.Namespace
+		}
+		adminNS := execCR.Spec.AdminRef.Namespace
+		if adminNS == "" || adminNS == execCR.Namespace {
+			specAdminName = strings.TrimSpace(execCR.Spec.AdminRef.Name)
+		}
+		if activeSyncedURL == "" {
+			activeSyncedURL = strings.TrimRight(strings.TrimSpace(execCR.Status.AdminURL), "/")
+		}
+	}
+
+	lookupConditionOrigin := func(targetURL string) adminOrigin {
+		if task != nil {
+			if co := extractSyncedEndpointOrigin(task.Status.Conditions, targetURL); co.hasAny() {
+				return co
+			}
+		}
+		if execCR != nil {
+			if co := extractSyncedEndpointOrigin(execCR.Status.Conditions, targetURL); co.hasAny() {
+				return co
+			}
+		}
+		return adminOrigin{}
+	}
+
+	adminDBHashForURL := func(admin *xxljobv1alpha1.XxlJobAdmin, candidateURL string) string {
+		if admin == nil {
+			return ""
+		}
+		isPureExternal := strings.TrimSpace(admin.Spec.ExternalURL) != "" && strings.TrimSpace(admin.Spec.Image) == ""
+		if isPureExternal {
+			return ""
+		}
+		if candidateURL != "" &&
+			candidateURL != resolveAdminURLForOrigin(admin) &&
+			!IsClusterLocalAdminServiceURL(candidateURL, admin.Name, admin.Namespace) {
+			return ""
+		}
+		return DatasourceURLHash(admin.Spec.Datasource.URL)
+	}
+
+	var specAdminCR xxljobv1alpha1.XxlJobAdmin
+	hasSpecAdmin := false
+	if specAdminName != "" && ns != "" {
+		if err := s.apiReader().Get(ctx, client.ObjectKey{Namespace: ns, Name: specAdminName}, &specAdminCR); err == nil {
+			hasSpecAdmin = true
+		}
+	}
+
+	if hasSpecAdmin {
+		specAdminURL := resolveAdminURLForOrigin(&specAdminCR)
+		specAdminUID := strings.TrimSpace(string(specAdminCR.UID))
+		if activeSyncedURL == "" || activeSyncedURL == specAdminURL || adminPreviouslyOwnedURL(&specAdminCR, activeSyncedURL) {
+			effectiveURL := activeSyncedURL
+			if effectiveURL == "" {
+				effectiveURL = specAdminURL
+			}
+			effectiveDBHash := ""
+			if effectiveURL == specAdminURL {
+				effectiveDBHash = adminDBHashForURL(&specAdminCR, effectiveURL)
+			} else if condOrigin := lookupConditionOrigin(effectiveURL); condOrigin.dbHash != "" &&
+				condOrigin.name == specAdminCR.Name && (condOrigin.uid == "" || condOrigin.uid == specAdminUID) {
+				effectiveDBHash = condOrigin.dbHash
+			} else {
+				effectiveDBHash = adminDBHashForURL(&specAdminCR, effectiveURL)
+			}
+			return adminOrigin{
+				name:   specAdminCR.Name,
+				url:    effectiveURL,
+				uid:    specAdminUID,
+				dbHash: effectiveDBHash,
+			}
+		}
+
+		// Pre-reconcile transition: Spec.AdminRef or ExternalURL / Port / ContextPath changed before Status.AdminURL reconciled.
+		// Resolve the Admin CR that actually owns activeSyncedURL so we never stamp a hybrid (specAdmin.Name/UID + prevAdmin.URL).
+		if condOrigin := lookupConditionOrigin(activeSyncedURL); condOrigin.hasAny() {
+			if condOrigin.name == specAdminCR.Name && (condOrigin.uid == "" || condOrigin.uid == specAdminUID) {
+				dbHash := condOrigin.dbHash
+				if dbHash == "" {
+					dbHash = adminDBHashForURL(&specAdminCR, activeSyncedURL)
+				}
+				return adminOrigin{name: specAdminCR.Name, url: activeSyncedURL, uid: specAdminUID, dbHash: dbHash}
+			}
+			if condOrigin.uid == "" && condOrigin.name != "" && ns != "" {
+				var prevCR xxljobv1alpha1.XxlJobAdmin
+				if err := s.apiReader().Get(ctx, client.ObjectKey{Namespace: ns, Name: condOrigin.name}, &prevCR); err == nil {
+					if resolveAdminURLForOrigin(&prevCR) == activeSyncedURL || adminPreviouslyOwnedURL(&prevCR, activeSyncedURL) {
+						condOrigin.uid = strings.TrimSpace(string(prevCR.UID))
+						if condOrigin.dbHash == "" {
+							condOrigin.dbHash = adminDBHashForURL(&prevCR, activeSyncedURL)
+						}
+					}
+				}
+			}
+			return condOrigin
+		}
+		if ns != "" {
+			var adminList xxljobv1alpha1.XxlJobAdminList
+			if err := s.apiReader().List(ctx, &adminList, client.InNamespace(ns)); err == nil {
+				for i := range adminList.Items {
+					item := &adminList.Items[i]
+					if resolveAdminURLForOrigin(item) == activeSyncedURL || adminPreviouslyOwnedURL(item, activeSyncedURL) {
+						return adminOrigin{
+							name:   item.Name,
+							url:    activeSyncedURL,
+							uid:    strings.TrimSpace(string(item.UID)),
+							dbHash: adminDBHashForURL(item, activeSyncedURL),
+						}
+					}
+				}
+			}
+		}
+		return adminOrigin{url: activeSyncedURL}
+	}
+
+	if condOrigin := lookupConditionOrigin(activeSyncedURL); condOrigin.hasAny() {
+		return condOrigin
+	}
+	return adminOrigin{
+		name: specAdminName,
+		url:  activeSyncedURL,
+	}
+}
+
+func stampOriginatingAdminOrigin(job *batchv1.Job, origin adminOrigin) {
 	if job == nil {
 		return
 	}
 	if job.Annotations == nil {
 		job.Annotations = make(map[string]string)
 	}
+	if origin.name != "" {
+		job.Annotations[AnnotationAdminName] = origin.name
+	}
+	if origin.url != "" {
+		job.Annotations[AnnotationAdminURL] = origin.url
+	}
+	if origin.uid != "" {
+		job.Annotations[AnnotationAdminUID] = origin.uid
+	}
+	if origin.dbHash != "" {
+		job.Annotations[AnnotationAdminDatasourceHash] = origin.dbHash
+	}
+}
+
+func stampOriginatingAdminAnnotations(job *batchv1.Job, task *xxljobv1alpha1.XxlJobTask, execCR *xxljobv1alpha1.XxlJobExecutor) {
+	var origin adminOrigin
 	if execCR != nil {
 		adminNS := execCR.Spec.AdminRef.Namespace
 		if adminNS == "" || adminNS == execCR.Namespace {
-			if name := strings.TrimSpace(execCR.Spec.AdminRef.Name); name != "" {
-				job.Annotations[AnnotationAdminName] = name
-			}
+			origin.name = strings.TrimSpace(execCR.Spec.AdminRef.Name)
 		}
-		if u := strings.TrimRight(strings.TrimSpace(execCR.Status.AdminURL), "/"); u != "" {
-			job.Annotations[AnnotationAdminURL] = u
-		}
+		origin.url = strings.TrimRight(strings.TrimSpace(execCR.Status.AdminURL), "/")
 	}
-	if job.Annotations[AnnotationAdminURL] == "" && task != nil {
-		if u := strings.TrimRight(strings.TrimSpace(task.Status.AdminURL), "/"); u != "" {
-			job.Annotations[AnnotationAdminURL] = u
-		}
+	if origin.url == "" && task != nil {
+		origin.url = strings.TrimRight(strings.TrimSpace(task.Status.AdminURL), "/")
 	}
+	stampOriginatingAdminOrigin(job, origin)
 }
 
 func sanitizeHeaderToken(raw string) string {
@@ -1268,31 +1972,124 @@ func applyFallbackGlueNonRootUser(podSpec *corev1.PodSpec) {
 	podSpec.SecurityContext.RunAsUser = &nonRootUID
 }
 
+func extractJobAdminOrigin(j *batchv1.Job) adminOrigin {
+	if j == nil || j.Annotations == nil {
+		return adminOrigin{}
+	}
+	return adminOrigin{
+		name:   strings.TrimSpace(j.Annotations[AnnotationAdminName]),
+		url:    strings.TrimRight(strings.TrimSpace(j.Annotations[AnnotationAdminURL]), "/"),
+		uid:    strings.TrimSpace(j.Annotations[AnnotationAdminUID]),
+		dbHash: strings.TrimSpace(j.Annotations[AnnotationAdminDatasourceHash]),
+	}
+}
+
+func jobHasAdminOrigin(j *batchv1.Job) bool {
+	return extractJobAdminOrigin(j).hasAny()
+}
+
+func sameManagedAdminOrigin(a, b adminOrigin) bool {
+	if a.name == "" || a.name != b.name {
+		return false
+	}
+	if a.uid != "" && b.uid != "" && a.uid != b.uid {
+		return false
+	}
+	if a.dbHash == "" || b.dbHash == "" || a.dbHash != b.dbHash {
+		return false
+	}
+	return a.url != "" && b.url != ""
+}
+
+func sameAdminOrigin(a, b adminOrigin) bool {
+	if !a.hasAny() || !b.hasAny() {
+		return true
+	}
+	if a.uid != "" && b.uid != "" && a.uid != b.uid {
+		return false
+	}
+	if a.name != "" && b.name != "" && a.name != b.name {
+		return false
+	}
+	if a.dbHash != "" && b.dbHash != "" && a.dbHash != b.dbHash {
+		return false
+	}
+	if sameManagedAdminOrigin(a, b) {
+		return true
+	}
+	if a.url != "" && b.url != "" && a.url != b.url {
+		return false
+	}
+	return (a.uid != "" && a.uid == b.uid) ||
+		(a.url != "" && a.url == b.url) ||
+		(a.name != "" && a.name == b.name) ||
+		(a.dbHash != "" && a.dbHash == b.dbHash)
+}
+
+// SameSyncedAdminOrigin reports whether two recorded endpoint status pairs (ConditionAdminEndpointSynced + Status.AdminURL)
+// belong to the same logical XXL-JOB Admin & database origin (including in-place managed Port/ContextPath/Hybrid URL edits,
+// while distinguishing replaced Datasource.URLs and recreated Admin UIDs).
+func SameSyncedAdminOrigin(condsA []metav1.Condition, urlA string, condsB []metav1.Condition, urlB string) bool {
+	urlA = strings.TrimRight(strings.TrimSpace(urlA), "/")
+	urlB = strings.TrimRight(strings.TrimSpace(urlB), "/")
+	origA := extractSyncedEndpointOrigin(condsA, urlA)
+	if !origA.hasAny() && urlA != "" {
+		origA = adminOrigin{url: urlA}
+	}
+	origB := extractSyncedEndpointOrigin(condsB, urlB)
+	if !origB.hasAny() && urlB != "" {
+		origB = adminOrigin{url: urlB}
+	}
+	return sameAdminOrigin(origA, origB)
+}
+
+func jobMatchesExecutorOrigin(j *batchv1.Job, origin adminOrigin) bool {
+	return sameAdminOrigin(extractJobAdminOrigin(j), origin)
+}
+
 func isSameOriginatingAdminJob(a, b *batchv1.Job) bool {
 	if a == nil || b == nil {
 		return true
 	}
-	var urlA, urlB, nameA, nameB string
-	if a.Annotations != nil {
-		urlA = strings.TrimRight(strings.TrimSpace(a.Annotations[AnnotationAdminURL]), "/")
-		nameA = strings.TrimSpace(a.Annotations[AnnotationAdminName])
-	}
-	if b.Annotations != nil {
-		urlB = strings.TrimRight(strings.TrimSpace(b.Annotations[AnnotationAdminURL]), "/")
-		nameB = strings.TrimSpace(b.Annotations[AnnotationAdminName])
-	}
-	if urlA != "" && urlB != "" {
-		return urlA == urlB
-	}
-	if nameA != "" && nameB != "" {
-		return nameA == nameB
-	}
-	return true
+	return sameAdminOrigin(extractJobAdminOrigin(a), extractJobAdminOrigin(b))
 }
 
 func executorShortHash(executorName string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(executorName)))
 	return hex.EncodeToString(sum[:3]) // 6 hex chars
+}
+
+func jobScopeShortHash(executorName, originKey string) string {
+	trimmedOrigin := strings.TrimSpace(originKey)
+	if trimmedOrigin == "" {
+		return executorShortHash(executorName)
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(executorName) + "\x00" + trimmedOrigin))
+	return hex.EncodeToString(sum[:4]) // 8 hex chars
+}
+
+func parseOriginScopedJobLogIDForJobID(jobName string, jobID int) (int64, bool) {
+	parts := strings.Split(strings.TrimSpace(jobName), "-")
+	if len(parts) != 4 || parts[0] != "xxljob" {
+		return 0, false
+	}
+	if len(parts[1]) != 6 && len(parts[1]) != 8 {
+		return 0, false
+	}
+	for i := 0; i < len(parts[1]); i++ {
+		ch := parts[1][i]
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+			return 0, false
+		}
+	}
+	if parts[2] != strconv.Itoa(jobID) {
+		return 0, false
+	}
+	lid, err := strconv.ParseInt(parts[3], 10, 64)
+	if err != nil || lid <= 0 {
+		return 0, false
+	}
+	return lid, true
 }
 
 func isJobSupersededByJob(candidateLogID int64, candidateJob, otherJob *batchv1.Job) bool {
@@ -1337,7 +2134,22 @@ func (s *Server) claimCoverEarlyWinner(
 ) (bool, error) {
 	current := initialTask.DeepCopy()
 	claimed := false
-	expectedPrefix := fmt.Sprintf("xxljob-%s-%d-", executorShortHash(executorName), jobID)
+	basePrefix := fmt.Sprintf("xxljob-%s-%d-", executorShortHash(executorName), jobID)
+	expectedPrefixes := []string{basePrefix}
+	if createdJob != nil {
+		if idx := strings.LastIndexByte(createdJob.Name, '-'); idx > 0 {
+			candPrefix := createdJob.Name[:idx+1]
+			if candPrefix != basePrefix {
+				expectedPrefixes = append(expectedPrefixes, candPrefix)
+			}
+		}
+		if origKey := extractJobAdminOrigin(createdJob).key(); origKey != "" {
+			scopedPrefix := fmt.Sprintf("xxljob-%s-%d-", jobScopeShortHash(executorName, origKey), jobID)
+			if scopedPrefix != basePrefix {
+				expectedPrefixes = append(expectedPrefixes, scopedPrefix)
+			}
+		}
+	}
 	for attempt := 0; attempt < 4; attempt++ {
 		if current.Status.LastExecutionJobName == createdJob.Name {
 			claimed = true
@@ -1352,18 +2164,38 @@ func (s *Server) claimCoverEarlyWinner(
 			} else if apierrors.IsNotFound(getErr) {
 				// Even if the newer winner Job already completed and was garbage-collected by TTLSecondsAfterFinished,
 				// parse its logId from LastExecutionJobName on the same originating Admin so a delayed out-of-order
-				// COVER_EARLY request never executes after a newer trigger finished.
-				jobAdminURL := ""
-				if createdJob != nil && createdJob.Annotations != nil {
-					jobAdminURL = strings.TrimRight(strings.TrimSpace(createdJob.Annotations[AnnotationAdminURL]), "/")
-				}
+				// COVER_EARLY request never executes after a newer trigger finished, while never mistaking a recreated
+				// same-URL Admin CR (different UID) for the same logId sequence.
+				jobOrigin := extractJobAdminOrigin(createdJob)
 				taskAdminURL := strings.TrimRight(strings.TrimSpace(current.Status.AdminURL), "/")
+				taskSyncedOrigin := extractSyncedEndpointOrigin(current.Status.Conditions, taskAdminURL)
 				sameRecordedAdmin := true
-				if jobAdminURL != "" || taskAdminURL != "" {
-					sameRecordedAdmin = jobAdminURL != "" && taskAdminURL != "" && jobAdminURL == taskAdminURL
+				if taskSyncedOrigin.hasAny() && jobOrigin.hasAny() {
+					sameRecordedAdmin = sameAdminOrigin(jobOrigin, taskSyncedOrigin)
+				} else if jobOrigin.url != "" || taskAdminURL != "" {
+					sameRecordedAdmin = jobOrigin.url != "" && taskAdminURL != "" && jobOrigin.url == taskAdminURL
 				}
-				if sameRecordedAdmin && logID > 0 && strings.HasPrefix(current.Status.LastExecutionJobName, expectedPrefix) {
-					if winnerLogID, parseErr := strconv.ParseInt(strings.TrimPrefix(current.Status.LastExecutionJobName, expectedPrefix), 10, 64); parseErr == nil && winnerLogID > logID {
+				if sameRecordedAdmin && logID > 0 {
+					candidatePrefixes := expectedPrefixes
+					if taskKey := taskSyncedOrigin.key(); taskKey != "" {
+						taskScopedPrefix := fmt.Sprintf("xxljob-%s-%d-", jobScopeShortHash(executorName, taskKey), jobID)
+						candidatePrefixes = append(candidatePrefixes, taskScopedPrefix)
+					}
+					supersededByGCDWinner := false
+					for _, pfx := range candidatePrefixes {
+						if strings.HasPrefix(current.Status.LastExecutionJobName, pfx) {
+							if winnerLogID, parseErr := strconv.ParseInt(strings.TrimPrefix(current.Status.LastExecutionJobName, pfx), 10, 64); parseErr == nil && winnerLogID > logID {
+								supersededByGCDWinner = true
+								break
+							}
+						}
+					}
+					if !supersededByGCDWinner && jobOrigin.dbHash != "" {
+						if winnerLogID, ok := parseOriginScopedJobLogIDForJobID(current.Status.LastExecutionJobName, jobID); ok && winnerLogID > logID {
+							supersededByGCDWinner = true
+						}
+					}
+					if supersededByGCDWinner {
 						break
 					}
 				}
@@ -1427,6 +2259,10 @@ func resolveGlueFallbackRuntime(glueType, script string, param xxlclient.Trigger
 }
 
 func (s *Server) buildBatchJob(param xxlclient.TriggerParam, task *xxljobv1alpha1.XxlJobTask) (*batchv1.Job, error) {
+	return s.buildBatchJobWithOrigin(param, task, adminOrigin{})
+}
+
+func (s *Server) buildBatchJobWithOrigin(param xxlclient.TriggerParam, task *xxljobv1alpha1.XxlJobTask, origin adminOrigin) (*batchv1.Job, error) {
 	if task == nil {
 		return nil, fmt.Errorf("XxlJobTask CR is required to build a Kubernetes batch Job")
 	}
@@ -1553,9 +2389,9 @@ func (s *Server) buildBatchJob(param xxlclient.TriggerParam, task *xxljobv1alpha
 		AnnotationCallbackSent:  "false",
 	}
 
-	// Include a short hash of the executor name so Jobs from two different executors/Admins
-	// in the same namespace with identical (jobId, logId) never collide (fixes P1-4).
-	jobName := BuildJobName(execName, param.JobID, logID)
+	// Include a short hash of (executorName, originating Admin identity) so Jobs from two different executors
+	// or migrated/recreated Admins in the same namespace with identical (jobId, logId) never collide (fixes P1-4).
+	jobName := BuildJobName(execName, param.JobID, logID, origin.key())
 
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1604,12 +2440,20 @@ func (s *Server) buildBatchJob(param xxlclient.TriggerParam, task *xxljobv1alpha
 	return job, nil
 }
 
-// BuildJobName generates a deterministic Kubernetes Job name scoped to (executorName, jobID, logID).
-func BuildJobName(executorName string, jobID int, logID int64) string {
-	return fmt.Sprintf("xxljob-%s-%d-%d", executorShortHash(executorName), jobID, logID)
+// BuildJobName generates a deterministic Kubernetes Job name scoped to (executorName, adminOrigin, jobID, logID).
+func BuildJobName(executorName string, jobID int, logID int64, adminOrigin ...string) string {
+	originKey := ""
+	if len(adminOrigin) > 0 {
+		originKey = adminOrigin[0]
+	}
+	return fmt.Sprintf("xxljob-%s-%d-%d", jobScopeShortHash(executorName, originKey), jobID, logID)
 }
 
 func (s *Server) hasRunningJob(ctx context.Context, namespace, executorName string, jobID int, excludeJobName string) (bool, error) {
+	return s.hasRunningJobForOrigin(ctx, namespace, executorName, jobID, excludeJobName, adminOrigin{})
+}
+
+func (s *Server) hasRunningJobForOrigin(ctx context.Context, namespace, executorName string, jobID int, excludeJobName string, origin adminOrigin) (bool, error) {
 	matchLabels := client.MatchingLabels{
 		LabelManagedBy: ManagedByValue,
 		LabelJobID:     strconv.Itoa(jobID),
@@ -1630,7 +2474,7 @@ func (s *Server) hasRunningJob(ctx context.Context, namespace, executorName stri
 		if excludeJobName != "" && j.Name == excludeJobName {
 			continue
 		}
-		if !matchesExecutorJobAnnotation(j, executorName) {
+		if !matchesExecutorJobAnnotation(j, executorName) || !jobMatchesExecutorOrigin(j, origin) {
 			continue
 		}
 		if isJobBlockingExecution(j) {
@@ -1667,12 +2511,24 @@ func isJobBlockingExecution(job *batchv1.Job) bool {
 	return true
 }
 
-// HasActiveOrTerminatingPods reports whether a batch/v1.Job still has active or terminating Pods (fixes R8-P1-1).
+// HasActiveOrTerminatingPods reports whether a batch/v1.Job still has active or terminating Pods,
+// including deleting Jobs that still hold the foregroundDeletion finalizer while GarbageCollector waits
+// for dependent Pods to terminate and be removed (fixes R8-P1-1).
 func HasActiveOrTerminatingPods(job *batchv1.Job) bool {
 	if job == nil {
 		return false
 	}
-	return job.Status.Active > 0 || (job.Status.Terminating != nil && *job.Status.Terminating > 0)
+	if job.Status.Active > 0 || (job.Status.Terminating != nil && *job.Status.Terminating > 0) {
+		return true
+	}
+	if !job.DeletionTimestamp.IsZero() {
+		for _, f := range job.Finalizers {
+			if f == metav1.FinalizerDeleteDependents {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hasActiveOrTerminatingPods(job *batchv1.Job) bool {
@@ -1696,7 +2552,12 @@ func isStaleOrphanSuspendedJob(job *batchv1.Job) bool {
 // killRunningJobs suspends and deletes ONLY running or suspended (incomplete) Jobs for (namespace, executorName, jobID),
 // preserving already-completed historical Jobs so their logs and pending callbacks are not lost (fixes R4-P1-2, R6-P2-1, R8-P1-2, R8-P2-6).
 func (s *Server) killRunningJobs(ctx context.Context, namespace, executorName string, jobID int, excludeJobName string) error {
-	_, err := s.killRunningJobsInternal(ctx, namespace, executorName, jobID, 0, nil, excludeJobName)
+	_, err := s.killRunningJobsInternal(ctx, namespace, executorName, jobID, 0, nil, excludeJobName, adminOrigin{})
+	return err
+}
+
+func (s *Server) killRunningJobsForOrigin(ctx context.Context, namespace, executorName string, jobID int, excludeJobName string, origin adminOrigin) error {
+	_, err := s.killRunningJobsInternal(ctx, namespace, executorName, jobID, 0, nil, excludeJobName, origin)
 	return err
 }
 
@@ -1708,10 +2569,12 @@ func (s *Server) killRunningJobsForCoverEarly(
 	candidateJob *batchv1.Job,
 ) (bool, error) {
 	excludeName := ""
+	var origin adminOrigin
 	if candidateJob != nil {
 		excludeName = candidateJob.Name
+		origin = extractJobAdminOrigin(candidateJob)
 	}
-	return s.killRunningJobsInternal(ctx, namespace, executorName, jobID, candidateLogID, candidateJob, excludeName)
+	return s.killRunningJobsInternal(ctx, namespace, executorName, jobID, candidateLogID, candidateJob, excludeName, origin)
 }
 
 func (s *Server) killRunningJobsInternal(
@@ -1721,6 +2584,7 @@ func (s *Server) killRunningJobsInternal(
 	candidateLogID int64,
 	candidateJob *batchv1.Job,
 	excludeJobName string,
+	origin adminOrigin,
 ) (bool, error) {
 	killCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
 	defer cancel()
@@ -1746,7 +2610,7 @@ func (s *Server) killRunningJobsInternal(
 			if excludeJobName != "" && job.Name == excludeJobName {
 				continue
 			}
-			if !matchesExecutorJobAnnotation(job, executorName) {
+			if !matchesExecutorJobAnnotation(job, executorName) || !jobMatchesExecutorOrigin(job, origin) {
 				continue
 			}
 			if isJobSupersededByJob(candidateLogID, candidateJob, job) {
@@ -1755,13 +2619,26 @@ func (s *Server) killRunningJobsInternal(
 		}
 	}
 
-	policy := metav1.DeletePropagationBackground
+	// Use Foreground deletion so Kubernetes GarbageCollector immediately terminates active/pending Job Pods
+	// via foregroundDeletion even while JobCallbackFinalizer (xxljob.io/callback-guard) retains the Job
+	// until Pods exit and callback delivery completes.
+	policy := metav1.DeletePropagationForeground
+	remainingOtherSuspended := 0
 	for i := range jobList.Items {
 		job := &jobList.Items[i]
 		if excludeJobName != "" && job.Name == excludeJobName {
 			continue
 		}
 		if !matchesExecutorJobAnnotation(job, executorName) {
+			continue
+		}
+		if !jobMatchesExecutorOrigin(job, origin) {
+			if job.DeletionTimestamp.IsZero() && isJobRunning(job) && job.Spec.Suspend != nil && *job.Spec.Suspend {
+				if job.Annotations == nil || ((job.Annotations[AnnotationFailureMessage] == "" && job.Annotations[AnnotationCallbackSent] != "true") &&
+					(job.Annotations[AnnotationBlockStrategy] == "" || job.Annotations[AnnotationBlockStrategy] == "SERIAL_EXECUTION")) {
+					remainingOtherSuspended++
+				}
+			}
 			continue
 		}
 		if !job.DeletionTimestamp.IsZero() || !isJobRunning(job) {
@@ -1780,7 +2657,7 @@ func (s *Server) killRunningJobsInternal(
 		}
 	}
 	if OnSerialQueueDepth != nil {
-		OnSerialQueueDepth(namespace, sanitizeLabel(executorName), strconv.Itoa(jobID), 0)
+		OnSerialQueueDepth(namespace, sanitizeLabel(executorName), strconv.Itoa(jobID), float64(remainingOtherSuspended))
 	}
 	return false, nil
 }

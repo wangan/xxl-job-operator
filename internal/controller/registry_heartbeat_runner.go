@@ -87,6 +87,14 @@ func (r *RegistryHeartbeatRunner) RunOnce(ctx context.Context) error {
 		if !shouldHeartbeatExecutorRegistry(&execCR) {
 			continue
 		}
+		if execCR.Spec.Mode != xxljobv1alpha1.ExecutorModeK8sJobProxy &&
+			execCR.Spec.UseServiceDNS && strings.TrimSpace(execCR.Spec.ServiceName) != "" {
+			readyCnt, keepAliveCnt, backendErr := evaluateServiceDNSBackends(ctx, r.Client, &execCR)
+			addrType := resolveExecutorAddressType(&execCR)
+			if backendErr == nil && readyCnt == 0 && (addrType != 1 || keepAliveCnt == 0) {
+				continue
+			}
+		}
 		addrSet := make(map[string]bool)
 		for _, addr := range execCR.Status.RegisteredAddresses {
 			if addr != "" {
@@ -186,7 +194,13 @@ func (r *RegistryHeartbeatRunner) RunOnce(ctx context.Context) error {
 		cli := xxlCli
 
 		for _, t := range grp.targets {
-			if t.execCR.Status.AdminURL != "" && strings.TrimRight(t.execCR.Status.AdminURL, "/") != resolvedAdminURL {
+			execMeta := extractSyncedAdminEndpointMeta(t.execCR.Status.Conditions)
+			if isAdminInstanceOrDBReplaced(adminCR, execMeta) {
+				continue
+			}
+			if t.execCR.Status.AdminURL != "" &&
+				strings.TrimRight(t.execCR.Status.AdminURL, "/") != resolvedAdminURL &&
+				!isSameManagedAdminDBUpdate(adminCR, t.execCR.Status.AdminURL, execMeta) {
 				continue
 			}
 			target := t

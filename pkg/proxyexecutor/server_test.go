@@ -15,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -2163,5 +2164,1233 @@ func TestBoostEndgameProxyPodSecurityOverridesLabelsAndCoverEarlyGC(t *testing.T
 	var checkForeign batchv1.Job
 	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: foreignRunningJob.Name}, &checkForeign); err != nil {
 		t.Fatalf("expected foreign executor Job %s to be preserved across /kill, got err=%v", foreignRunningJob.Name, err)
+	}
+}
+
+func TestProxyForegroundDeleteAndCrossAdminJobCollisionIsolation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = xxljobv1alpha1.AddToScheme(scheme)
+
+	ctx := context.Background()
+
+	adminA := &xxljobv1alpha1.XxlJobAdmin{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "admin-a",
+			Namespace: "default",
+			UID:       types.UID("uid-a"),
+		},
+		Spec: xxljobv1alpha1.XxlJobAdminSpec{
+			ExternalURL: "http://admin-a:8080/xxl-job-admin",
+			Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "mig-tok"},
+		},
+		Status: xxljobv1alpha1.XxlJobAdminStatus{
+			AdminURL: "http://admin-a:8080/xxl-job-admin",
+		},
+	}
+	adminB := &xxljobv1alpha1.XxlJobAdmin{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "admin-b",
+			Namespace: "default",
+			UID:       types.UID("uid-b"),
+		},
+		Spec: xxljobv1alpha1.XxlJobAdminSpec{
+			ExternalURL: "http://admin-b:8080/xxl-job-admin",
+			Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "mig-tok"},
+		},
+		Status: xxljobv1alpha1.XxlJobAdminStatus{
+			AdminURL: "http://admin-b:8080/xxl-job-admin",
+		},
+	}
+	execCR := &xxljobv1alpha1.XxlJobExecutor{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mig-proxy",
+			Namespace: "default",
+		},
+		Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+			AdminRef: xxljobv1alpha1.LocalObjectReference{Name: "admin-a"},
+			AppName:  "mig-proxy-app",
+			Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+		},
+		Status: xxljobv1alpha1.XxlJobExecutorStatus{
+			JobGroupID: 10,
+			AdminURL:   "http://admin-a:8080/xxl-job-admin",
+			Synced:     true,
+		},
+	}
+	taskCR := &xxljobv1alpha1.XxlJobTask{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mig-task",
+			Namespace: "default",
+		},
+		Spec: xxljobv1alpha1.XxlJobTaskSpec{
+			ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: "mig-proxy"},
+			JobDesc:         "Migrated Task",
+			Author:          "ops",
+			ScheduleType:    "CRON",
+			ScheduleConf:    "0 * * * * ?",
+			ExecutorHandler: "migHandler",
+			K8sJobTemplate: &xxljobv1alpha1.K8sJobTemplateSpec{
+				Image:   "alpine:3.19",
+				Command: []string{"/bin/sh", "-c"},
+				Args:    []string{"echo ok"},
+			},
+		},
+		Status: xxljobv1alpha1.XxlJobTaskStatus{
+			JobID:      55,
+			JobGroupID: 10,
+			AdminURL:   "http://admin-a:8080/xxl-job-admin",
+			Synced:     true,
+		},
+	}
+
+	var delMu sync.Mutex
+	deletedPolicies := make(map[string]metav1.DeletionPropagation)
+
+	fakeK8s := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(adminA, adminB, execCR, taskCR).
+		WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(ctx context.Context, cli client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if job, ok := obj.(*batchv1.Job); ok {
+					delOpts := &client.DeleteOptions{}
+					delOpts.ApplyOptions(opts)
+					delMu.Lock()
+					if delOpts.PropagationPolicy != nil {
+						deletedPolicies[job.Name] = *delOpts.PropagationPolicy
+					} else {
+						deletedPolicies[job.Name] = ""
+					}
+					delMu.Unlock()
+				}
+				return cli.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+
+	srv := NewServer(fakeK8s, ":0", "default", "mig-tok")
+	srv.FetchPodLog = func(ctx context.Context, namespace, podName, containerName string) (string, error) {
+		return "log-from-" + podName + "\n", nil
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	post := func(action string, body any) xxlclient.ReturnT {
+		t.Helper()
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/proxy/default/mig-proxy/"+action, bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(xxlclient.AccessTokenHeader, "mig-tok")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s failed: %v", action, err)
+		}
+		defer resp.Body.Close()
+		var ret xxlclient.ReturnT
+		_ = json.NewDecoder(resp.Body).Decode(&ret)
+		return ret
+	}
+
+	// 1. Trigger COVER_EARLY 1000 then preempt with 1001 on admin-a -> verify Foreground delete on 1000
+	if ret := post("run", xxlclient.TriggerParam{
+		JobID:                 55,
+		ExecutorHandler:       "migHandler",
+		ExecutorBlockStrategy: "COVER_EARLY",
+		LogID:                 1000,
+		LogDateTime:           1700000001000,
+	}); !ret.IsSuccess() {
+		t.Fatalf("expected admin-a logId=1000 to succeed, got %+v", ret)
+	}
+	job1000Name := BuildJobName("mig-proxy", 55, 1000)
+	if ret := post("run", xxlclient.TriggerParam{
+		JobID:                 55,
+		ExecutorHandler:       "migHandler",
+		ExecutorBlockStrategy: "COVER_EARLY",
+		LogID:                 1001,
+		LogDateTime:           1700000001001,
+	}); !ret.IsSuccess() {
+		t.Fatalf("expected admin-a COVER_EARLY logId=1001 to succeed, got %+v", ret)
+	}
+	delMu.Lock()
+	pol1000 := deletedPolicies[job1000Name]
+	delMu.Unlock()
+	if pol1000 != metav1.DeletePropagationForeground {
+		t.Fatalf("expected COVER_EARLY preemption to delete %s with DeletePropagationForeground, got %q", job1000Name, pol1000)
+	}
+
+	// Mark admin-a's 1001 Job active with a Pod
+	jobA1001Name := BuildJobName("mig-proxy", 55, 1001)
+	var jobA1001 batchv1.Job
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: jobA1001Name}, &jobA1001); err != nil {
+		t.Fatalf("get admin-a job 1001: %v", err)
+	}
+	if jobA1001.Annotations[AnnotationAdminUID] != "uid-a" || jobA1001.Annotations[AnnotationAdminName] != "admin-a" {
+		t.Fatalf("expected admin-a origin annotations stamped on job, got %+v", jobA1001.Annotations)
+	}
+	jobA1001.Status.Active = 1
+	_ = fakeK8s.Status().Update(ctx, &jobA1001)
+	_ = fakeK8s.Create(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-admin-a-1001",
+			Namespace: "default",
+			Labels: map[string]string{
+				LabelManagedBy:    ManagedByValue,
+				LabelExecutorName: SanitizeLabel("mig-proxy"),
+				LabelLogID:        "1001",
+				"job-name":        jobA1001Name,
+			},
+		},
+		Spec: jobA1001.Spec.Template.Spec,
+	})
+
+	// Also create a completed historical Job 1002 on admin-a (callback already sent)
+	if ret := post("run", xxlclient.TriggerParam{
+		JobID:           55,
+		ExecutorHandler: "migHandler",
+		LogID:           1002,
+		LogDateTime:     1700000001002,
+	}); !ret.IsSuccess() {
+		t.Fatalf("expected admin-a logId=1002 to succeed, got %+v", ret)
+	}
+	jobA1002Name := BuildJobName("mig-proxy", 55, 1002)
+	var jobA1002 batchv1.Job
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: jobA1002Name}, &jobA1002)
+	jobA1002.Annotations[AnnotationCallbackSent] = "true"
+	_ = fakeK8s.Update(ctx, &jobA1002)
+	jobA1002.Status.Succeeded = 1
+	jobA1002.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+	_ = fakeK8s.Status().Update(ctx, &jobA1002)
+
+	// 2. Migrate mig-proxy and mig-task to admin-b while admin-a's Jobs 1001 (active) and 1002 (completed) still exist!
+	var curExec xxljobv1alpha1.XxlJobExecutor
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "mig-proxy"}, &curExec)
+	curExec.Spec.AdminRef.Name = "admin-b"
+	_ = fakeK8s.Update(ctx, &curExec)
+	curExec.Status.AdminURL = "http://admin-b:8080/xxl-job-admin"
+	curExec.Status.JobGroupID = 20
+	_ = fakeK8s.Status().Update(ctx, &curExec)
+
+	var curTask xxljobv1alpha1.XxlJobTask
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "mig-task"}, &curTask)
+	curTask.Status.AdminURL = "http://admin-b:8080/xxl-job-admin"
+	curTask.Status.JobGroupID = 20
+	curTask.Status.JobID = 55 // colliding auto-increment jobId on admin-b!
+	curTask.Status.LastExecutionJobName = ""
+	_ = fakeK8s.Status().Update(ctx, &curTask)
+
+	// (a) /idleBeat on admin-b MUST NOT be blocked by admin-a's active Job 1001
+	if idleRet := post("idleBeat", xxlclient.IdleBeatParam{JobID: 55}); !idleRet.IsSuccess() {
+		t.Fatalf("expected /idleBeat on admin-b not to be blocked by admin-a's active Job, got %+v", idleRet)
+	}
+
+	// (b) Colliding (jobId=55, logId=1001) on admin-b with DIFFERENT logDateTime MUST succeed with origin-scoped Job name
+	if ret := post("run", xxlclient.TriggerParam{
+		JobID:                 55,
+		ExecutorHandler:       "migHandler",
+		ExecutorBlockStrategy: "DISCARD_LATER",
+		LogID:                 1001,
+		LogDateTime:           1700000999999,
+	}); !ret.IsSuccess() {
+		t.Fatalf("expected colliding (55, 1001) on admin-b to succeed via origin-scoped Job name, got %+v", ret)
+	}
+	originKeyB := CanonicalAdminOriginKey("admin-b", "http://admin-b:8080/xxl-job-admin", "uid-b")
+	jobB1001Name := BuildJobName("mig-proxy", 55, 1001, originKeyB)
+	if jobB1001Name == jobA1001Name {
+		t.Fatalf("expected distinct Job name for admin-b collision, got identical %s", jobB1001Name)
+	}
+	var jobB1001 batchv1.Job
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: jobB1001Name}, &jobB1001); err != nil {
+		t.Fatalf("expected origin-scoped Job %s to be created, got err=%v", jobB1001Name, err)
+	}
+	if jobB1001.Annotations[AnnotationAdminName] != "admin-b" || jobB1001.Annotations[AnnotationAdminUID] != "uid-b" {
+		t.Fatalf("unexpected origin annotations on %s: %+v", jobB1001Name, jobB1001.Annotations)
+	}
+
+	// (c) Colliding (jobId=55, logId=1002) on admin-b with IDENTICAL logDateTime to admin-a's completed Job 1002
+	// MUST spawn a fresh Job for admin-b (neither swallowed as idempotent nor rejected as already completed)!
+	if ret := post("run", xxlclient.TriggerParam{
+		JobID:           55,
+		ExecutorHandler: "migHandler",
+		LogID:           1002,
+		LogDateTime:     1700000001002,
+	}); !ret.IsSuccess() {
+		t.Fatalf("expected colliding (55, 1002) with identical logDateTime on admin-b to spawn new Job, got %+v", ret)
+	}
+	jobB1002Name := BuildJobName("mig-proxy", 55, 1002, originKeyB)
+	var jobB1002 batchv1.Job
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: jobB1002Name}, &jobB1002); err != nil {
+		t.Fatalf("expected admin-b Job %s created despite identical logDateTime on admin-a, got err=%v", jobB1002Name, err)
+	}
+
+	// (d) Idempotent retry of (55, 1001) on admin-b BEFORE and AFTER admin-a's Job 1001 is TTL-deleted
+	// MUST recognize jobB1001 without spawning a duplicate Job!
+	if dupRet := post("run", xxlclient.TriggerParam{
+		JobID:                 55,
+		ExecutorHandler:       "migHandler",
+		ExecutorBlockStrategy: "DISCARD_LATER",
+		LogID:                 1001,
+		LogDateTime:           1700000999999,
+	}); !dupRet.IsSuccess() || !strings.Contains(dupRet.Msg, "already exists") {
+		t.Fatalf("expected idempotent retry before TTL GC to return already exists, got %+v", dupRet)
+	}
+
+	// Create Pod for admin-b's Job 1001 and verify /log isolates admin-b from admin-a
+	_ = fakeK8s.Create(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "pod-admin-b-1001",
+			Namespace: "default",
+			Labels: map[string]string{
+				LabelManagedBy:    ManagedByValue,
+				LabelExecutorName: SanitizeLabel("mig-proxy"),
+				LabelLogID:        "1001",
+				"job-name":        jobB1001Name,
+			},
+		},
+		Spec: jobB1001.Spec.Template.Spec,
+	})
+	logRet := post("log", xxlclient.LogParam{LogID: 1001, FromLineNum: 1})
+	var logRes xxlclient.LogResult
+	_ = json.Unmarshal(logRet.Content, &logRes)
+	if !strings.Contains(logRes.LogContent, "log-from-pod-admin-b-1001") || strings.Contains(logRes.LogContent, "pod-admin-a-1001") {
+		t.Fatalf("expected /log on admin-b to read only admin-b's Pod log, got %+v", logRes)
+	}
+
+	// /kill on admin-b MUST delete admin-b's active Jobs with DeletePropagationForeground while preserving admin-a's active Job 1001!
+	if killRet := post("kill", xxlclient.KillParam{JobID: 55}); !killRet.IsSuccess() {
+		t.Fatalf("expected /kill on admin-b to succeed: %+v", killRet)
+	}
+	delMu.Lock()
+	polB1001 := deletedPolicies[jobB1001Name]
+	_, killedAdminA := deletedPolicies[jobA1001Name]
+	delMu.Unlock()
+	if polB1001 != metav1.DeletePropagationForeground {
+		t.Fatalf("expected /kill to delete %s with DeletePropagationForeground, got %q", jobB1001Name, polB1001)
+	}
+	if killedAdminA {
+		t.Fatalf("expected /kill on admin-b NOT to delete admin-a's active Job %s", jobA1001Name)
+	}
+
+	// Simulate TTL GC removing admin-a's Job 1002, then retry (55, 1002) on admin-b -> must still find jobB1002!
+	jobA1002.Finalizers = nil
+	_ = fakeK8s.Update(ctx, &jobA1002)
+	_ = fakeK8s.Delete(ctx, &jobA1002)
+
+	// Since /kill above deleted jobB1002 (whose finalizer was only callback-guard, or in fakeK8s retained by callback-guard),
+	// verify retrying (55, 1002) after admin-a's Job 1002 TTL GC recognizes jobB1002 ("is currently being deleted")
+	// and never spawns a duplicate base Job!
+	base1002Name := BuildJobName("mig-proxy", 55, 1002)
+	retryAfterGC := post("run", xxlclient.TriggerParam{
+		JobID:           55,
+		ExecutorHandler: "migHandler",
+		LogID:           1002,
+		LogDateTime:     1700000001002,
+	})
+	if retryAfterGC.IsSuccess() || !strings.Contains(retryAfterGC.Msg, "currently being deleted") {
+		t.Fatalf("expected retry of deleting jobB1002 after base Job GC to report deleting, got %+v", retryAfterGC)
+	}
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: base1002Name}, &batchv1.Job{}); err == nil {
+		t.Fatalf("expected no duplicate base Job %s spawned after TTL GC", base1002Name)
+	}
+
+	// Recreate admin-b with a new UID ("uid-b-v2") and trigger (55, 1003) -> then recreate with ("uid-b-v3") and trigger (55, 1003)
+	var curAdminB xxljobv1alpha1.XxlJobAdmin
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "admin-b"}, &curAdminB)
+	_ = fakeK8s.Delete(ctx, &curAdminB)
+	adminBv2 := &xxljobv1alpha1.XxlJobAdmin{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "admin-b",
+			Namespace: "default",
+			UID:       types.UID("uid-b-v2"),
+		},
+		Spec:   adminB.Spec,
+		Status: adminB.Status,
+	}
+	_ = fakeK8s.Create(ctx, adminBv2)
+	if ret := post("run", xxlclient.TriggerParam{
+		JobID:           55,
+		ExecutorHandler: "migHandler",
+		LogID:           1003,
+		LogDateTime:     1700000001003,
+	}); !ret.IsSuccess() {
+		t.Fatalf("expected admin-b (uid-b-v2) logId=1003 to succeed: %+v", ret)
+	}
+	// Simulate TTL GC NOT yet removing uid-b-v2's Job 1003 while admin-b is recreated with fresh DB ("uid-b-v3")
+	_ = fakeK8s.Delete(ctx, adminBv2)
+	adminBv3 := &xxljobv1alpha1.XxlJobAdmin{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "admin-b",
+			Namespace: "default",
+			UID:       types.UID("uid-b-v3"),
+		},
+		Spec:   adminB.Spec,
+		Status: adminB.Status,
+	}
+	_ = fakeK8s.Create(ctx, adminBv3)
+	if ret := post("run", xxlclient.TriggerParam{
+		JobID:           55,
+		ExecutorHandler: "migHandler",
+		LogID:           1003,
+		LogDateTime:     1700000009999,
+	}); !ret.IsSuccess() {
+		t.Fatalf("expected recreated same-name admin-b (uid-b-v3) colliding logId=1003 to spawn distinct Job, got %+v", ret)
+	}
+	originKeyBv3 := CanonicalAdminOriginKey("admin-b", "http://admin-b:8080/xxl-job-admin", "uid-b-v3")
+	jobBv3Name := BuildJobName("mig-proxy", 55, 1003, originKeyBv3)
+	var jobBv3 batchv1.Job
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: jobBv3Name}, &jobBv3); err != nil {
+		t.Fatalf("expected uid-b-v3 disambiguated Job %s to exist, got err=%v", jobBv3Name, err)
+	}
+	// Now delete uid-b-v2's base Job 1003 (simulating TTL GC) and send an idempotent retry for uid-b-v3's (55, 1003):
+	// MUST find jobBv3Name instead of spawning a duplicate base Job!
+	base1003Name := BuildJobName("mig-proxy", 55, 1003)
+	var base1003 batchv1.Job
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: base1003Name}, &base1003)
+	base1003.Finalizers = nil
+	_ = fakeK8s.Update(ctx, &base1003)
+	_ = fakeK8s.Delete(ctx, &base1003)
+
+	if retryRet := post("run", xxlclient.TriggerParam{
+		JobID:           55,
+		ExecutorHandler: "migHandler",
+		LogID:           1003,
+		LogDateTime:     1700000009999,
+	}); !retryRet.IsSuccess() || !strings.Contains(retryRet.Msg, "already exists") {
+		t.Fatalf("expected idempotent retry after base Job TTL GC to locate %s, got %+v", jobBv3Name, retryRet)
+	}
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: base1003Name}, &batchv1.Job{}); err == nil {
+		t.Fatalf("expected no duplicate base Job %s spawned on retry after TTL GC", base1003Name)
+	}
+}
+
+func TestCrossAdminSerialQueueHybridOriginAndRecreatedCoverEarly(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = xxljobv1alpha1.AddToScheme(scheme)
+
+	ctx := context.Background()
+
+	adminA := &xxljobv1alpha1.XxlJobAdmin{
+		ObjectMeta: metav1.ObjectMeta{Name: "admin-a", Namespace: "default", UID: types.UID("uid-a")},
+		Spec: xxljobv1alpha1.XxlJobAdminSpec{
+			ExternalURL: "http://admin-a:8080/xxl-job-admin",
+			Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "serial-tok"},
+		},
+		Status: xxljobv1alpha1.XxlJobAdminStatus{AdminURL: "http://admin-a:8080/xxl-job-admin"},
+	}
+	adminB := &xxljobv1alpha1.XxlJobAdmin{
+		ObjectMeta: metav1.ObjectMeta{Name: "admin-b", Namespace: "default", UID: types.UID("uid-b")},
+		Spec: xxljobv1alpha1.XxlJobAdminSpec{
+			ExternalURL: "http://admin-b:8080/xxl-job-admin",
+			Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "serial-tok"},
+		},
+		Status: xxljobv1alpha1.XxlJobAdminStatus{AdminURL: "http://admin-b:8080/xxl-job-admin"},
+	}
+	execCR := &xxljobv1alpha1.XxlJobExecutor{
+		ObjectMeta: metav1.ObjectMeta{Name: "ser-proxy", Namespace: "default"},
+		Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+			AdminRef: xxljobv1alpha1.LocalObjectReference{Name: "admin-a"},
+			AppName:  "ser-proxy-app",
+			Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+		},
+		Status: xxljobv1alpha1.XxlJobExecutorStatus{
+			JobGroupID: 1,
+			AdminURL:   "http://admin-a:8080/xxl-job-admin",
+			Synced:     true,
+		},
+	}
+	taskCR := &xxljobv1alpha1.XxlJobTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "ser-task", Namespace: "default"},
+		Spec: xxljobv1alpha1.XxlJobTaskSpec{
+			ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: "ser-proxy"},
+			JobDesc:         "Serial Task",
+			Author:          "ops",
+			ScheduleType:    "CRON",
+			ScheduleConf:    "0 * * * * ?",
+			ExecutorHandler: "serHandler",
+			K8sJobTemplate: &xxljobv1alpha1.K8sJobTemplateSpec{
+				Image:   "alpine:3.19",
+				Command: []string{"/bin/sh", "-c"},
+				Args:    []string{"echo ok"},
+			},
+		},
+		Status: xxljobv1alpha1.XxlJobTaskStatus{
+			JobID:      55,
+			JobGroupID: 1,
+			AdminURL:   "http://admin-a:8080/xxl-job-admin",
+			Synced:     true,
+			Conditions: []metav1.Condition{{
+				Type:               ConditionAdminEndpointSynced,
+				Status:             metav1.ConditionTrue,
+				Reason:             "EndpointSynced",
+				Message:            EncodeSyncedAdminEndpointMeta(adminA, "http://admin-a:8080/xxl-job-admin"),
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+
+	fakeK8s := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(adminA, adminB, execCR, taskCR).
+		WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+		Build()
+
+	srv := NewServer(fakeK8s, ":0", "default", "serial-tok")
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	post := func(action string, body any) xxlclient.ReturnT {
+		t.Helper()
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/proxy/default/ser-proxy/"+action, bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(xxlclient.AccessTokenHeader, "serial-tok")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s failed: %v", action, err)
+		}
+		defer resp.Body.Close()
+		var ret xxlclient.ReturnT
+		_ = json.NewDecoder(resp.Body).Decode(&ret)
+		return ret
+	}
+
+	// 1. Pre-reconcile Spec.AdminRef switch (admin-a -> admin-b while Status.AdminURL is still admin-a):
+	// MUST stamp consistent admin-a origin (never Frankenstein hybrid {name: admin-b, uid: uid-b, url: admin-a}).
+	var liveExec xxljobv1alpha1.XxlJobExecutor
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "ser-proxy"}, &liveExec)
+	liveExec.Spec.AdminRef.Name = "admin-b"
+	_ = fakeK8s.Update(ctx, &liveExec)
+
+	if ret := post("run", xxlclient.TriggerParam{
+		JobID:                 55,
+		ExecutorHandler:       "serHandler",
+		ExecutorBlockStrategy: "SERIAL_EXECUTION",
+		LogID:                 900,
+		LogDateTime:           1700000000900,
+	}); !ret.IsSuccess() {
+		t.Fatalf("expected pre-reconcile admin-a SERIAL trigger 900 to succeed, got %+v", ret)
+	}
+	jobA900Name := BuildJobName("ser-proxy", 55, 900)
+	var jobA900 batchv1.Job
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: jobA900Name}, &jobA900); err != nil {
+		t.Fatalf("get jobA900: %v", err)
+	}
+	if jobA900.Annotations[AnnotationAdminName] != "admin-a" ||
+		jobA900.Annotations[AnnotationAdminUID] != "uid-a" ||
+		jobA900.Annotations[AnnotationAdminURL] != "http://admin-a:8080/xxl-job-admin" {
+		t.Fatalf("expected consistent admin-a origin during pre-reconcile window, got hybrid %+v", jobA900.Annotations)
+	}
+
+	// Enqueue second SERIAL_EXECUTION Job 901 on admin-a, advance queue so 900 runs (Active=1) and 901 stays queued
+	if ret := post("run", xxlclient.TriggerParam{
+		JobID:                 55,
+		ExecutorHandler:       "serHandler",
+		ExecutorBlockStrategy: "SERIAL_EXECUTION",
+		LogID:                 901,
+		LogDateTime:           1700000000901,
+	}); !ret.IsSuccess() {
+		t.Fatalf("expected admin-a SERIAL trigger 901 to succeed: %+v", ret)
+	}
+	if err := AdvanceSerialQueueWithReader(ctx, fakeK8s, fakeK8s, "default", SanitizeLabel("ser-proxy"), "55"); err != nil {
+		t.Fatalf("advance admin-a queue: %v", err)
+	}
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: jobA900Name}, &jobA900)
+	if jobA900.Spec.Suspend != nil && *jobA900.Spec.Suspend {
+		t.Fatalf("expected admin-a head 900 to be unsuspended")
+	}
+	jobA900.Status.Active = 1
+	_ = fakeK8s.Status().Update(ctx, &jobA900)
+
+	// 2. Complete migration to admin-b (JobID=55 collides!) while admin-a's 900 is Active=1 and 901 is queued!
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "ser-proxy"}, &liveExec)
+	liveExec.Status.AdminURL = "http://admin-b:8080/xxl-job-admin"
+	liveExec.Status.JobGroupID = 2
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+
+	var liveTask xxljobv1alpha1.XxlJobTask
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "ser-task"}, &liveTask)
+	liveTask.Status.AdminURL = "http://admin-b:8080/xxl-job-admin"
+	liveTask.Status.JobGroupID = 2
+	liveTask.Status.JobID = 55
+	liveTask.Status.LastExecutionJobName = ""
+	liveTask.Status.Conditions = []metav1.Condition{{
+		Type:               ConditionAdminEndpointSynced,
+		Status:             metav1.ConditionTrue,
+		Reason:             "EndpointSynced",
+		Message:            EncodeSyncedAdminEndpointMeta(adminB, "http://admin-b:8080/xxl-job-admin"),
+		LastTransitionTime: metav1.Now(),
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	// Enqueue SERIAL_EXECUTION logId=1 and logId=2 on admin-b
+	for _, lid := range []int64{1, 2} {
+		if ret := post("run", xxlclient.TriggerParam{
+			JobID:                 55,
+			ExecutorHandler:       "serHandler",
+			ExecutorBlockStrategy: "SERIAL_EXECUTION",
+			LogID:                 lid,
+			LogDateTime:           1700000001000 + lid,
+		}); !ret.IsSuccess() {
+			t.Fatalf("expected admin-b SERIAL trigger %d to succeed: %+v", lid, ret)
+		}
+	}
+
+	var depthMu sync.Mutex
+	var recordedDepth float64 = -1
+	prevHook := OnSerialQueueDepth
+	OnSerialQueueDepth = func(_, _, _ string, depth float64) {
+		depthMu.Lock()
+		recordedDepth = depth
+		depthMu.Unlock()
+	}
+	defer func() { OnSerialQueueDepth = prevHook }()
+
+	// AdvanceSerialQueueWithReader MUST unsuspend admin-b's logId=1 despite admin-a's active 900 & queued 901!
+	if err := AdvanceSerialQueueWithReader(ctx, fakeK8s, fakeK8s, "default", SanitizeLabel("ser-proxy"), "55"); err != nil {
+		t.Fatalf("advance cross-admin serial queue: %v", err)
+	}
+	var jobB1, jobB2, jobA901 batchv1.Job
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: BuildJobName("ser-proxy", 55, 1)}, &jobB1)
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: BuildJobName("ser-proxy", 55, 2)}, &jobB2)
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: BuildJobName("ser-proxy", 55, 901)}, &jobA901)
+	if jobB1.Spec.Suspend != nil && *jobB1.Spec.Suspend {
+		t.Fatalf("expected admin-b SERIAL head logId=1 to unsuspend immediately without blocking behind admin-a's active Job 900")
+	}
+	if jobB2.Spec.Suspend == nil || !*jobB2.Spec.Suspend {
+		t.Fatalf("expected admin-b second SERIAL Job logId=2 to remain suspended behind logId=1")
+	}
+	if jobA901.Spec.Suspend == nil || !*jobA901.Spec.Suspend {
+		t.Fatalf("expected admin-a queued SERIAL Job 901 to remain suspended behind admin-a's active Job 900")
+	}
+	depthMu.Lock()
+	gotDepth := recordedDepth
+	depthMu.Unlock()
+	if gotDepth != 2 {
+		t.Fatalf("expected combined remaining serial queue depth = 2 (admin-a 901 + admin-b 2), got %v", gotDepth)
+	}
+
+	// 3. Rolling-upgrade safety: origin-less legacy active Job conservatively blocks post-upgrade queue on jobId=77
+	suspendFalse := false
+	suspendTrue := true
+	legacyActive := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      BuildJobName("ser-proxy", 77, 50),
+			Namespace: "default",
+			Labels: map[string]string{
+				LabelManagedBy:    ManagedByValue,
+				LabelExecutorName: SanitizeLabel("ser-proxy"),
+				LabelJobID:        "77",
+				LabelLogID:        "50",
+			},
+			Annotations: map[string]string{
+				AnnotationExecutorName:  "ser-proxy",
+				AnnotationLogID:         "50",
+				AnnotationBlockStrategy: "SERIAL_EXECUTION",
+			},
+		},
+		Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+		Status: batchv1.JobStatus{Active: 1},
+	}
+	postUpgradeQueued := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      BuildJobName("ser-proxy", 77, 51),
+			Namespace: "default",
+			Labels: map[string]string{
+				LabelManagedBy:    ManagedByValue,
+				LabelExecutorName: SanitizeLabel("ser-proxy"),
+				LabelJobID:        "77",
+				LabelLogID:        "51",
+			},
+			Annotations: map[string]string{
+				AnnotationExecutorName:  "ser-proxy",
+				AnnotationLogID:         "51",
+				AnnotationBlockStrategy: "SERIAL_EXECUTION",
+				AnnotationAdminName:     "admin-b",
+				AnnotationAdminURL:      "http://admin-b:8080/xxl-job-admin",
+				AnnotationAdminUID:      "uid-b",
+			},
+		},
+		Spec: batchv1.JobSpec{Suspend: &suspendTrue},
+	}
+	_ = fakeK8s.Create(ctx, legacyActive)
+	_ = fakeK8s.Create(ctx, postUpgradeQueued)
+	_ = AdvanceSerialQueueWithReader(ctx, fakeK8s, fakeK8s, "default", SanitizeLabel("ser-proxy"), "77")
+	var postCheck batchv1.Job
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: postUpgradeQueued.Name}, &postCheck)
+	if postCheck.Spec.Suspend == nil || !*postCheck.Spec.Suspend {
+		t.Fatalf("expected legacy origin-less active Job to conservatively block post-upgrade SERIAL Job")
+	}
+
+	// 4. Recreated same-name/same-URL Admin (uid-b -> uid-b-recreated) with TTL-GC'd LastExecutionJobName=500000:
+	// COVER_EARLY trigger with fresh DB logId=3 MUST NOT be falsely discarded as superseded by 500000!
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "ser-task"}, &liveTask)
+	liveTask.Status.LastExecutionJobName = BuildJobName("ser-proxy", 55, 500000) // already GC'd by TTL
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	var curB xxljobv1alpha1.XxlJobAdmin
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "admin-b"}, &curB)
+	_ = fakeK8s.Delete(ctx, &curB)
+	adminBRecreated := &xxljobv1alpha1.XxlJobAdmin{
+		ObjectMeta: metav1.ObjectMeta{Name: "admin-b", Namespace: "default", UID: types.UID("uid-b-recreated")},
+		Spec:       adminB.Spec,
+		Status:     adminB.Status,
+	}
+	_ = fakeK8s.Create(ctx, adminBRecreated)
+
+	if coverRet := post("run", xxlclient.TriggerParam{
+		JobID:                 55,
+		ExecutorHandler:       "serHandler",
+		ExecutorBlockStrategy: "COVER_EARLY",
+		LogID:                 3,
+		LogDateTime:           1700000002003,
+	}); !coverRet.IsSuccess() {
+		t.Fatalf("expected COVER_EARLY logId=3 from recreated same-URL Admin (uid-b-recreated) not to be discarded by uid-b's GC'd 500000, got %+v", coverRet)
+	}
+}
+
+func TestSyncedEndpointJSONStrictParsingForegroundDeleteAndOriginSpecificity(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = xxljobv1alpha1.AddToScheme(scheme)
+
+	// 1. extractSyncedEndpointOrigin strictly parses JSON and never matches arbitrary targetURL on malformed/empty payloads.
+	for _, badMsg := range []string{
+		"",
+		"   ",
+		"not-json-at-all",
+		"name=admin-a\nuid=uid-a\nurl=http://admin-a:8080/xxl-job-admin",
+		"{}",
+		`{"username":"ops"}`,
+	} {
+		conds := []metav1.Condition{{
+			Type:    ConditionAdminEndpointSynced,
+			Status:  metav1.ConditionTrue,
+			Message: badMsg,
+		}}
+		if got := extractSyncedEndpointOrigin(conds, "http://any-target:8080/xxl-job-admin"); got.hasAny() {
+			t.Fatalf("expected malformed/empty condition %q to yield empty adminOrigin, got %+v", badMsg, got)
+		}
+	}
+
+	adminManaged := &xxljobv1alpha1.XxlJobAdmin{
+		ObjectMeta: metav1.ObjectMeta{Name: "mgr-admin", Namespace: "default", UID: types.UID("uid-mgr-1")},
+		Spec: xxljobv1alpha1.XxlJobAdminSpec{
+			Port:        8080,
+			ContextPath: "/xxl-job-admin",
+			Datasource:  xxljobv1alpha1.DatasourceSpec{URL: "jdbc:mysql://mysql:3306/xxl_job"},
+			Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "mgr-tok"},
+		},
+	}
+	encodedJSON := EncodeSyncedAdminEndpointMeta(adminManaged, "http://mgr-admin.default.svc.cluster.local:8080/xxl-job-admin")
+	validConds := []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: encodedJSON,
+	}}
+	if mismatch := extractSyncedEndpointOrigin(validConds, "http://other-admin:8080/xxl-job-admin"); mismatch.hasAny() {
+		t.Fatalf("expected mismatched targetURL to yield empty adminOrigin, got %+v", mismatch)
+	}
+	matched := extractSyncedEndpointOrigin(validConds, "http://mgr-admin.default.svc.cluster.local:8080/xxl-job-admin")
+	if matched.name != "mgr-admin" || matched.uid != "uid-mgr-1" || matched.dbHash == "" {
+		t.Fatalf("expected full JSON origin fields decoded, got %+v", matched)
+	}
+
+	// 2. HasActiveOrTerminatingPods & AdvanceSerialQueueWithReader honor metav1.FinalizerDeleteDependents ("foregroundDeletion")
+	// when a deleting Job's Status.Active is already 0 and Status.Terminating is nil while GC has not finished deleting Pods.
+	now := metav1.Now()
+	suspendFalse := false
+	suspendTrue := true
+	deletingWithFG := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              BuildJobName("fg-exec", 88, 10),
+			Namespace:         "default",
+			DeletionTimestamp: &now,
+			Finalizers:        []string{JobCallbackFinalizer, metav1.FinalizerDeleteDependents},
+			Labels: map[string]string{
+				LabelManagedBy:    ManagedByValue,
+				LabelExecutorName: SanitizeLabel("fg-exec"),
+				LabelJobID:        "88",
+				LabelLogID:        "10",
+			},
+			Annotations: map[string]string{
+				AnnotationExecutorName:  "fg-exec",
+				AnnotationLogID:         "10",
+				AnnotationBlockStrategy: "SERIAL_EXECUTION",
+				AnnotationAdminName:     "mgr-admin",
+				AnnotationAdminUID:      "uid-mgr-1",
+				AnnotationAdminURL:      "http://mgr-admin.default.svc.cluster.local:8080/xxl-job-admin",
+			},
+		},
+		Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+		Status: batchv1.JobStatus{Active: 0, Terminating: nil},
+	}
+	if !HasActiveOrTerminatingPods(deletingWithFG) {
+		t.Fatalf("expected HasActiveOrTerminatingPods=true while deleting Job still carries foregroundDeletion finalizer")
+	}
+	queuedBehindFG := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      BuildJobName("fg-exec", 88, 11),
+			Namespace: "default",
+			Finalizers: []string{
+				JobCallbackFinalizer,
+			},
+			Labels: map[string]string{
+				LabelManagedBy:    ManagedByValue,
+				LabelExecutorName: SanitizeLabel("fg-exec"),
+				LabelJobID:        "88",
+				LabelLogID:        "11",
+			},
+			Annotations: map[string]string{
+				AnnotationExecutorName:  "fg-exec",
+				AnnotationLogID:         "11",
+				AnnotationBlockStrategy: "SERIAL_EXECUTION",
+				AnnotationAdminName:     "mgr-admin",
+				AnnotationAdminUID:      "uid-mgr-1",
+				AnnotationAdminURL:      "http://mgr-admin.default.svc.cluster.local:8080/xxl-job-admin",
+			},
+		},
+		Spec: batchv1.JobSpec{Suspend: &suspendTrue},
+	}
+	fgClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(deletingWithFG, queuedBehindFG).
+		WithStatusSubresource(&batchv1.Job{}).
+		Build()
+
+	if err := AdvanceSerialQueueWithReader(ctx, fgClient, fgClient, "default", SanitizeLabel("fg-exec"), "88"); err != nil {
+		t.Fatalf("advance queue while foregroundDeletion present: %v", err)
+	}
+	var checkQueued batchv1.Job
+	_ = fgClient.Get(ctx, client.ObjectKey{Namespace: "default", Name: queuedBehindFG.Name}, &checkQueued)
+	if checkQueued.Spec.Suspend == nil || !*checkQueued.Spec.Suspend {
+		t.Fatalf("expected queued SERIAL_EXECUTION Job to stay suspended while predecessor holds foregroundDeletion finalizer")
+	}
+
+	// Simulate Kubernetes GarbageCollector removing FinalizerDeleteDependents once dependent Pods vanish
+	var liveDel batchv1.Job
+	_ = fgClient.Get(ctx, client.ObjectKey{Namespace: "default", Name: deletingWithFG.Name}, &liveDel)
+	liveDel.Finalizers = []string{JobCallbackFinalizer}
+	_ = fgClient.Update(ctx, &liveDel)
+	if HasActiveOrTerminatingPods(&liveDel) {
+		t.Fatalf("expected HasActiveOrTerminatingPods=false once foregroundDeletion finalizer is removed and Active=0")
+	}
+	if err := AdvanceSerialQueueWithReader(ctx, fgClient, fgClient, "default", SanitizeLabel("fg-exec"), "88"); err != nil {
+		t.Fatalf("advance queue after foregroundDeletion removed: %v", err)
+	}
+	_ = fgClient.Get(ctx, client.ObjectKey{Namespace: "default", Name: queuedBehindFG.Name}, &checkQueued)
+	if checkQueued.Spec.Suspend != nil && *checkQueued.Spec.Suspend {
+		t.Fatalf("expected queued SERIAL_EXECUTION Job to unsuspend once foregroundDeletion finalizer was removed")
+	}
+
+	// 3. AdvanceSerialQueueWithReader deterministic partitioning across all 3! = 6 slice permutations when uid is empty.
+	// Active Job A has {name: "adm", url: "http://a"}, Queued Job B has {name: "adm", url: "http://b"},
+	// and Partial Queued Job P has {name: "adm"} (empty uid, empty url).
+	// Regardless of slice order:
+	//  - Job A ({name: "adm", url: "http://a"}, active) and Job B ({name: "adm", url: "http://b"}, suspended) MUST NEVER coalesce;
+	//  - Job B MUST always unsuspend, while Job P deterministically attaches to Partition[0] ({name: "adm", url: "http://a"}) and stays suspended!
+	perms := [][3]int{
+		{0, 1, 2},
+		{0, 2, 1},
+		{1, 0, 2},
+		{1, 2, 0},
+		{2, 0, 1},
+		{2, 1, 0},
+	}
+	for pIdx, perm := range perms {
+		mkJobs := []*batchv1.Job{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("job-0-active-a-%d", pIdx),
+					Namespace: "default",
+					Labels: map[string]string{
+						LabelManagedBy:    ManagedByValue,
+						LabelExecutorName: SanitizeLabel("perm-exec"),
+						LabelJobID:        "91",
+						LabelLogID:        "1",
+					},
+					Annotations: map[string]string{
+						AnnotationExecutorName:  "perm-exec",
+						AnnotationLogID:         "1",
+						AnnotationBlockStrategy: "SERIAL_EXECUTION",
+						AnnotationAdminName:     "adm",
+						AnnotationAdminURL:      "http://a",
+					},
+				},
+				Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+				Status: batchv1.JobStatus{Active: 1},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("job-1-queued-b-%d", pIdx),
+					Namespace: "default",
+					Labels: map[string]string{
+						LabelManagedBy:    ManagedByValue,
+						LabelExecutorName: SanitizeLabel("perm-exec"),
+						LabelJobID:        "91",
+						LabelLogID:        "2",
+					},
+					Annotations: map[string]string{
+						AnnotationExecutorName:  "perm-exec",
+						AnnotationLogID:         "2",
+						AnnotationBlockStrategy: "SERIAL_EXECUTION",
+						AnnotationAdminName:     "adm",
+						AnnotationAdminURL:      "http://b",
+					},
+				},
+				Spec: batchv1.JobSpec{Suspend: &suspendTrue},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("job-2-partial-%d", pIdx),
+					Namespace: "default",
+					Labels: map[string]string{
+						LabelManagedBy:    ManagedByValue,
+						LabelExecutorName: SanitizeLabel("perm-exec"),
+						LabelJobID:        "91",
+						LabelLogID:        "3",
+					},
+					Annotations: map[string]string{
+						AnnotationExecutorName:  "perm-exec",
+						AnnotationLogID:         "3",
+						AnnotationBlockStrategy: "SERIAL_EXECUTION",
+						AnnotationAdminName:     "adm",
+					},
+				},
+				Spec: batchv1.JobSpec{Suspend: &suspendTrue},
+			},
+		}
+		permCli := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&batchv1.Job{}).Build()
+		for _, idx := range perm {
+			_ = permCli.Create(ctx, mkJobs[idx].DeepCopy())
+		}
+		if err := AdvanceSerialQueueWithReader(ctx, permCli, permCli, "default", SanitizeLabel("perm-exec"), "91"); err != nil {
+			t.Fatalf("perm %v advance failed: %v", perm, err)
+		}
+		var gotB, gotP batchv1.Job
+		_ = permCli.Get(ctx, client.ObjectKey{Namespace: "default", Name: mkJobs[1].Name}, &gotB)
+		_ = permCli.Get(ctx, client.ObjectKey{Namespace: "default", Name: mkJobs[2].Name}, &gotP)
+		if gotB.Spec.Suspend != nil && *gotB.Spec.Suspend {
+			t.Fatalf("perm %v: expected {name:adm, url:http://b} Job to unsuspend independently of {name:adm, url:http://a}", perm)
+		}
+		if gotP.Spec.Suspend == nil || !*gotP.Spec.Suspend {
+			t.Fatalf("perm %v: expected partial {name:adm} Job to deterministically join active http://a partition and stay suspended", perm)
+		}
+	}
+
+	// 4. In-place managed XxlJobAdmin Port/ContextPath change preserves sameAdminOrigin (SERIAL_EXECUTION / DISCARD_LATER)
+	// when Datasource.URL and UID are unchanged, while isolating when Datasource.URL changes.
+	dbHash1 := DatasourceURLHash("jdbc:mysql://mysql:3306/xxl_job")
+	dbHash2 := DatasourceURLHash("jdbc:mysql://mysql2:3306/xxl_job_v2")
+	origOldPort := adminOrigin{
+		name:   "mgr-admin",
+		uid:    "uid-mgr-1",
+		url:    "http://mgr-admin.default.svc.cluster.local:8080/xxl-job-admin",
+		dbHash: dbHash1,
+	}
+	origNewPortAndPath := adminOrigin{
+		name:   "mgr-admin",
+		uid:    "uid-mgr-1",
+		url:    "http://mgr-admin.default.svc.cluster.local:8081/scheduler",
+		dbHash: dbHash1,
+	}
+	origDifferentDB := adminOrigin{
+		name:   "mgr-admin",
+		uid:    "uid-mgr-1",
+		url:    "http://mgr-admin.default.svc.cluster.local:8081/scheduler",
+		dbHash: dbHash2,
+	}
+	if !sameAdminOrigin(origOldPort, origNewPortAndPath) {
+		t.Fatalf("expected same managed cluster-local Admin across Port/ContextPath edit with identical dbHash to match sameAdminOrigin")
+	}
+	if sameAdminOrigin(origOldPort, origDifferentDB) {
+		t.Fatalf("expected managed cluster-local Admin with changed Datasource.URL (dbHash) NOT to match sameAdminOrigin")
+	}
+}
+
+func TestManagedOriginSameURLDBSwapHybridAndGCdCoverEarlyPrefix(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = xxljobv1alpha1.AddToScheme(scheme)
+
+	svcURL8080 := "http://mgr-adv.default.svc.cluster.local:8080/xxl-job-admin"
+	svcURL8081 := "http://mgr-adv.default.svc.cluster.local:8081/scheduler"
+	hybridURL := "https://xxl-ingress.corp.local/xxl-job-admin"
+	db1 := "jdbc:mysql://mysql-db1:3306/xxl_job"
+	db2 := "jdbc:mysql://mysql-db2:3306/xxl_job_v2"
+	dbHash1 := DatasourceURLHash(db1)
+	dbHash2 := DatasourceURLHash(db2)
+
+	adminCR := &xxljobv1alpha1.XxlJobAdmin{
+		ObjectMeta: metav1.ObjectMeta{Name: "mgr-adv", Namespace: "default", UID: types.UID("uid-mgr-adv")},
+		Spec: xxljobv1alpha1.XxlJobAdminSpec{
+			Image:       "xuxueli/xxl-job-admin:2.4.1",
+			Port:        8080,
+			ContextPath: "/xxl-job-admin",
+			Datasource:  xxljobv1alpha1.DatasourceSpec{URL: db1},
+			Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "adv-tok"},
+		},
+		Status: xxljobv1alpha1.XxlJobAdminStatus{AdminURL: svcURL8080},
+	}
+	execCR := &xxljobv1alpha1.XxlJobExecutor{
+		ObjectMeta: metav1.ObjectMeta{Name: "adv-proxy", Namespace: "default"},
+		Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+			AdminRef: xxljobv1alpha1.LocalObjectReference{Name: "mgr-adv"},
+			AppName:  "adv-proxy-app",
+			Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+		},
+		Status: xxljobv1alpha1.XxlJobExecutorStatus{
+			JobGroupID: 1,
+			AdminURL:   svcURL8080,
+			Synced:     true,
+			Conditions: []metav1.Condition{{
+				Type:    ConditionAdminEndpointSynced,
+				Status:  metav1.ConditionTrue,
+				Message: EncodeSyncedAdminEndpointMeta(adminCR, svcURL8080),
+			}},
+		},
+	}
+	taskCR := &xxljobv1alpha1.XxlJobTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "adv-task", Namespace: "default"},
+		Spec: xxljobv1alpha1.XxlJobTaskSpec{
+			ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: "adv-proxy"},
+			JobDesc:         "Adv Task",
+			Author:          "ops",
+			ScheduleType:    "CRON",
+			ScheduleConf:    "0 * * * * ?",
+			ExecutorHandler: "advHandler",
+			K8sJobTemplate: &xxljobv1alpha1.K8sJobTemplateSpec{
+				Image:   "alpine:3.19",
+				Command: []string{"/bin/sh", "-c"},
+				Args:    []string{"echo ok"},
+			},
+		},
+		Status: xxljobv1alpha1.XxlJobTaskStatus{
+			JobID:      55,
+			JobGroupID: 1,
+			AdminURL:   svcURL8080,
+			Synced:     true,
+			Conditions: []metav1.Condition{{
+				Type:    ConditionAdminEndpointSynced,
+				Status:  metav1.ConditionTrue,
+				Message: EncodeSyncedAdminEndpointMeta(adminCR, svcURL8080),
+			}},
+		},
+	}
+
+	fakeK8s := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(adminCR, execCR, taskCR).
+		WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+		Build()
+
+	srv := NewServer(fakeK8s, ":0", "default", "adv-tok\r\n")
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	post := func(action string, body any) xxlclient.ReturnT {
+		t.Helper()
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/proxy/default/adv-proxy/"+action, bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(xxlclient.AccessTokenHeader, "adv-tok")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s failed: %v", action, err)
+		}
+		defer resp.Body.Close()
+		var ret xxlclient.ReturnT
+		_ = json.NewDecoder(resp.Body).Decode(&ret)
+		return ret
+	}
+
+	// 1. Trigger origin-scoped COVER_EARLY winner logId=500 on :8080 (when base name is occupied by a foreign Admin's TTL Job),
+	// then GC winner 500, edit managed Port/ContextPath to :8081/scheduler (same DB), and verify delayed logId=499 is rejected!
+	suspendFalse := false
+	foreignBaseJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      BuildJobName("adv-proxy", 55, 500),
+			Namespace: "default",
+			Labels: map[string]string{
+				LabelManagedBy:    ManagedByValue,
+				LabelExecutorName: SanitizeLabel("adv-proxy"),
+				LabelJobID:        "55",
+				LabelLogID:        "500",
+			},
+			Annotations: map[string]string{
+				AnnotationExecutorName:  "adv-proxy",
+				AnnotationAdminName:     "other-admin",
+				AnnotationAdminUID:      "uid-other",
+				AnnotationAdminURL:      "http://other-admin:8080/xxl-job-admin",
+				AnnotationLogID:         "500",
+				AnnotationBlockStrategy: "COVER_EARLY",
+				AnnotationCallbackSent:  "true",
+			},
+		},
+		Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+		Status: batchv1.JobStatus{
+			Succeeded:  1,
+			Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+		},
+	}
+	_ = fakeK8s.Create(ctx, foreignBaseJob)
+
+	if ret := post("run", xxlclient.TriggerParam{
+		JobID:                 55,
+		ExecutorHandler:       "advHandler",
+		ExecutorBlockStrategy: "COVER_EARLY",
+		LogID:                 500,
+		LogDateTime:           1700000000500,
+	}); !ret.IsSuccess() {
+		t.Fatalf("expected COVER_EARLY logId=500 to succeed under origin-scoped name: %+v", ret)
+	}
+	var liveTask xxljobv1alpha1.XxlJobTask
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "adv-task"}, &liveTask)
+	scopedWinner500Name := liveTask.Status.LastExecutionJobName
+	if scopedWinner500Name == "" || scopedWinner500Name == foreignBaseJob.Name {
+		t.Fatalf("expected origin-scoped LastExecutionJobName distinct from %s, got %q", foreignBaseJob.Name, scopedWinner500Name)
+	}
+	// Simulate TTL garbage collection of scopedWinner500Name
+	var winner500 batchv1.Job
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: scopedWinner500Name}, &winner500)
+	winner500.Finalizers = nil
+	_ = fakeK8s.Update(ctx, &winner500)
+	_ = fakeK8s.Delete(ctx, &winner500)
+
+	// Edit managed Admin Port/ContextPath to :8081/scheduler (same DB) and sync Executor + Task
+	var liveAdmin xxljobv1alpha1.XxlJobAdmin
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "mgr-adv"}, &liveAdmin)
+	liveAdmin.Spec.Port = 8081
+	liveAdmin.Spec.ContextPath = "/scheduler"
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+	liveAdmin.Status.AdminURL = svcURL8081
+	_ = fakeK8s.Status().Update(ctx, &liveAdmin)
+
+	var liveExec xxljobv1alpha1.XxlJobExecutor
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "adv-proxy"}, &liveExec)
+	liveExec.Status.AdminURL = svcURL8081
+	liveExec.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: EncodeSyncedAdminEndpointMeta(&liveAdmin, svcURL8081),
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "adv-task"}, &liveTask)
+	liveTask.Status.AdminURL = svcURL8081
+	liveTask.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: EncodeSyncedAdminEndpointMeta(&liveAdmin, svcURL8081),
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	if staleRet := post("run", xxlclient.TriggerParam{
+		JobID:                 55,
+		ExecutorHandler:       "advHandler",
+		ExecutorBlockStrategy: "COVER_EARLY",
+		LogID:                 499,
+		LogDateTime:           1700000000499,
+	}); staleRet.IsSuccess() {
+		t.Fatalf("expected delayed COVER_EARLY logId=499 after Port/ContextPath edit to be superseded by GC'd origin-scoped winner 500")
+	}
+
+	// 2. Hybrid mode (ExternalURL != "" + Image != "" + same Datasource.URL) preserves continuity with :8081/scheduler!
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "mgr-adv"}, &liveAdmin)
+	liveAdmin.Spec.ExternalURL = hybridURL
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+	hybridMetaRaw := EncodeSyncedAdminEndpointMeta(&liveAdmin, hybridURL)
+	hybridDecoded := DecodeSyncedAdminEndpointMeta([]metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: hybridMetaRaw}})
+	if hybridDecoded == nil || !hybridDecoded.ManagedInCluster || hybridDecoded.DatasourceHash != dbHash1 {
+		t.Fatalf("expected Hybrid managed Admin metadata to set ManagedInCluster=true and DatasourceHash=%s, got %+v", dbHash1, hybridDecoded)
+	}
+	// Sync Executor to hybridURL while Task is still on svcURL8081: triggers MUST remain consistent!
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "adv-proxy"}, &liveExec)
+	liveExec.Status.AdminURL = hybridURL
+	liveExec.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: hybridMetaRaw,
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+
+	if serRet := post("run", xxlclient.TriggerParam{
+		JobID:                 55,
+		ExecutorHandler:       "advHandler",
+		ExecutorBlockStrategy: "SERIAL_EXECUTION",
+		LogID:                 601,
+		LogDateTime:           1700000000601,
+	}); !serRet.IsSuccess() {
+		t.Fatalf("expected SERIAL_EXECUTION trigger during Hybrid URL transition (same DB) to succeed: %+v", serRet)
+	}
+	if err := AdvanceSerialQueueWithReader(ctx, fakeK8s, fakeK8s, "default", SanitizeLabel("adv-proxy"), "55"); err != nil {
+		t.Fatalf("advance hybrid db1 serial queue: %v", err)
+	}
+	var jobDB1 batchv1.Job
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: BuildJobName("adv-proxy", 55, 601)}, &jobDB1)
+	jobDB1.Status.Active = 1
+	_ = fakeK8s.Status().Update(ctx, &jobDB1)
+
+	// 3. Same-URL Datasource.URL swap (db1 -> db2 on hybridURL):
+	//    - While Executor synced db2 and Task still holds db1, findMatchingTask / isTaskConsistentWithExecutor rejects stale db1 Task!
+	//    - Once Task syncs db2, resolveExecutorOrigin stamps dbHash2 and SERIAL_EXECUTION runs independently of db1's active Job!
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "mgr-adv"}, &liveAdmin)
+	liveAdmin.Spec.Datasource.URL = db2
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "adv-proxy"}, &liveExec)
+	liveExec.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: EncodeSyncedAdminEndpointMeta(&liveAdmin, hybridURL),
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+
+	if mismatchRet := post("run", xxlclient.TriggerParam{
+		JobID:                 55,
+		ExecutorHandler:       "advHandler",
+		ExecutorBlockStrategy: "SERIAL_EXECUTION",
+		LogID:                 1,
+		LogDateTime:           1700000001001,
+	}); mismatchRet.IsSuccess() {
+		t.Fatalf("expected trigger for undeclared/unreconciled task across db1->db2 swap to be rejected before Task syncs db2")
+	}
+
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "adv-task"}, &liveTask)
+	liveTask.Status.AdminURL = hybridURL
+	liveTask.Status.LastExecutionJobName = ""
+	liveTask.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: EncodeSyncedAdminEndpointMeta(&liveAdmin, hybridURL),
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	if db2Ret := post("run", xxlclient.TriggerParam{
+		JobID:                 55,
+		ExecutorHandler:       "advHandler",
+		ExecutorBlockStrategy: "SERIAL_EXECUTION",
+		LogID:                 1,
+		LogDateTime:           1700000001002,
+	}); !db2Ret.IsSuccess() {
+		t.Fatalf("expected SERIAL_EXECUTION trigger on db2 after Task syncs db2 to succeed: %+v", db2Ret)
+	}
+	var jobDB2 batchv1.Job
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: BuildJobName("adv-proxy", 55, 1)}, &jobDB2)
+	if jobDB2.Annotations[AnnotationAdminDatasourceHash] != dbHash2 {
+		t.Fatalf("expected db2 Job stamped with dbHash2=%s, got %q", dbHash2, jobDB2.Annotations[AnnotationAdminDatasourceHash])
+	}
+	if err := AdvanceSerialQueueWithReader(ctx, fakeK8s, fakeK8s, "default", SanitizeLabel("adv-proxy"), "55"); err != nil {
+		t.Fatalf("advance db2 serial queue: %v", err)
+	}
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: jobDB2.Name}, &jobDB2)
+	if jobDB2.Spec.Suspend != nil && *jobDB2.Spec.Suspend {
+		t.Fatalf("expected db2 SERIAL_EXECUTION Job to unsuspend independently of db1's active Job on the same URL")
 	}
 }

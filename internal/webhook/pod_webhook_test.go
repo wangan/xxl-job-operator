@@ -799,3 +799,119 @@ func TestBoostEndgameWebhookSecurityAndK8sJobProxyIsolation(t *testing.T) {
 		t.Fatalf("expected sidecar XXL_JOB_ACCESS_TOKEN sanitized to ann-tok-v2, got %q", gotSidecarTok)
 	}
 }
+
+func TestSidecarPodRootRunAsUserOverrideAndExplicitUID(t *testing.T) {
+	mutator := NewPodExecutorMutator("", "http://xxl-admin:8080/xxl-job-admin", "sidecar-secret-tok")
+
+	int64Ptr := func(v int64) *int64 { return &v }
+
+	// 1. Pod with spec.securityContext.runAsUser=0 and runAsGroup=0 must receive an explicit non-root
+	// container-level RunAsUser/RunAsGroup on xxl-job-sidecar so Kubelet verifyRunAsNonRoot does not fail.
+	rootPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "legacy-root-business-pod",
+			Namespace: "default",
+			Labels:    map[string]string{LabelInject: "true"},
+			Annotations: map[string]string{
+				AnnotationMode:    "sidecar",
+				AnnotationAppName: "legacy-root-app",
+			},
+		},
+		Spec: corev1.PodSpec{
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsUser:  int64Ptr(0),
+				RunAsGroup: int64Ptr(0),
+			},
+			Containers: []corev1.Container{{Name: "legacy-app", Image: "nginx:1.25"}},
+		},
+	}
+	if ok, err := mutator.MutatePodOrError(context.Background(), rootPod, "default"); err != nil || !ok {
+		t.Fatalf("expected sidecar injection on root Pod to succeed, got ok=%v err=%v", ok, err)
+	}
+	sidecarSC := rootPod.Spec.Containers[1].SecurityContext
+	if sidecarSC == nil || sidecarSC.RunAsNonRoot == nil || !*sidecarSC.RunAsNonRoot {
+		t.Fatalf("expected sidecar RunAsNonRoot=true, got %+v", sidecarSC)
+	}
+	if sidecarSC.RunAsUser == nil || *sidecarSC.RunAsUser != DefaultSidecarNonRootUID {
+		t.Fatalf("expected sidecar RunAsUser=%d when Pod RunAsUser=0, got %+v", DefaultSidecarNonRootUID, sidecarSC.RunAsUser)
+	}
+	if sidecarSC.RunAsGroup == nil || *sidecarSC.RunAsGroup != DefaultSidecarNonRootUID {
+		t.Fatalf("expected sidecar RunAsGroup=%d when Pod RunAsGroup=0, got %+v", DefaultSidecarNonRootUID, sidecarSC.RunAsGroup)
+	}
+	if rootPod.Spec.Containers[0].SecurityContext != nil && rootPod.Spec.Containers[0].SecurityContext.RunAsUser != nil {
+		t.Fatalf("expected business container SecurityContext not to be modified")
+	}
+
+	// 2. Explicit xxljob.io/sidecar-run-as-user annotation overrides default 65532
+	customUIDPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "custom-uid-sidecar-pod",
+			Namespace: "default",
+			Labels:    map[string]string{LabelInject: "true"},
+			Annotations: map[string]string{
+				AnnotationMode:             "sidecar",
+				AnnotationAppName:          "legacy-root-app",
+				AnnotationSidecarRunAsUser: "10005",
+			},
+		},
+		Spec: corev1.PodSpec{
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsUser:  int64Ptr(0),
+				RunAsGroup: int64Ptr(0),
+			},
+			Containers: []corev1.Container{{Name: "legacy-app", Image: "nginx:1.25"}},
+		},
+	}
+	if ok, err := mutator.MutatePodOrError(context.Background(), customUIDPod, "default"); err != nil || !ok {
+		t.Fatalf("expected custom sidecar UID injection to succeed, got ok=%v err=%v", ok, err)
+	}
+	customSC := customUIDPod.Spec.Containers[1].SecurityContext
+	if customSC.RunAsUser == nil || *customSC.RunAsUser != 10005 || customSC.RunAsGroup == nil || *customSC.RunAsGroup != 10005 {
+		t.Fatalf("expected sidecar RunAsUser=10005 and RunAsGroup=10005, got %+v", customSC)
+	}
+
+	// 3. Positive Pod-level RunAsUser (e.g. OpenShift restricted-v2 UID range) leaves sidecar RunAsUser nil
+	openshiftPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "openshift-pod",
+			Namespace: "default",
+			Labels:    map[string]string{LabelInject: "true"},
+			Annotations: map[string]string{
+				AnnotationMode:    "sidecar",
+				AnnotationAppName: "ocp-app",
+			},
+		},
+		Spec: corev1.PodSpec{
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsUser: int64Ptr(1000680000),
+			},
+			Containers: []corev1.Container{{Name: "app", Image: "busybox:1.36"}},
+		},
+	}
+	if ok, err := mutator.MutatePodOrError(context.Background(), openshiftPod, "default"); err != nil || !ok {
+		t.Fatalf("expected OpenShift Pod injection to succeed, got ok=%v err=%v", ok, err)
+	}
+	if openshiftPod.Spec.Containers[1].SecurityContext.RunAsUser != nil {
+		t.Fatalf("expected sidecar RunAsUser=nil when Pod RunAsUser is positive, got %v", *openshiftPod.Spec.Containers[1].SecurityContext.RunAsUser)
+	}
+
+	// 4. Invalid xxljob.io/sidecar-run-as-user ("0", "-1", "not-an-int") must be denied
+	for _, badVal := range []string{"0", "-1", "root"} {
+		badPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "bad-uid-pod",
+				Namespace: "default",
+				Labels:    map[string]string{LabelInject: "true"},
+				Annotations: map[string]string{
+					AnnotationMode:             "sidecar",
+					AnnotationAppName:          "bad-app",
+					AnnotationSidecarRunAsUser: badVal,
+				},
+			},
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox:1.36"}}},
+		}
+		if _, err := mutator.MutatePodOrError(context.Background(), badPod, "default"); err == nil {
+			t.Fatalf("expected invalid %s=%q to be denied", AnnotationSidecarRunAsUser, badVal)
+		}
+	}
+}
