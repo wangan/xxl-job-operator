@@ -20,6 +20,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -47,21 +48,26 @@ const (
 
 	// Annotations persisted on batch/v1.Job so callbacks and serial queues survive Operator restarts
 	// and XxlJobTask deletion (fixes R5-P2-5).
-	AnnotationTaskNamespace       = "xxljob.io/task-namespace"
-	AnnotationTaskName            = "xxljob.io/task-name"
-	AnnotationExecutorName        = "xxljob.io/executor-name"
-	AnnotationAdminName           = "xxljob.io/admin-name"
-	AnnotationAdminURL            = "xxljob.io/admin-url"
-	AnnotationAdminUID            = "xxljob.io/admin-uid"
-	AnnotationAdminDatasourceHash = "xxljob.io/admin-db-hash"
-	AnnotationLogID               = "xxljob.io/log-id"
-	AnnotationLogDateTime         = "xxljob.io/log-datetime"
-	AnnotationCallbackSent        = "xxljob.io/callback-sent"
-	AnnotationBlockStrategy       = "xxljob.io/block-strategy"
-	AnnotationFailureMessage      = "xxljob.io/failure-message"
+	AnnotationTaskNamespace             = "xxljob.io/task-namespace"
+	AnnotationTaskName                  = "xxljob.io/task-name"
+	AnnotationExecutorName              = "xxljob.io/executor-name"
+	AnnotationAdminName                 = "xxljob.io/admin-name"
+	AnnotationAdminURL                  = "xxljob.io/admin-url"
+	AnnotationAdminUID                  = "xxljob.io/admin-uid"
+	AnnotationAdminManaged              = "xxljob.io/admin-managed"
+	AnnotationAdminDatasourceHash       = "xxljob.io/admin-db-hash"
+	AnnotationAdminLegacyDatasourceHash = "xxljob.io/admin-legacy-db-hash"
+	AnnotationLogID                     = "xxljob.io/log-id"
+	AnnotationLogDateTime               = "xxljob.io/log-datetime"
+	AnnotationCallbackSent              = "xxljob.io/callback-sent"
+	AnnotationBlockStrategy             = "xxljob.io/block-strategy"
+	AnnotationFailureMessage            = "xxljob.io/failure-message"
+	AnnotationBackgroundPodsTerminating = "xxljob.io/bg-pods-terminating"
+	AnnotationOrphanPodsRequested       = "xxljob.io/orphan-pods"
 
-	ConditionAdminEndpointSynced = "AdminEndpointSynced"
-	ConditionPreviousAdminURLs   = "PreviousAdminURLs"
+	ConditionAdminEndpointSynced    = "AdminEndpointSynced"
+	ConditionPreviousAdminURLs      = "PreviousAdminURLs"
+	ConditionPreviousAdminEndpoints = "PreviousAdminEndpoints"
 
 	MaxLogReadBytes                 int64 = 4 * 1024 * 1024 // 4 MiB cap per /log request
 	MaxRequestBodyBytes             int64 = 1 * 1024 * 1024 // 1 MiB cap per incoming HTTP trigger body
@@ -408,6 +414,16 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request, rc routeConte
 					task.Namespace, execName, param.JobID), nil)
 				return
 			}
+			converged, convErr := s.isTaskAndExecutorConvergedWithAdmin(ctx, task, &execCR)
+			if convErr != nil {
+				writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("lookup XxlJobAdmin failed: %v", convErr), nil)
+				return
+			}
+			if !converged {
+				writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("no declared XxlJobTask CR found for executor=%s/%s jobId=%d",
+					task.Namespace, execName, param.JobID), nil)
+				return
+			}
 		} else if !apierrors.IsNotFound(err) {
 			writeReturnT(w, xxlclient.FailCode, fmt.Sprintf("get XxlJobExecutor %s/%s failed: %v", task.Namespace, execName, err), nil)
 			return
@@ -703,16 +719,31 @@ func AdvanceSerialQueue(ctx context.Context, k8sClient client.Client, namespace,
 type serialOriginPartition struct {
 	execKey      string
 	origins      []adminOrigin
+	dbHashes     map[string]bool
 	stillRunning bool
 	suspended    []*batchv1.Job
+}
+
+func (p *serialOriginPartition) matchesDBHash(orig adminOrigin) bool {
+	if len(p.dbHashes) == 0 || orig.dbHash == "" {
+		return true
+	}
+	if p.dbHashes[orig.dbHash] {
+		return true
+	}
+	return orig.altDBHash != "" && p.dbHashes[orig.altDBHash]
 }
 
 func (p *serialOriginPartition) matches(execKey string, orig adminOrigin) bool {
 	if p.execKey != execKey {
 		return false
 	}
+	if !p.matchesDBHash(orig) {
+		return false
+	}
+	knownDB := len(p.dbHashes) > 0 && orig.dbHash != ""
 	for _, existing := range p.origins {
-		if !sameAdminOrigin(existing, orig) {
+		if !sameAdminOriginWithKnownDB(existing, orig, knownDB) {
 			return false
 		}
 	}
@@ -720,6 +751,17 @@ func (p *serialOriginPartition) matches(execKey string, orig adminOrigin) bool {
 }
 
 func (p *serialOriginPartition) recordOrigin(orig adminOrigin) {
+	if orig.dbHash != "" || orig.altDBHash != "" {
+		if p.dbHashes == nil {
+			p.dbHashes = make(map[string]bool, 2)
+		}
+		if orig.dbHash != "" {
+			p.dbHashes[orig.dbHash] = true
+		}
+		if orig.altDBHash != "" {
+			p.dbHashes[orig.altDBHash] = true
+		}
+	}
 	for _, existing := range p.origins {
 		if existing == orig {
 			return
@@ -854,8 +896,8 @@ func AdvanceSerialQueueWithReader(ctx context.Context, reader client.Reader, wri
 		}
 		p := &serialOriginPartition{
 			execKey: execKey,
-			origins: []adminOrigin{orig},
 		}
+		p.recordOrigin(orig)
 		partitions = append(partitions, p)
 		return p
 	}
@@ -879,15 +921,20 @@ func AdvanceSerialQueueWithReader(ctx context.Context, reader client.Reader, wri
 			}
 		}
 
-		if !isJobRunning(j) {
-			if HasActiveOrTerminatingPods(j) && isCompletedJobStillDrainingPods(j) {
+		// A deleting Job whose Pod is still active or terminating on the node must finish terminating
+		// before the next SERIAL_EXECUTION Job is unsuspended, unless its callback/cleanup was already bypassed (fixes R6-P2-1 & R7-P2-7).
+		if !j.DeletionTimestamp.IsZero() {
+			draining, drainErr := isDeletingJobDrainingPods(ctx, reader, j)
+			if drainErr != nil {
+				return drainErr
+			}
+			if draining {
 				markRunning()
 			}
 			continue
 		}
-		// A deleting Job whose Pod is still active or terminating on the node must finish terminating
-		// before the next SERIAL_EXECUTION Job is unsuspended, unless its callback/cleanup was already bypassed (fixes R6-P2-1 & R7-P2-7).
-		if !j.DeletionTimestamp.IsZero() {
+
+		if !isJobRunning(j) {
 			if HasActiveOrTerminatingPods(j) && isCompletedJobStillDrainingPods(j) {
 				markRunning()
 			}
@@ -1387,7 +1434,25 @@ func isTaskConsistentWithExecutor(task *xxljobv1alpha1.XxlJobTask, execCR *xxljo
 	if execOrig.uid != "" && taskOrig.uid != "" && execOrig.uid != taskOrig.uid {
 		return false
 	}
-	if execOrig.dbHash != "" && taskOrig.dbHash != "" && execOrig.dbHash != taskOrig.dbHash {
+	if execOrig.managedKnown && taskOrig.managedKnown && execOrig.managed != taskOrig.managed {
+		return false
+	}
+	if (!taskOrig.managedKnown && execOrig.managed) || (execOrig.hasAny() && !execOrig.managedKnown && taskOrig.managed) {
+		return false
+	}
+	if execOrig.dbHash != "" && taskOrig.dbHash != "" && !sameOriginDBHash(execOrig, taskOrig) {
+		return false
+	}
+	if (execOrig.dbHash == "") != (taskOrig.dbHash == "") {
+		if !taskOrig.hasAny() && (execOrig.managed || execOrig.dbHash != "") {
+			return false
+		}
+		if execOrig.hasAny() && taskOrig.hasAny() &&
+			((execOrig.dbHash == "" && execOrig.explicitManaged) || (taskOrig.dbHash == "" && taskOrig.explicitManaged)) {
+			return false
+		}
+	}
+	if !taskOrig.hasAny() && execOrig.explicitManaged && execOrig.managed {
 		return false
 	}
 	if execAdminURL != "" && taskAdminURL != "" && taskAdminURL != execAdminURL {
@@ -1431,14 +1496,287 @@ func (s *Server) findMatchingTask(
 		if rc.ExecutorName != "" && item.Spec.ExecutorRef.Name != rc.ExecutorName {
 			continue
 		}
+		if item.Status.JobID != param.JobID {
+			continue
+		}
 		if !isTaskConsistentWithExecutor(item, execCR) {
 			continue
 		}
-		if item.Status.JobID == param.JobID {
-			return item, nil
+		converged, err := s.isTaskAndExecutorConvergedWithAdmin(ctx, item, execCR)
+		if err != nil {
+			return nil, err
 		}
+		if !converged {
+			continue
+		}
+		return item, nil
 	}
 	return nil, nil
+}
+
+func isPureExternalAdminSpec(admin *xxljobv1alpha1.XxlJobAdmin) bool {
+	if admin == nil {
+		return false
+	}
+	return strings.TrimSpace(admin.Spec.ExternalURL) != "" && strings.TrimSpace(admin.Spec.Image) == ""
+}
+
+func matchesAdminDatasourceOrPreservedLegacy(meta *SyncedAdminEndpointMeta, admin *xxljobv1alpha1.XxlJobAdmin) bool {
+	if meta == nil || admin == nil {
+		return false
+	}
+	if meta.MatchesAdminDatasourceURL(admin.Spec.Datasource.URL) {
+		return true
+	}
+	if isPureExternalAdminSpec(admin) || !meta.HasDatasourceHash() {
+		return false
+	}
+	currentHash := DatasourceURLHash(admin.Spec.Datasource.URL)
+	if currentHash == "" {
+		return false
+	}
+	if admMeta := DecodeSyncedAdminEndpointMeta(admin.Status.Conditions); admMeta != nil &&
+		(admMeta.AdminUID == "" || admin.UID == "" || strings.TrimSpace(admMeta.AdminUID) == string(admin.UID)) &&
+		strings.TrimSpace(admMeta.DatasourceHash) == currentHash &&
+		strings.TrimSpace(admMeta.LegacyDatasourceHash) != "" {
+		preserved := strings.TrimSpace(admMeta.LegacyDatasourceHash)
+		if strings.TrimSpace(meta.DatasourceHash) == preserved ||
+			strings.TrimSpace(meta.LegacyDatasourceHash) == preserved {
+			return true
+		}
+	}
+	return false
+}
+
+func isSyncedMetaConvergedWithAdmin(meta *SyncedAdminEndpointMeta, admin *xxljobv1alpha1.XxlJobAdmin) bool {
+	if meta == nil || admin == nil {
+		return true
+	}
+	isPureExternal := isPureExternalAdminSpec(admin)
+	if meta.ManagedInCluster && isPureExternal {
+		return false
+	}
+	if meta.HasExplicitMode() && !meta.ManagedInCluster && !isPureExternal {
+		return false
+	}
+	if meta.HasDatasourceHash() {
+		if isPureExternal || !matchesAdminDatasourceOrPreservedLegacy(meta, admin) {
+			return false
+		}
+	} else if meta.HasExplicitMode() && meta.ManagedInCluster && !isPureExternal {
+		if !MatchesDatasourceURLHash(admin.Spec.Datasource.URL, "") {
+			return false
+		}
+	}
+	if savedUID := strings.TrimSpace(meta.AdminUID); savedUID != "" && admin.UID != "" && string(admin.UID) != savedUID {
+		if meta.ManagedInCluster || !isPureExternal {
+			return false
+		}
+	}
+	return true
+}
+
+func adminHasRetiredEndpointForModeOrDB(admin *xxljobv1alpha1.XxlJobAdmin) bool {
+	if admin == nil {
+		return false
+	}
+	for i := range admin.Status.Conditions {
+		c := &admin.Status.Conditions[i]
+		if c.Type != ConditionPreviousAdminEndpoints || c.Status != metav1.ConditionTrue || strings.TrimSpace(c.Message) == "" {
+			continue
+		}
+		var prevList []SyncedAdminEndpointMeta
+		if err := json.Unmarshal([]byte(c.Message), &prevList); err != nil {
+			continue
+		}
+		for j := range prevList {
+			item := &prevList[j]
+			if sName := strings.TrimSpace(item.AdminName); sName != "" && sName != admin.Name {
+				continue
+			}
+			if sUID := strings.TrimSpace(item.AdminUID); sUID != "" && admin.UID != "" && sUID != string(admin.UID) {
+				continue
+			}
+			if !isSyncedMetaConvergedWithAdmin(item, admin) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Server) isTaskAndExecutorConvergedWithAdmin(
+	ctx context.Context,
+	task *xxljobv1alpha1.XxlJobTask,
+	execCR *xxljobv1alpha1.XxlJobExecutor,
+) (bool, error) {
+	if task == nil {
+		return true, nil
+	}
+	ns := task.Namespace
+	if ns == "" && execCR != nil {
+		ns = execCR.Namespace
+	}
+	if ns == "" {
+		return true, nil
+	}
+	specAdminName := ""
+	if execCR != nil {
+		adminNS := execCR.Spec.AdminRef.Namespace
+		if adminNS == "" || adminNS == execCR.Namespace {
+			specAdminName = strings.TrimSpace(execCR.Spec.AdminRef.Name)
+		}
+	}
+
+	adminCache := make(map[string]*xxljobv1alpha1.XxlJobAdmin, 2)
+	getAdmin := func(name string) (*xxljobv1alpha1.XxlJobAdmin, error) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, nil
+		}
+		if cached, ok := adminCache[name]; ok {
+			return cached, nil
+		}
+		var adm xxljobv1alpha1.XxlJobAdmin
+		if err := s.apiReader().Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, &adm); err != nil {
+			if apierrors.IsNotFound(err) {
+				adminCache[name] = nil
+				return nil, nil
+			}
+			return nil, err
+		}
+		adminCache[name] = &adm
+		return &adm, nil
+	}
+
+	var adminListLoaded bool
+	var cachedAdminList []xxljobv1alpha1.XxlJobAdmin
+	findAdminByURL := func(targetURL string) (*xxljobv1alpha1.XxlJobAdmin, error) {
+		targetURL = strings.TrimRight(strings.TrimSpace(targetURL), "/")
+		if targetURL == "" {
+			return nil, nil
+		}
+		if !adminListLoaded {
+			var list xxljobv1alpha1.XxlJobAdminList
+			if err := s.apiReader().List(ctx, &list, client.InNamespace(ns)); err != nil {
+				return nil, err
+			}
+			cachedAdminList = list.Items
+			adminListLoaded = true
+		}
+		for i := range cachedAdminList {
+			item := &cachedAdminList[i]
+			if resolveAdminURLForOrigin(item) == targetURL || adminPreviouslyOwnedURL(item, targetURL) {
+				return item, nil
+			}
+		}
+		return nil, nil
+	}
+
+	checkMeta := func(meta *SyncedAdminEndpointMeta) (bool, error) {
+		if meta == nil {
+			return true, nil
+		}
+		targetName := strings.TrimSpace(meta.AdminName)
+		metaURL := strings.TrimRight(strings.TrimSpace(meta.AdminURL), "/")
+		var adm *xxljobv1alpha1.XxlJobAdmin
+		var err error
+		if targetName != "" {
+			adm, err = getAdmin(targetName)
+			if err != nil {
+				return false, err
+			}
+		} else if specAdminName != "" {
+			cand, candErr := getAdmin(specAdminName)
+			if candErr != nil {
+				return false, candErr
+			}
+			if cand != nil && (metaURL == "" || resolveAdminURLForOrigin(cand) == metaURL || adminPreviouslyOwnedURL(cand, metaURL)) {
+				adm = cand
+			}
+		}
+		if adm == nil && targetName == "" && metaURL != "" {
+			adm, err = findAdminByURL(metaURL)
+			if err != nil {
+				return false, err
+			}
+		}
+		if adm == nil {
+			return true, nil
+		}
+		return isSyncedMetaConvergedWithAdmin(meta, adm), nil
+	}
+
+	taskMeta := DecodeSyncedAdminEndpointMeta(task.Status.Conditions)
+	if ok, err := checkMeta(taskMeta); err != nil || !ok {
+		return false, err
+	}
+	var execMeta *SyncedAdminEndpointMeta
+	if execCR != nil {
+		execMeta = DecodeSyncedAdminEndpointMeta(execCR.Status.Conditions)
+		if ok, err := checkMeta(execMeta); err != nil || !ok {
+			return false, err
+		}
+	}
+	if taskMeta == nil && execMeta != nil && (execMeta.ManagedInCluster || execMeta.HasDatasourceHash()) {
+		return false, nil
+	}
+	if taskMeta == nil || execMeta == nil {
+		activeURL := strings.TrimRight(strings.TrimSpace(task.Status.AdminURL), "/")
+		if activeURL == "" && execCR != nil {
+			activeURL = strings.TrimRight(strings.TrimSpace(execCR.Status.AdminURL), "/")
+		}
+		checkHalfConvergedAdmin := func(adm *xxljobv1alpha1.XxlJobAdmin) bool {
+			if adm == nil {
+				return true
+			}
+			if admMeta := DecodeSyncedAdminEndpointMeta(adm.Status.Conditions); admMeta != nil {
+				if !isSyncedMetaConvergedWithAdmin(admMeta, adm) {
+					return false
+				}
+				// In a rolling-upgrade half-converged window where XxlJobAdmin (and possibly XxlJobExecutor) already
+				// reconciled a new Spec.Datasource.URL or mode (including Managed -> Pure-External), reject legacy
+				// XxlJobTask CRs whose Status.Conditions still lack ConditionAdminEndpointSynced (taskMeta == nil)
+				// so stale Status.JobID cannot slip through.
+				if taskMeta == nil &&
+					(!isPureExternalAdminSpec(adm) ||
+						admMeta.ManagedInCluster ||
+						admMeta.HasDatasourceHash() ||
+						execMeta != nil ||
+						adminHasRetiredEndpointForModeOrDB(adm)) {
+					return false
+				}
+			}
+			return true
+		}
+
+		checkedActiveAdmin := false
+		if specAdminName != "" {
+			adm, err := getAdmin(specAdminName)
+			if err != nil {
+				return false, err
+			}
+			if adm != nil {
+				specAdminURL := resolveAdminURLForOrigin(adm)
+				if activeURL == "" || activeURL == specAdminURL || adminPreviouslyOwnedURL(adm, activeURL) {
+					checkedActiveAdmin = true
+					if !checkHalfConvergedAdmin(adm) {
+						return false, nil
+					}
+				}
+			}
+		}
+		if !checkedActiveAdmin && activeURL != "" {
+			activeAdm, err := findAdminByURL(activeURL)
+			if err != nil {
+				return false, err
+			}
+			if !checkHalfConvergedAdmin(activeAdm) {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
 }
 
 func (s *Server) claimDiscardLaterWinner(ctx context.Context, initialTask *xxljobv1alpha1.XxlJobTask, prevLastExec string, createdJob *batchv1.Job) (bool, error) {
@@ -1450,8 +1788,14 @@ func (s *Server) claimDiscardLaterWinner(ctx context.Context, initialTask *xxljo
 		if current.Status.LastExecutionJobName != "" && current.Status.LastExecutionJobName != createdJob.Name {
 			var winnerJob batchv1.Job
 			if getErr := s.apiReader().Get(ctx, client.ObjectKey{Namespace: initialTask.Namespace, Name: current.Status.LastExecutionJobName}, &winnerJob); getErr == nil {
-				if isSameOriginatingAdminJob(&winnerJob, createdJob) && isJobBlockingExecution(&winnerJob) {
-					break
+				if isSameOriginatingAdminJob(&winnerJob, createdJob) {
+					if !winnerJob.DeletionTimestamp.IsZero() {
+						if draining, drainErr := isDeletingJobDrainingPods(ctx, s.apiReader(), &winnerJob); drainErr != nil || draining {
+							break
+						}
+					} else if isJobBlockingExecution(&winnerJob) {
+						break
+					}
 				}
 			} else if !apierrors.IsNotFound(getErr) {
 				break
@@ -1509,7 +1853,9 @@ type SyncedAdminEndpointMeta struct {
 	AdminUID               string                             `json:"adminUID,omitempty"`
 	AdminURL               string                             `json:"adminURL,omitempty"`
 	ManagedInCluster       bool                               `json:"managedInCluster,omitempty"`
+	ModeCaptured           bool                               `json:"modeCaptured,omitempty"`
 	DatasourceHash         string                             `json:"datasourceHash,omitempty"`
+	LegacyDatasourceHash   string                             `json:"legacyDatasourceHash,omitempty"`
 	AuthCaptured           bool                               `json:"authCaptured,omitempty"`
 	Username               string                             `json:"username,omitempty"`
 	UsedDefaultPassword    bool                               `json:"usedDefaultPassword,omitempty"`
@@ -1518,16 +1864,665 @@ type SyncedAdminEndpointMeta struct {
 	AccessTokenSecretRef   *xxljobv1alpha1.SecretKeyReference `json:"accessTokenSecretRef,omitempty"`
 }
 
-// DatasourceURLHash computes a non-reversible hex SHA-256 prefix of a trimmed JDBC URL so controllers
+// HasExplicitMode reports whether ManagedInCluster (and empty vs non-empty DatasourceHash) was explicitly
+// recorded rather than left as zero-valued defaults, without implying credential fields were captured.
+func (m *SyncedAdminEndpointMeta) HasExplicitMode() bool {
+	if m == nil {
+		return false
+	}
+	return m.ModeCaptured || m.AuthCaptured || m.HasDatasourceHash()
+}
+
+// HasDatasourceHash reports whether either canonical DatasourceHash or LegacyDatasourceHash is populated.
+func (m *SyncedAdminEndpointMeta) HasDatasourceHash() bool {
+	if m == nil {
+		return false
+	}
+	return strings.TrimSpace(m.DatasourceHash) != "" || strings.TrimSpace(m.LegacyDatasourceHash) != ""
+}
+
+// MatchesAdminDatasourceURL reports whether rawURL matches either canonical DatasourceHash or LegacyDatasourceHash
+// recorded on m (supporting both canonical and pre-canonicalization 1cf04b3 rolling-upgrade hashes).
+func (m *SyncedAdminEndpointMeta) MatchesAdminDatasourceURL(rawURL string) bool {
+	if m == nil {
+		return false
+	}
+	h1 := strings.TrimSpace(m.DatasourceHash)
+	h2 := strings.TrimSpace(m.LegacyDatasourceHash)
+	if h1 == "" && h2 == "" {
+		return MatchesDatasourceURLHash(rawURL, "")
+	}
+	if h1 != "" && MatchesDatasourceURLHash(rawURL, h1) {
+		return true
+	}
+	if h2 != "" && MatchesDatasourceURLHash(rawURL, h2) {
+		return true
+	}
+	return false
+}
+
+// DatasourceURLHash computes a non-reversible hex SHA-256 prefix of a canonicalized JDBC URL so controllers
 // and K8sJobProxy can detect whether an in-cluster managed XxlJobAdmin still points to the same database
-// without exposing JDBC query parameters in Status.Conditions or Job annotations.
+// without exposing JDBC query parameters in Status.Conditions or Job annotations, while treating harmless
+// JDBC query-option reorderings, default ports, and hostname case differences as the same database.
 func DatasourceURLHash(rawURL string) string {
+	canonical := canonicalJDBCURL(rawURL)
+	if canonical == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(canonical))
+	return hex.EncodeToString(sum[:16])
+}
+
+// LegacyRawDatasourceURLHash computes the pre-canonicalization SHA-256 prefix of strings.TrimSpace(rawURL)
+// so rolling upgrades from releases prior to JDBC URL canonicalization preserve in-flight Job callbacks,
+// /run triggers, /kill, /log, and SERIAL_EXECUTION partitioning without false DB-replacement detections.
+func LegacyRawDatasourceURLHash(rawURL string) string {
 	trimmed := strings.TrimSpace(rawURL)
 	if trimmed == "" {
 		return ""
 	}
 	sum := sha256.Sum256([]byte(trimmed))
 	return hex.EncodeToString(sum[:16])
+}
+
+// MatchesDatasourceURLHash reports whether savedHash matches either the canonical DatasourceURLHash(rawURL)
+// or the pre-canonicalization LegacyRawDatasourceURLHash(rawURL) (or both are empty when rawURL is empty).
+func MatchesDatasourceURLHash(rawURL, savedHash string) bool {
+	sh := strings.TrimSpace(savedHash)
+	canon := DatasourceURLHash(rawURL)
+	if sh == "" || canon == "" {
+		return sh == canon
+	}
+	if sh == canon {
+		return true
+	}
+	return sh == LegacyRawDatasourceURLHash(rawURL)
+}
+
+func jdbcUnescape(raw string) string {
+	if !strings.Contains(raw, "%") {
+		return raw
+	}
+	if decoded, err := url.PathUnescape(raw); err == nil {
+		return decoded
+	}
+	return raw
+}
+
+func jdbcDefaultPort(subproto string) string {
+	switch subproto {
+	case "mysql", "mariadb",
+		"mysql:loadbalance", "mysql:failover", "mysql:replication",
+		"mariadb:loadbalance", "mariadb:failover", "mariadb:replication", "mariadb:aurora", "mariadb:sequential":
+		return "3306"
+	case "postgresql", "postgres":
+		return "5432"
+	case "sqlserver":
+		return "1433"
+	case "oracle:thin":
+		return "1521"
+	default:
+		return ""
+	}
+}
+
+func jdbcDefaultHost(subproto string) string {
+	switch subproto {
+	case "mysql", "mariadb",
+		"mysql:loadbalance", "mysql:failover", "mysql:replication",
+		"mariadb:loadbalance", "mariadb:failover", "mariadb:replication", "mariadb:aurora", "mariadb:sequential",
+		"postgresql", "postgres":
+		return "localhost"
+	default:
+		return ""
+	}
+}
+
+func formatJDBCHostPort(host, port string) string {
+	h := strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+	p := strings.TrimSpace(port)
+	if strings.Contains(h, ":") {
+		if p != "" {
+			return "[" + h + "]:" + p
+		}
+		return "[" + h + "]"
+	}
+	if p != "" {
+		return h + ":" + p
+	}
+	return h
+}
+
+func canonicalizeSingleJDBCHost(rawHost, defaultPort string, defaultHost ...string) string {
+	defHost := ""
+	if len(defaultHost) > 0 {
+		defHost = defaultHost[0]
+	}
+	h := strings.TrimSpace(rawHost)
+	if h == "" {
+		if defHost != "" {
+			return formatJDBCHostPort(defHost, defaultPort)
+		}
+		return ""
+	}
+	lowerH := strings.ToLower(h)
+	if strings.HasPrefix(lowerH, "address=") {
+		rest := strings.TrimSpace(h[len("address="):])
+		var pairs [][2]string
+		validGroups := len(rest) > 0
+		idx := 0
+		for idx < len(rest) {
+			for idx < len(rest) && (rest[idx] == ' ' || rest[idx] == '\t') {
+				idx++
+			}
+			if idx >= len(rest) {
+				break
+			}
+			if rest[idx] != '(' {
+				validGroups = false
+				break
+			}
+			end := strings.IndexByte(rest[idx+1:], ')')
+			if end < 0 {
+				validGroups = false
+				break
+			}
+			inner := rest[idx+1 : idx+1+end]
+			if eq := strings.IndexByte(inner, '='); eq >= 0 {
+				pairs = append(pairs, [2]string{inner[:eq], inner[eq+1:]})
+			} else if strings.TrimSpace(inner) != "" {
+				pairs = append(pairs, [2]string{inner, ""})
+			}
+			idx += end + 2
+		}
+		if validGroups && len(pairs) > 0 {
+			return canonicalizeJDBCHostPropPairs(pairs, defaultPort, defHost)
+		}
+	}
+	if strings.HasPrefix(h, "(") && strings.HasSuffix(h, ")") {
+		inner := h[1 : len(h)-1]
+		if strings.Contains(inner, "=") && !strings.ContainsAny(inner, "()") {
+			parts := strings.Split(inner, ",")
+			pairs := make([][2]string, 0, len(parts))
+			for _, p := range parts {
+				if strings.TrimSpace(p) == "" {
+					continue
+				}
+				if eq := strings.IndexByte(p, '='); eq >= 0 {
+					pairs = append(pairs, [2]string{p[:eq], p[eq+1:]})
+				} else {
+					pairs = append(pairs, [2]string{p, ""})
+				}
+			}
+			if len(pairs) > 0 {
+				return canonicalizeJDBCHostPropPairs(pairs, defaultPort, defHost)
+			}
+		}
+	}
+	if strings.HasPrefix(h, "[") && strings.HasSuffix(h, "]") {
+		inner := h[1 : len(h)-1]
+		if indexTopLevelByte(inner, ',') >= 0 {
+			subEntries := splitTopLevel(inner, ',')
+			canonSub := make([]string, len(subEntries))
+			for i, sub := range subEntries {
+				canonSub[i] = canonicalizeSingleJDBCHost(sub, defaultPort, defHost)
+			}
+			return "[" + strings.Join(canonSub, ",") + "]"
+		}
+	}
+	if strings.HasPrefix(h, "[") {
+		if closeIdx := strings.IndexByte(h, ']'); closeIdx > 0 {
+			ipv6Host := h[1:closeIdx]
+			rem := strings.TrimSpace(h[closeIdx+1:])
+			port := ""
+			if strings.HasPrefix(rem, ":") {
+				port = strings.TrimSpace(rem[1:])
+			} else if rem != "" {
+				return strings.ToLower(h)
+			}
+			if port == "" {
+				port = defaultPort
+			}
+			return formatJDBCHostPort(ipv6Host, port)
+		}
+	}
+	if firstColon := strings.IndexByte(h, ':'); firstColon >= 0 {
+		if strings.IndexByte(h[firstColon+1:], ':') >= 0 {
+			// Unbracketed IPv6 literal without port
+			return formatJDBCHostPort(h, defaultPort)
+		}
+		hostOnly := strings.TrimSpace(h[:firstColon])
+		if hostOnly == "" && defHost != "" {
+			hostOnly = defHost
+		}
+		port := strings.TrimSpace(h[firstColon+1:])
+		if port == "" {
+			port = defaultPort
+		}
+		return formatJDBCHostPort(hostOnly, port)
+	}
+	return formatJDBCHostPort(h, defaultPort)
+}
+
+func canonicalizeJDBCHostPropPairs(pairs [][2]string, defaultPort, defaultHost string) string {
+	props := make(map[string]string, len(pairs))
+	for _, kv := range pairs {
+		k := strings.ToLower(strings.TrimSpace(jdbcUnescape(kv[0])))
+		if k == "" {
+			continue
+		}
+		v := strings.TrimSpace(jdbcUnescape(kv[1]))
+		props[k] = v
+	}
+	proto := strings.ToLower(props["protocol"])
+	if proto == "" && props["path"] == "" && (props["host"] != "" || (props["port"] != "" && defaultHost != "")) {
+		proto = "tcp"
+	}
+	if proto != "" {
+		props["protocol"] = proto
+	}
+	if proto == "tcp" && props["host"] == "" && defaultHost != "" {
+		props["host"] = defaultHost
+	}
+	if hv, ok := props["host"]; ok {
+		props["host"] = strings.Trim(strings.ToLower(hv), "[]")
+	}
+	if proto == "tcp" && props["port"] == "" && defaultPort != "" && props["host"] != "" {
+		props["port"] = defaultPort
+	}
+	pureTCP := proto == "tcp" && props["host"] != ""
+	if pureTCP {
+		for k := range props {
+			if k != "protocol" && k != "host" && k != "port" {
+				pureTCP = false
+				break
+			}
+		}
+		if pureTCP {
+			return formatJDBCHostPort(props["host"], props["port"])
+		}
+	}
+	keys := make([]string, 0, len(props))
+	for k := range props {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString("address=")
+	for _, k := range keys {
+		b.WriteByte('(')
+		b.WriteString(url.PathEscape(k))
+		b.WriteByte('=')
+		b.WriteString(url.PathEscape(props[k]))
+		b.WriteByte(')')
+	}
+	return b.String()
+}
+
+type jdbcKVParam struct {
+	key   string
+	val   string
+	hasEq bool
+}
+
+func canonicalizeJDBCParams(segments []string, sep string, unescape bool, keySynonyms ...map[string]string) string {
+	if len(segments) == 0 {
+		return ""
+	}
+	var synonyms map[string]string
+	if len(keySynonyms) > 0 {
+		synonyms = keySynonyms[0]
+	}
+	indexByKey := make(map[string]int, len(segments))
+	params := make([]jdbcKVParam, 0, len(segments))
+	for _, seg := range segments {
+		if strings.TrimSpace(seg) == "" {
+			continue
+		}
+		rawK := seg
+		rawV := ""
+		hasEq := false
+		if eq := strings.IndexByte(seg, '='); eq >= 0 {
+			rawK = seg[:eq]
+			rawV = seg[eq+1:]
+			hasEq = true
+		}
+		if unescape {
+			rawK = jdbcUnescape(rawK)
+			rawV = jdbcUnescape(rawV)
+		}
+		k := strings.ToLower(strings.TrimSpace(rawK))
+		if k == "" {
+			continue
+		}
+		if synonyms != nil {
+			if canonicalKey, ok := synonyms[k]; ok {
+				k = canonicalKey
+			}
+		}
+		entry := jdbcKVParam{key: k, val: rawV, hasEq: hasEq}
+		if idx, exists := indexByKey[k]; exists {
+			params[idx] = entry
+		} else {
+			indexByKey[k] = len(params)
+			params = append(params, entry)
+		}
+	}
+	if len(params) == 0 {
+		return ""
+	}
+	sort.Slice(params, func(i, j int) bool {
+		return params[i].key < params[j].key
+	})
+	encoded := make([]string, len(params))
+	for i, p := range params {
+		if unescape {
+			if p.hasEq {
+				encoded[i] = url.PathEscape(p.key) + "=" + url.PathEscape(p.val)
+			} else {
+				encoded[i] = url.PathEscape(p.key)
+			}
+		} else {
+			if p.hasEq {
+				encoded[i] = p.key + "=" + strings.TrimSpace(p.val)
+			} else {
+				encoded[i] = p.key
+			}
+		}
+	}
+	return strings.Join(encoded, sep)
+}
+
+func splitTopLevel(s string, sep byte) []string {
+	var parts []string
+	parenDepth := 0
+	bracketDepth := 0
+	braceDepth := 0
+	start := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			parenDepth++
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case '[':
+			bracketDepth++
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case '{':
+			braceDepth++
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
+			}
+		case sep:
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+				parts = append(parts, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
+}
+
+func indexTopLevelByte(s string, target byte) int {
+	parenDepth := 0
+	bracketDepth := 0
+	braceDepth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			parenDepth++
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case '[':
+			bracketDepth++
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case '{':
+			braceDepth++
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
+			}
+		case target:
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func lastIndexTopLevelByte(s string, target byte) int {
+	parenDepth := 0
+	bracketDepth := 0
+	braceDepth := 0
+	last := -1
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			parenDepth++
+		case ')':
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case '[':
+			bracketDepth++
+		case ']':
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case '{':
+			braceDepth++
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
+			}
+		case target:
+			if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+				last = i
+			}
+		}
+	}
+	return last
+}
+
+var sqlServerKeySynonyms = map[string]string{
+	"database": "databasename",
+}
+
+func canonicalJDBCURL(rawURL string) string {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return ""
+	}
+	if len(trimmed) < 5 || !strings.EqualFold(trimmed[:5], "jdbc:") {
+		return trimmed
+	}
+	rest := trimmed[5:]
+
+	schemeSep := strings.Index(rest, "://")
+	firstQ := indexTopLevelByte(rest, '?')
+	firstSemi := indexTopLevelByte(rest, ';')
+	if schemeSep > 0 && (firstQ < 0 || schemeSep < firstQ) && (firstSemi < 0 || schemeSep < firstSemi) {
+		subproto := strings.ToLower(strings.TrimSpace(rest[:schemeSep]))
+		afterScheme := rest[schemeSep+3:]
+
+		if subproto == "sqlserver" || strings.HasPrefix(subproto, "sqlserver:") {
+			parts := splitTopLevel(afterScheme, ';')
+			hostPart := strings.TrimSpace(parts[0])
+			if hostPart != "" {
+				if strings.Contains(hostPart, `\`) {
+					hostPart = strings.ToLower(hostPart)
+				} else {
+					hostPart = canonicalizeSingleJDBCHost(hostPart, jdbcDefaultPort("sqlserver"))
+				}
+			}
+			canonProps := canonicalizeJDBCParams(parts[1:], ";", false, sqlServerKeySynonyms)
+			if canonProps != "" {
+				return "jdbc:" + subproto + "://" + hostPart + ";" + canonProps
+			}
+			return "jdbc:" + subproto + "://" + hostPart
+		}
+
+		beforeQuery := afterScheme
+		rawQuery := ""
+		if qIdx := indexTopLevelByte(afterScheme, '?'); qIdx >= 0 {
+			beforeQuery = afterScheme[:qIdx]
+			rawQuery = afterScheme[qIdx+1:]
+		}
+
+		authority := beforeQuery
+		dbPath := ""
+		if slashIdx := indexTopLevelByte(beforeQuery, '/'); slashIdx >= 0 {
+			authority = beforeQuery[:slashIdx]
+			dbPath = beforeQuery[slashIdx:]
+			if dbPath == "/" {
+				dbPath = ""
+			}
+		}
+
+		userPrefix := ""
+		hostListStr := authority
+		if atIdx := lastIndexTopLevelByte(authority, '@'); atIdx >= 0 {
+			userPrefix = authority[:atIdx+1]
+			hostListStr = authority[atIdx+1:]
+		}
+
+		defPort := jdbcDefaultPort(subproto)
+		defHost := jdbcDefaultHost(subproto)
+		var canonHosts []string
+		if strings.TrimSpace(hostListStr) == "" {
+			canonHosts = []string{canonicalizeSingleJDBCHost("", defPort, defHost)}
+		} else {
+			hostEntries := splitTopLevel(hostListStr, ',')
+			canonHosts = make([]string, len(hostEntries))
+			for i, h := range hostEntries {
+				if strings.TrimSpace(h) == "" {
+					canonHosts[i] = ""
+				} else {
+					canonHosts[i] = canonicalizeSingleJDBCHost(h, defPort, defHost)
+				}
+			}
+		}
+		canonAuthority := userPrefix + strings.Join(canonHosts, ",")
+
+		canonQuery := ""
+		if rawQuery != "" {
+			canonQuery = canonicalizeJDBCParams(strings.Split(rawQuery, "&"), "&", true)
+		}
+
+		var b strings.Builder
+		b.WriteString("jdbc:")
+		b.WriteString(subproto)
+		b.WriteString("://")
+		b.WriteString(canonAuthority)
+		b.WriteString(dbPath)
+		if canonQuery != "" {
+			b.WriteByte('?')
+			b.WriteString(canonQuery)
+		}
+		return b.String()
+	}
+
+	// PostgreSQL shorthand without //: jdbc:postgresql:dbname[?query] === jdbc:postgresql://localhost:5432/dbname[?query]
+	if firstSemi < 0 {
+		if colonIdx := strings.IndexByte(rest, ':'); colonIdx > 0 && (firstQ < 0 || colonIdx < firstQ) {
+			subproto := strings.ToLower(strings.TrimSpace(rest[:colonIdx]))
+			afterProto := rest[colonIdx+1:]
+			if (subproto == "postgresql" || subproto == "postgres") && !strings.HasPrefix(afterProto, "/") {
+				dbName := afterProto
+				rawQuery := ""
+				if qIdx := indexTopLevelByte(afterProto, '?'); qIdx >= 0 {
+					dbName = afterProto[:qIdx]
+					rawQuery = afterProto[qIdx+1:]
+				}
+				if strings.TrimSpace(dbName) != "" {
+					canonQuery := ""
+					if rawQuery != "" {
+						canonQuery = canonicalizeJDBCParams(strings.Split(rawQuery, "&"), "&", true)
+					}
+					base := "jdbc:" + subproto + "://localhost:5432/" + dbName
+					if canonQuery != "" {
+						return base + "?" + canonQuery
+					}
+					return base
+				}
+			}
+		}
+	}
+
+	// Oracle Thin EZConnect: jdbc:oracle:thin:[user/pass]@//host[:1521][/service][?query]
+	if len(rest) > len("oracle:thin:") && strings.EqualFold(rest[:len("oracle:thin:")], "oracle:thin:") {
+		afterThin := rest[len("oracle:thin:"):]
+		if atSlashIdx := strings.Index(afterThin, "@//"); atSlashIdx >= 0 && (firstQ < 0 || len("oracle:thin:")+atSlashIdx < firstQ) {
+			credPrefix := afterThin[:atSlashIdx+3]
+			ezRest := afterThin[atSlashIdx+3:]
+			beforeQuery := ezRest
+			rawQuery := ""
+			if qIdx := indexTopLevelByte(ezRest, '?'); qIdx >= 0 {
+				beforeQuery = ezRest[:qIdx]
+				rawQuery = ezRest[qIdx+1:]
+			}
+			hostPart := beforeQuery
+			svcPath := ""
+			if slashIdx := indexTopLevelByte(beforeQuery, '/'); slashIdx >= 0 {
+				hostPart = beforeQuery[:slashIdx]
+				svcPath = beforeQuery[slashIdx:]
+				if svcPath == "/" {
+					svcPath = ""
+				}
+			}
+			canonHost := canonicalizeSingleJDBCHost(hostPart, jdbcDefaultPort("oracle:thin"))
+			canonQuery := ""
+			if rawQuery != "" {
+				canonQuery = canonicalizeJDBCParams(strings.Split(rawQuery, "&"), "&", true)
+			}
+			base := "jdbc:oracle:thin:" + credPrefix + canonHost + svcPath
+			if canonQuery != "" {
+				return base + "?" + canonQuery
+			}
+			return base
+		}
+	}
+
+	if firstQ >= 0 && (firstSemi < 0 || firstQ < firstSemi) {
+		beforeQuery := rest[:firstQ]
+		rawQuery := rest[firstQ+1:]
+		if colonIdx := strings.IndexByte(beforeQuery, ':'); colonIdx > 0 {
+			beforeQuery = strings.ToLower(beforeQuery[:colonIdx]) + beforeQuery[colonIdx:]
+		}
+		canonQuery := canonicalizeJDBCParams(strings.Split(rawQuery, "&"), "&", true)
+		if canonQuery != "" {
+			return "jdbc:" + beforeQuery + "?" + canonQuery
+		}
+		return "jdbc:" + beforeQuery
+	}
+
+	if firstQ < 0 && firstSemi > 0 {
+		parts := splitTopLevel(rest, ';')
+		prefix := parts[0]
+		if colonIdx := strings.IndexByte(prefix, ':'); colonIdx > 0 {
+			prefix = strings.ToLower(prefix[:colonIdx]) + prefix[colonIdx:]
+		}
+		canonProps := canonicalizeJDBCParams(parts[1:], ";", false)
+		if canonProps != "" {
+			return "jdbc:" + prefix + ";" + canonProps
+		}
+		return "jdbc:" + prefix
+	}
+	return "jdbc:" + rest
 }
 
 // IsClusterLocalAdminServiceURL reports whether rawURL targets the cluster-internal Kubernetes Service
@@ -1557,8 +2552,21 @@ func EncodeSyncedAdminEndpointMeta(admin *xxljobv1alpha1.XxlJobAdmin, adminURL s
 	isPureExternal := strings.TrimSpace(admin.Spec.ExternalURL) != "" && strings.TrimSpace(admin.Spec.Image) == ""
 	managedInCluster := !isPureExternal
 	dbHash := ""
+	legacyDBHash := ""
 	if !isPureExternal {
 		dbHash = DatasourceURLHash(admin.Spec.Datasource.URL)
+		if rawHash := LegacyRawDatasourceURLHash(admin.Spec.Datasource.URL); rawHash != "" && rawHash != dbHash {
+			legacyDBHash = rawHash
+		}
+		if dbHash != "" {
+			if prev := DecodeSyncedAdminEndpointMeta(admin.Status.Conditions); prev != nil &&
+				strings.TrimSpace(prev.AdminUID) == string(admin.UID) &&
+				strings.TrimSpace(prev.DatasourceHash) == dbHash &&
+				strings.TrimSpace(prev.LegacyDatasourceHash) != "" &&
+				strings.TrimSpace(prev.LegacyDatasourceHash) != dbHash {
+				legacyDBHash = strings.TrimSpace(prev.LegacyDatasourceHash)
+			}
+		}
 	}
 	trimmedPw := strings.TrimSpace(admin.Spec.Auth.Password)
 	sanitizedTok := sanitizeHeaderToken(admin.Spec.Auth.AccessToken)
@@ -1567,7 +2575,9 @@ func EncodeSyncedAdminEndpointMeta(admin *xxljobv1alpha1.XxlJobAdmin, adminURL s
 		AdminUID:               string(admin.UID),
 		AdminURL:               normURL,
 		ManagedInCluster:       managedInCluster,
+		ModeCaptured:           true,
 		DatasourceHash:         dbHash,
+		LegacyDatasourceHash:   legacyDBHash,
 		AuthCaptured:           true,
 		Username:               admin.Spec.Auth.Username,
 		UsedDefaultPassword:    admin.Spec.Auth.PasswordSecretRef == nil && (trimmedPw == "" || trimmedPw == "123456"),
@@ -1601,7 +2611,9 @@ func DecodeSyncedAdminEndpointMeta(conditions []metav1.Condition) *SyncedAdminEn
 			strings.TrimSpace(parsed.AdminUID) == "" &&
 			strings.TrimSpace(parsed.AdminURL) == "" &&
 			strings.TrimSpace(parsed.DatasourceHash) == "" &&
+			strings.TrimSpace(parsed.LegacyDatasourceHash) == "" &&
 			!parsed.ManagedInCluster &&
+			!parsed.ModeCaptured &&
 			!parsed.AuthCaptured {
 			continue
 		}
@@ -1611,33 +2623,88 @@ func DecodeSyncedAdminEndpointMeta(conditions []metav1.Condition) *SyncedAdminEn
 }
 
 type adminOrigin struct {
-	name   string
-	url    string
-	uid    string
-	dbHash string
+	name            string
+	url             string
+	uid             string
+	dbHash          string
+	altDBHash       string
+	managedKnown    bool
+	managed         bool
+	explicitManaged bool
+}
+
+func isClusterLocalAdminOriginURL(rawURL, adminName string) bool {
+	rawURL = strings.TrimSpace(rawURL)
+	adminName = strings.TrimSpace(adminName)
+	if rawURL == "" || adminName == "" {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	prefix := strings.ToLower(adminName) + "."
+	suffix := ".svc.cluster.local"
+	if !strings.HasPrefix(host, prefix) || !strings.HasSuffix(host, suffix) || len(host) <= len(prefix)+len(suffix) {
+		return false
+	}
+	nsPart := host[len(prefix) : len(host)-len(suffix)]
+	return nsPart != "" && !strings.Contains(nsPart, ".")
+}
+
+func normalizeAdminOrigin(o adminOrigin) adminOrigin {
+	if o.dbHash == "" && o.altDBHash != "" {
+		o.dbHash = o.altDBHash
+		o.altDBHash = ""
+	}
+	if o.dbHash != "" {
+		o.managedKnown = true
+		o.managed = true
+		o.explicitManaged = true
+	} else if !o.managedKnown && o.name != "" && o.url != "" && isClusterLocalAdminOriginURL(o.url, o.name) {
+		o.managedKnown = true
+		o.managed = true
+	}
+	return o
 }
 
 func (o adminOrigin) hasAny() bool {
-	return o.name != "" || o.url != "" || o.uid != "" || o.dbHash != ""
+	return o.name != "" || o.url != "" || o.uid != "" || o.dbHash != "" || o.altDBHash != ""
 }
 
 func (o adminOrigin) key() string {
-	base := CanonicalAdminOriginKey(o.name, o.url, o.uid)
-	if o.dbHash == "" {
+	norm := normalizeAdminOrigin(o)
+	base := CanonicalAdminOriginKey(norm.name, norm.url, norm.uid)
+	if norm.dbHash == "" {
+		if norm.explicitManaged && norm.managed {
+			if base == "" {
+				return "db=empty"
+			}
+			return base + "|db=empty"
+		}
 		return base
 	}
 	if base == "" {
-		return "db=" + o.dbHash
+		return "db=" + norm.dbHash
 	}
-	return base + "|db=" + o.dbHash
+	return base + "|db=" + norm.dbHash
 }
 
 func adminOriginMoreSpecific(a, b adminOrigin) bool {
+	a = normalizeAdminOrigin(a)
+	b = normalizeAdminOrigin(b)
 	if (a.uid != "") != (b.uid != "") {
 		return a.uid != ""
 	}
 	if (a.dbHash != "") != (b.dbHash != "") {
 		return a.dbHash != ""
+	}
+	if a.explicitManaged != b.explicitManaged {
+		return a.explicitManaged
+	}
+	if (a.altDBHash != "") != (b.altDBHash != "") {
+		return a.altDBHash != ""
 	}
 	if (a.url != "") != (b.url != "") {
 		return a.url != ""
@@ -1650,6 +2717,12 @@ func adminOriginMoreSpecific(a, b adminOrigin) bool {
 	}
 	if a.dbHash != b.dbHash {
 		return a.dbHash < b.dbHash
+	}
+	if a.managed != b.managed {
+		return a.managed
+	}
+	if a.altDBHash != b.altDBHash {
+		return a.altDBHash < b.altDBHash
 	}
 	if a.url != b.url {
 		return a.url < b.url
@@ -1702,12 +2775,18 @@ func extractSyncedEndpointOrigin(conds []metav1.Condition, targetURL string) adm
 	if parsed == nil {
 		return adminOrigin{}
 	}
-	o := adminOrigin{
-		name:   strings.TrimSpace(parsed.AdminName),
-		url:    strings.TrimRight(strings.TrimSpace(parsed.AdminURL), "/"),
-		uid:    strings.TrimSpace(parsed.AdminUID),
-		dbHash: strings.TrimSpace(parsed.DatasourceHash),
-	}
+	explicitMode := parsed.HasExplicitMode()
+	isManaged := parsed.ManagedInCluster || parsed.HasDatasourceHash()
+	o := normalizeAdminOrigin(adminOrigin{
+		name:            strings.TrimSpace(parsed.AdminName),
+		url:             strings.TrimRight(strings.TrimSpace(parsed.AdminURL), "/"),
+		uid:             strings.TrimSpace(parsed.AdminUID),
+		dbHash:          strings.TrimSpace(parsed.DatasourceHash),
+		altDBHash:       strings.TrimSpace(parsed.LegacyDatasourceHash),
+		managedKnown:    explicitMode || isManaged,
+		managed:         isManaged,
+		explicitManaged: explicitMode,
+	})
 	if !o.hasAny() {
 		return adminOrigin{}
 	}
@@ -1719,7 +2798,7 @@ func extractSyncedEndpointOrigin(conds []metav1.Condition, targetURL string) adm
 	}
 	if o.url == "" && (o.name != "" || o.uid != "") {
 		o.url = targetURL
-		return o
+		return normalizeAdminOrigin(o)
 	}
 	return adminOrigin{}
 }
@@ -1793,20 +2872,30 @@ func (s *Server) resolveExecutorOrigin(
 		return adminOrigin{}
 	}
 
-	adminDBHashForURL := func(admin *xxljobv1alpha1.XxlJobAdmin, candidateURL string) string {
-		if admin == nil {
-			return ""
-		}
-		isPureExternal := strings.TrimSpace(admin.Spec.ExternalURL) != "" && strings.TrimSpace(admin.Spec.Image) == ""
-		if isPureExternal {
-			return ""
+	adminDBHashesForURL := func(admin *xxljobv1alpha1.XxlJobAdmin, candidateURL string) (string, string) {
+		if admin == nil || isPureExternalAdminSpec(admin) {
+			return "", ""
 		}
 		if candidateURL != "" &&
 			candidateURL != resolveAdminURLForOrigin(admin) &&
 			!IsClusterLocalAdminServiceURL(candidateURL, admin.Name, admin.Namespace) {
-			return ""
+			return "", ""
 		}
-		return DatasourceURLHash(admin.Spec.Datasource.URL)
+		canon := DatasourceURLHash(admin.Spec.Datasource.URL)
+		alt := ""
+		if raw := LegacyRawDatasourceURLHash(admin.Spec.Datasource.URL); raw != "" && raw != canon {
+			alt = raw
+		}
+		if canon != "" {
+			if admMeta := DecodeSyncedAdminEndpointMeta(admin.Status.Conditions); admMeta != nil &&
+				(admMeta.AdminUID == "" || admin.UID == "" || strings.TrimSpace(admMeta.AdminUID) == string(admin.UID)) &&
+				strings.TrimSpace(admMeta.DatasourceHash) == canon &&
+				strings.TrimSpace(admMeta.LegacyDatasourceHash) != "" &&
+				strings.TrimSpace(admMeta.LegacyDatasourceHash) != canon {
+				alt = strings.TrimSpace(admMeta.LegacyDatasourceHash)
+			}
+		}
+		return canon, alt
 	}
 
 	var specAdminCR xxljobv1alpha1.XxlJobAdmin
@@ -1820,26 +2909,41 @@ func (s *Server) resolveExecutorOrigin(
 	if hasSpecAdmin {
 		specAdminURL := resolveAdminURLForOrigin(&specAdminCR)
 		specAdminUID := strings.TrimSpace(string(specAdminCR.UID))
+		specIsManaged := !isPureExternalAdminSpec(&specAdminCR)
 		if activeSyncedURL == "" || activeSyncedURL == specAdminURL || adminPreviouslyOwnedURL(&specAdminCR, activeSyncedURL) {
 			effectiveURL := activeSyncedURL
 			if effectiveURL == "" {
 				effectiveURL = specAdminURL
 			}
-			effectiveDBHash := ""
-			if effectiveURL == specAdminURL {
-				effectiveDBHash = adminDBHashForURL(&specAdminCR, effectiveURL)
-			} else if condOrigin := lookupConditionOrigin(effectiveURL); condOrigin.dbHash != "" &&
-				condOrigin.name == specAdminCR.Name && (condOrigin.uid == "" || condOrigin.uid == specAdminUID) {
-				effectiveDBHash = condOrigin.dbHash
-			} else {
-				effectiveDBHash = adminDBHashForURL(&specAdminCR, effectiveURL)
+			effectiveManaged := specIsManaged
+			effectiveDBHash, effectiveAltDBHash := adminDBHashesForURL(&specAdminCR, effectiveURL)
+			if condOrigin := lookupConditionOrigin(effectiveURL); condOrigin.hasAny() &&
+				condOrigin.name == specAdminCR.Name &&
+				(condOrigin.uid == "" || condOrigin.uid == specAdminUID) {
+				if condOrigin.explicitManaged && condOrigin.managed != specIsManaged {
+					effectiveManaged = condOrigin.managed
+					effectiveDBHash = condOrigin.dbHash
+					effectiveAltDBHash = condOrigin.altDBHash
+				} else if specIsManaged &&
+					condOrigin.dbHash != "" &&
+					!sameOriginDBHash(adminOrigin{dbHash: effectiveDBHash, altDBHash: effectiveAltDBHash}, condOrigin) {
+					effectiveDBHash = condOrigin.dbHash
+					effectiveAltDBHash = condOrigin.altDBHash
+				} else if specIsManaged && condOrigin.explicitManaged && condOrigin.dbHash == "" && effectiveDBHash != "" {
+					effectiveDBHash = ""
+					effectiveAltDBHash = ""
+				}
 			}
-			return adminOrigin{
-				name:   specAdminCR.Name,
-				url:    effectiveURL,
-				uid:    specAdminUID,
-				dbHash: effectiveDBHash,
-			}
+			return normalizeAdminOrigin(adminOrigin{
+				name:            specAdminCR.Name,
+				url:             effectiveURL,
+				uid:             specAdminUID,
+				dbHash:          effectiveDBHash,
+				altDBHash:       effectiveAltDBHash,
+				managedKnown:    true,
+				managed:         effectiveManaged,
+				explicitManaged: true,
+			})
 		}
 
 		// Pre-reconcile transition: Spec.AdminRef or ExternalURL / Port / ContextPath changed before Status.AdminURL reconciled.
@@ -1847,23 +2951,42 @@ func (s *Server) resolveExecutorOrigin(
 		if condOrigin := lookupConditionOrigin(activeSyncedURL); condOrigin.hasAny() {
 			if condOrigin.name == specAdminCR.Name && (condOrigin.uid == "" || condOrigin.uid == specAdminUID) {
 				dbHash := condOrigin.dbHash
-				if dbHash == "" {
-					dbHash = adminDBHashForURL(&specAdminCR, activeSyncedURL)
+				altDBHash := condOrigin.altDBHash
+				managed := condOrigin.managed
+				if !condOrigin.explicitManaged {
+					managed = specIsManaged
+					if dbHash == "" {
+						dbHash, altDBHash = adminDBHashesForURL(&specAdminCR, activeSyncedURL)
+					}
 				}
-				return adminOrigin{name: specAdminCR.Name, url: activeSyncedURL, uid: specAdminUID, dbHash: dbHash}
+				return normalizeAdminOrigin(adminOrigin{
+					name:            specAdminCR.Name,
+					url:             activeSyncedURL,
+					uid:             specAdminUID,
+					dbHash:          dbHash,
+					altDBHash:       altDBHash,
+					managedKnown:    true,
+					managed:         managed,
+					explicitManaged: true,
+				})
 			}
 			if condOrigin.uid == "" && condOrigin.name != "" && ns != "" {
 				var prevCR xxljobv1alpha1.XxlJobAdmin
 				if err := s.apiReader().Get(ctx, client.ObjectKey{Namespace: ns, Name: condOrigin.name}, &prevCR); err == nil {
 					if resolveAdminURLForOrigin(&prevCR) == activeSyncedURL || adminPreviouslyOwnedURL(&prevCR, activeSyncedURL) {
 						condOrigin.uid = strings.TrimSpace(string(prevCR.UID))
-						if condOrigin.dbHash == "" {
-							condOrigin.dbHash = adminDBHashForURL(&prevCR, activeSyncedURL)
+						if !condOrigin.explicitManaged {
+							condOrigin.managedKnown = true
+							condOrigin.managed = !isPureExternalAdminSpec(&prevCR)
+							condOrigin.explicitManaged = true
+							if condOrigin.dbHash == "" {
+								condOrigin.dbHash, condOrigin.altDBHash = adminDBHashesForURL(&prevCR, activeSyncedURL)
+							}
 						}
 					}
 				}
 			}
-			return condOrigin
+			return normalizeAdminOrigin(condOrigin)
 		}
 		if ns != "" {
 			var adminList xxljobv1alpha1.XxlJobAdminList
@@ -1871,32 +2994,38 @@ func (s *Server) resolveExecutorOrigin(
 				for i := range adminList.Items {
 					item := &adminList.Items[i]
 					if resolveAdminURLForOrigin(item) == activeSyncedURL || adminPreviouslyOwnedURL(item, activeSyncedURL) {
-						return adminOrigin{
-							name:   item.Name,
-							url:    activeSyncedURL,
-							uid:    strings.TrimSpace(string(item.UID)),
-							dbHash: adminDBHashForURL(item, activeSyncedURL),
-						}
+						dbHash, altDBHash := adminDBHashesForURL(item, activeSyncedURL)
+						return normalizeAdminOrigin(adminOrigin{
+							name:            item.Name,
+							url:             activeSyncedURL,
+							uid:             strings.TrimSpace(string(item.UID)),
+							dbHash:          dbHash,
+							altDBHash:       altDBHash,
+							managedKnown:    true,
+							managed:         !isPureExternalAdminSpec(item),
+							explicitManaged: true,
+						})
 					}
 				}
 			}
 		}
-		return adminOrigin{url: activeSyncedURL}
+		return normalizeAdminOrigin(adminOrigin{url: activeSyncedURL})
 	}
 
 	if condOrigin := lookupConditionOrigin(activeSyncedURL); condOrigin.hasAny() {
-		return condOrigin
+		return normalizeAdminOrigin(condOrigin)
 	}
-	return adminOrigin{
+	return normalizeAdminOrigin(adminOrigin{
 		name: specAdminName,
 		url:  activeSyncedURL,
-	}
+	})
 }
 
 func stampOriginatingAdminOrigin(job *batchv1.Job, origin adminOrigin) {
 	if job == nil {
 		return
 	}
+	origin = normalizeAdminOrigin(origin)
 	if job.Annotations == nil {
 		job.Annotations = make(map[string]string)
 	}
@@ -1909,8 +3038,14 @@ func stampOriginatingAdminOrigin(job *batchv1.Job, origin adminOrigin) {
 	if origin.uid != "" {
 		job.Annotations[AnnotationAdminUID] = origin.uid
 	}
+	if origin.explicitManaged {
+		job.Annotations[AnnotationAdminManaged] = strconv.FormatBool(origin.managed)
+	}
 	if origin.dbHash != "" {
 		job.Annotations[AnnotationAdminDatasourceHash] = origin.dbHash
+	}
+	if origin.altDBHash != "" && origin.altDBHash != origin.dbHash {
+		job.Annotations[AnnotationAdminLegacyDatasourceHash] = origin.altDBHash
 	}
 }
 
@@ -1976,32 +3111,73 @@ func extractJobAdminOrigin(j *batchv1.Job) adminOrigin {
 	if j == nil || j.Annotations == nil {
 		return adminOrigin{}
 	}
-	return adminOrigin{
-		name:   strings.TrimSpace(j.Annotations[AnnotationAdminName]),
-		url:    strings.TrimRight(strings.TrimSpace(j.Annotations[AnnotationAdminURL]), "/"),
-		uid:    strings.TrimSpace(j.Annotations[AnnotationAdminUID]),
-		dbHash: strings.TrimSpace(j.Annotations[AnnotationAdminDatasourceHash]),
+	o := adminOrigin{
+		name:      strings.TrimSpace(j.Annotations[AnnotationAdminName]),
+		url:       strings.TrimRight(strings.TrimSpace(j.Annotations[AnnotationAdminURL]), "/"),
+		uid:       strings.TrimSpace(j.Annotations[AnnotationAdminUID]),
+		dbHash:    strings.TrimSpace(j.Annotations[AnnotationAdminDatasourceHash]),
+		altDBHash: strings.TrimSpace(j.Annotations[AnnotationAdminLegacyDatasourceHash]),
 	}
+	switch strings.ToLower(strings.TrimSpace(j.Annotations[AnnotationAdminManaged])) {
+	case "true":
+		o.managedKnown = true
+		o.managed = true
+		o.explicitManaged = true
+	case "false":
+		o.managedKnown = true
+		o.managed = false
+		o.explicitManaged = true
+	}
+	return normalizeAdminOrigin(o)
 }
 
 func jobHasAdminOrigin(j *batchv1.Job) bool {
 	return extractJobAdminOrigin(j).hasAny()
 }
 
-func sameManagedAdminOrigin(a, b adminOrigin) bool {
+func sameOriginDBHash(a, b adminOrigin) bool {
+	a = normalizeAdminOrigin(a)
+	b = normalizeAdminOrigin(b)
+	if a.dbHash == "" || b.dbHash == "" {
+		return a.dbHash == b.dbHash
+	}
+	if a.dbHash == b.dbHash {
+		return true
+	}
+	if a.altDBHash != "" && (a.altDBHash == b.dbHash || a.altDBHash == b.altDBHash) {
+		return true
+	}
+	if b.altDBHash != "" && b.altDBHash == a.dbHash {
+		return true
+	}
+	return false
+}
+
+func sameManagedAdminOriginWithDB(a, b adminOrigin, dbMatches bool) bool {
+	a = normalizeAdminOrigin(a)
+	b = normalizeAdminOrigin(b)
 	if a.name == "" || a.name != b.name {
 		return false
 	}
 	if a.uid != "" && b.uid != "" && a.uid != b.uid {
 		return false
 	}
-	if a.dbHash == "" || b.dbHash == "" || a.dbHash != b.dbHash {
+	if a.managedKnown && b.managedKnown && (!a.managed || !b.managed) {
+		return false
+	}
+	if a.dbHash == "" || b.dbHash == "" || !dbMatches {
 		return false
 	}
 	return a.url != "" && b.url != ""
 }
 
-func sameAdminOrigin(a, b adminOrigin) bool {
+func sameManagedAdminOrigin(a, b adminOrigin) bool {
+	return sameManagedAdminOriginWithDB(a, b, sameOriginDBHash(a, b))
+}
+
+func sameAdminOriginWithKnownDB(a, b adminOrigin, knownDBMatch bool) bool {
+	a = normalizeAdminOrigin(a)
+	b = normalizeAdminOrigin(b)
 	if !a.hasAny() || !b.hasAny() {
 		return true
 	}
@@ -2011,10 +3187,20 @@ func sameAdminOrigin(a, b adminOrigin) bool {
 	if a.name != "" && b.name != "" && a.name != b.name {
 		return false
 	}
-	if a.dbHash != "" && b.dbHash != "" && a.dbHash != b.dbHash {
+	if a.managedKnown && b.managedKnown && a.managed != b.managed {
 		return false
 	}
-	if sameManagedAdminOrigin(a, b) {
+	dbMatch := knownDBMatch || sameOriginDBHash(a, b)
+	if a.dbHash != "" && b.dbHash != "" && !dbMatch {
+		return false
+	}
+	if (a.dbHash == "") != (b.dbHash == "") {
+		if (a.dbHash == "" && (a.explicitManaged || (a.uid != "" && !a.managedKnown))) ||
+			(b.dbHash == "" && (b.explicitManaged || (b.uid != "" && !b.managedKnown))) {
+			return false
+		}
+	}
+	if sameManagedAdminOriginWithDB(a, b, dbMatch) {
 		return true
 	}
 	if a.url != "" && b.url != "" && a.url != b.url {
@@ -2023,7 +3209,11 @@ func sameAdminOrigin(a, b adminOrigin) bool {
 	return (a.uid != "" && a.uid == b.uid) ||
 		(a.url != "" && a.url == b.url) ||
 		(a.name != "" && a.name == b.name) ||
-		(a.dbHash != "" && a.dbHash == b.dbHash)
+		(a.dbHash != "" && b.dbHash != "" && dbMatch)
+}
+
+func sameAdminOrigin(a, b adminOrigin) bool {
+	return sameAdminOriginWithKnownDB(a, b, false)
 }
 
 // SameSyncedAdminOrigin reports whether two recorded endpoint status pairs (ConditionAdminEndpointSynced + Status.AdminURL)
@@ -2477,6 +3667,16 @@ func (s *Server) hasRunningJobForOrigin(ctx context.Context, namespace, executor
 		if !matchesExecutorJobAnnotation(j, executorName) || !jobMatchesExecutorOrigin(j, origin) {
 			continue
 		}
+		if !j.DeletionTimestamp.IsZero() {
+			draining, drainErr := isDeletingJobDrainingPods(ctx, s.apiReader(), j)
+			if drainErr != nil {
+				return false, drainErr
+			}
+			if draining {
+				return true, nil
+			}
+			continue
+		}
 		if isJobBlockingExecution(j) {
 			return true, nil
 		}
@@ -2509,6 +3709,185 @@ func isJobBlockingExecution(job *batchv1.Job) bool {
 		return false
 	}
 	return true
+}
+
+func jobContainsFinalizer(job *batchv1.Job, target string) bool {
+	if job == nil {
+		return false
+	}
+	for _, f := range job.Finalizers {
+		if f == target {
+			return true
+		}
+	}
+	return false
+}
+
+// PodBelongsToJob reports whether pod is owned by job. When job.UID is populated (all real Kubernetes API
+// objects) or pod.OwnerReferences is non-empty, a matching Job OwnerReference is strictly required so Pods
+// orphaned by GarbageCollector (--cascade=orphan, which strips OwnerReferences while leaving batch labels intact)
+// and Pods owned by ReplicaSets/StatefulSets/other Jobs are never matched; synthetic unit-test Jobs with empty UID
+// and empty OwnerReferences still fall back to batch Job labels.
+func PodBelongsToJob(pod *corev1.Pod, job *batchv1.Job) bool {
+	if pod == nil || job == nil || pod.Namespace != job.Namespace || job.Name == "" {
+		return false
+	}
+	if len(pod.OwnerReferences) > 0 {
+		for i := range pod.OwnerReferences {
+			ref := &pod.OwnerReferences[i]
+			if ref.Kind != "Job" || ref.Name != job.Name {
+				continue
+			}
+			if job.UID != "" && ref.UID != "" && ref.UID != job.UID {
+				continue
+			}
+			if ref.APIVersion != "" && ref.APIVersion != batchv1.SchemeGroupVersion.String() && !strings.HasPrefix(ref.APIVersion, "batch/") {
+				continue
+			}
+			return true
+		}
+		return false
+	}
+	if job.UID != "" {
+		return false
+	}
+	if pod.Labels == nil {
+		return false
+	}
+	jobNameLbl := strings.TrimSpace(pod.Labels["batch.kubernetes.io/job-name"])
+	if jobNameLbl == "" {
+		jobNameLbl = strings.TrimSpace(pod.Labels["job-name"])
+	}
+	return jobNameLbl == job.Name
+}
+
+// IsOrphanDeletingJob reports whether a deleting Job requested --cascade=orphan Pod preservation
+// (either via metav1.FinalizerOrphanDependents or persisted AnnotationOrphanPodsRequested after GC removes "orphan").
+func IsOrphanDeletingJob(job *batchv1.Job) bool {
+	if job == nil || job.DeletionTimestamp.IsZero() {
+		return false
+	}
+	if jobContainsFinalizer(job, metav1.FinalizerOrphanDependents) {
+		return true
+	}
+	return job.Annotations != nil && job.Annotations[AnnotationOrphanPodsRequested] == "true"
+}
+
+func podWasOrphanedFromJob(pod *corev1.Pod, job *batchv1.Job) bool {
+	if pod == nil || job == nil || job.UID == "" || pod.Namespace != job.Namespace || len(pod.OwnerReferences) > 0 || pod.Labels == nil {
+		return false
+	}
+	uidStr := string(job.UID)
+	if strings.TrimSpace(pod.Labels["batch.kubernetes.io/controller-uid"]) == uidStr ||
+		strings.TrimSpace(pod.Labels["controller-uid"]) == uidStr {
+		return true
+	}
+	return false
+}
+
+// IsPodTerminal reports whether pod has reached a terminal phase (Succeeded or Failed).
+func IsPodTerminal(pod *corev1.Pod) bool {
+	if pod == nil {
+		return true
+	}
+	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
+}
+
+// ListOwnedAndOrphanedJobPodsAuthoritative lists Pods owned by job in job.Namespace (scoped by job.Spec.Selector when present),
+// reports whether any Pod originally created by job.UID had its OwnerReferences stripped (--cascade=orphan), and reports
+// whether the Pod list result is authoritative for a real API Job (job.UID != "" and corev1.Pod GVK registered in reader).
+func ListOwnedAndOrphanedJobPodsAuthoritative(ctx context.Context, reader client.Reader, job *batchv1.Job) ([]corev1.Pod, bool, bool, error) {
+	if reader == nil || job == nil || job.Namespace == "" || job.Name == "" {
+		return nil, false, false, nil
+	}
+	listOpts := []client.ListOption{client.InNamespace(job.Namespace)}
+	if job.Spec.Selector != nil && (len(job.Spec.Selector.MatchLabels) > 0 || len(job.Spec.Selector.MatchExpressions) > 0) {
+		if sel, selErr := metav1.LabelSelectorAsSelector(job.Spec.Selector); selErr == nil {
+			listOpts = append(listOpts, client.MatchingLabelsSelector{Selector: sel})
+		}
+	}
+	var podList corev1.PodList
+	if err := reader.List(ctx, &podList, listOpts...); err != nil {
+		if runtime.IsNotRegisteredError(err) {
+			return nil, false, false, nil
+		}
+		return nil, false, false, err
+	}
+	authoritative := job.UID != ""
+	if len(podList.Items) == 0 {
+		return nil, false, authoritative, nil
+	}
+	owned := make([]corev1.Pod, 0, len(podList.Items))
+	orphaned := false
+	for i := range podList.Items {
+		if PodBelongsToJob(&podList.Items[i], job) {
+			owned = append(owned, podList.Items[i])
+		} else if podWasOrphanedFromJob(&podList.Items[i], job) {
+			orphaned = true
+		}
+	}
+	return owned, orphaned, authoritative, nil
+}
+
+// ListOwnedAndOrphanedJobPods lists Pods owned by job in job.Namespace (scoped by job.Spec.Selector when present)
+// and also reports whether any Pod originally created by job.UID has had its OwnerReferences stripped by
+// Kubernetes GarbageCollector (--cascade=orphan), ignoring unregistered Pod GVK errors in minimal unit-test schemes.
+func ListOwnedAndOrphanedJobPods(ctx context.Context, reader client.Reader, job *batchv1.Job) ([]corev1.Pod, bool, error) {
+	owned, orphaned, _, err := ListOwnedAndOrphanedJobPodsAuthoritative(ctx, reader, job)
+	return owned, orphaned, err
+}
+
+// ListOwnedJobPods lists Pods owned by job in job.Namespace, scoping the API query via job.Spec.Selector
+// when present and ignoring unregistered Pod GVK errors in minimal unit-test schemes.
+func ListOwnedJobPods(ctx context.Context, reader client.Reader, job *batchv1.Job) ([]corev1.Pod, error) {
+	owned, _, err := ListOwnedAndOrphanedJobPods(ctx, reader, job)
+	return owned, err
+}
+
+// HasLiveJobPods reports whether any non-terminal Pod owned by job still exists in etcd.
+func HasLiveJobPods(ctx context.Context, reader client.Reader, job *batchv1.Job) (bool, error) {
+	pods, err := ListOwnedJobPods(ctx, reader, job)
+	if err != nil {
+		return false, err
+	}
+	for i := range pods {
+		if !IsPodTerminal(&pods[i]) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func isDeletingJobDrainingPods(ctx context.Context, reader client.Reader, job *batchv1.Job) (bool, error) {
+	if job == nil || !isCompletedJobStillDrainingPods(job) {
+		return false, nil
+	}
+	if IsOrphanDeletingJob(job) {
+		return false, nil
+	}
+	if !job.DeletionTimestamp.IsZero() &&
+		!jobContainsFinalizer(job, metav1.FinalizerDeleteDependents) &&
+		reader != nil {
+		owned, orphaned, authoritative, err := ListOwnedAndOrphanedJobPodsAuthoritative(ctx, reader, job)
+		if err != nil {
+			return false, err
+		}
+		if orphaned {
+			return false, nil
+		}
+		if authoritative || len(owned) > 0 || (job.Annotations != nil && job.Annotations[AnnotationBackgroundPodsTerminating] == "true") {
+			for i := range owned {
+				if !IsPodTerminal(&owned[i]) {
+					return true, nil
+				}
+			}
+			return false, nil
+		}
+	}
+	if HasActiveOrTerminatingPods(job) {
+		return true, nil
+	}
+	return false, nil
 }
 
 // HasActiveOrTerminatingPods reports whether a batch/v1.Job still has active or terminating Pods,

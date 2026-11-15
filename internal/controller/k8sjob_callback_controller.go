@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
@@ -42,6 +43,7 @@ type K8sJobCallbackReconciler struct {
 
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
 
 func (r *K8sJobCallbackReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -77,8 +79,18 @@ func (r *K8sJobCallbackReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			patch := client.MergeFrom(job.DeepCopy())
 			suspend := true
 			job.Spec.Suspend = &suspend
-			_ = r.Patch(ctx, &job, patch)
+			if patchErr := r.Patch(ctx, &job, patch); patchErr != nil && !apierrors.IsNotFound(patchErr) {
+				return ctrl.Result{}, patchErr
+			}
 		}
+
+		// Under default Background deletion (kubectl delete job without --cascade=foreground), Kubernetes JobController
+		// stops managing Pods once DeletionTimestamp is set while GarbageCollector waits for JobCallbackFinalizer to be
+		// removed before sweeping child Pods. Actively delete non-terminal owned Pods so Background deletion never deadlocks,
+		// while preserving Pods when --cascade=orphan was requested.
+		ownedBgPods, orphanRequested, livePodsRemain, bgPodsAuthoritative, podCleanupErr := r.terminateBackgroundDeletingJobPods(ctx, reader, &job)
+		trackedBgPods := !orphanRequested && (ownedBgPods > 0 || livePodsRemain ||
+			(job.Annotations != nil && job.Annotations[proxyexecutor.AnnotationBackgroundPodsTerminating] == "true"))
 
 		if controllerutil.ContainsFinalizer(&job, proxyexecutor.JobCallbackFinalizer) {
 			callbackSent := job.Annotations != nil && job.Annotations[proxyexecutor.AnnotationCallbackSent] == "true"
@@ -95,6 +107,9 @@ func (r *K8sJobCallbackReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				}
 				if err := r.deliverCallback(ctx, reader, &job, succeeded, failed, msg); err != nil {
 					if !shouldBypassRemoteCleanup(ctx, reader, &job) {
+						if orphanRequested && (job.Annotations == nil || job.Annotations[proxyexecutor.AnnotationOrphanPodsRequested] != "true") {
+							_ = r.persistJobCallbackState(ctx, reader, &job, false, false, false, true)
+						}
 						logger.Error(err, "Failed to deliver callback for deleting K8s Job, will retry", "job", job.Name)
 						return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 					}
@@ -105,26 +120,41 @@ func (r *K8sJobCallbackReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				clearCallbackPending(job.Namespace, execLabel, job.Name)
 			}
 
+			podsStillDraining := podCleanupErr != nil || livePodsRemain
+			if !podsStillDraining {
+				if orphanRequested || (isBackgroundDeletingJob(&job) && (trackedBgPods || bgPodsAuthoritative)) {
+					podsStillDraining = false
+				} else {
+					podsStillDraining = proxyexecutor.HasActiveOrTerminatingPods(&job)
+				}
+			}
+
 			// Retain JobCallbackFinalizer while the deleting Job still has active or terminating Pods so the Job stays
 			// in etcd until its Pods exit and AdvanceSerialQueueWithReader can wake the next queued SERIAL_EXECUTION Job (fixes R8-P1-1).
-			if proxyexecutor.HasActiveOrTerminatingPods(&job) && !shouldBypassRemoteCleanup(ctx, reader, &job) {
-				if !callbackSent {
-					if err := r.persistJobCallbackState(ctx, reader, &job, true, false); err != nil && !apierrors.IsNotFound(err) {
+			if podsStillDraining && !shouldBypassRemoteCleanup(ctx, reader, &job) {
+				needStateUpdate := !callbackSent ||
+					(trackedBgPods && (job.Annotations == nil || job.Annotations[proxyexecutor.AnnotationBackgroundPodsTerminating] != "true")) ||
+					(orphanRequested && (job.Annotations == nil || job.Annotations[proxyexecutor.AnnotationOrphanPodsRequested] != "true"))
+				if needStateUpdate {
+					if err := r.persistJobCallbackState(ctx, reader, &job, true, false, trackedBgPods, orphanRequested); err != nil && !apierrors.IsNotFound(err) {
 						return ctrl.Result{}, err
 					}
+				}
+				if podCleanupErr != nil {
+					logger.Error(podCleanupErr, "Failed to delete Pods for background-deleting K8s Job, will retry", "job", job.Name)
 				}
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
 
 			if err := proxyexecutor.AdvanceSerialQueueWithReader(ctx, reader, r.Client, job.Namespace, execLabel, jobIDLabel); err != nil {
 				if !callbackSent {
-					_ = r.persistJobCallbackState(ctx, reader, &job, true, false)
+					_ = r.persistJobCallbackState(ctx, reader, &job, true, false, trackedBgPods, orphanRequested)
 				}
 				logger.Error(err, "Failed to advance SERIAL_EXECUTION queue on Job deletion", "job", job.Name)
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
 
-			if err := r.persistJobCallbackState(ctx, reader, &job, true, true); err != nil && !apierrors.IsNotFound(err) {
+			if err := r.persistJobCallbackState(ctx, reader, &job, true, true, trackedBgPods, orphanRequested); err != nil && !apierrors.IsNotFound(err) {
 				return ctrl.Result{}, err
 			}
 			if err := proxyexecutor.AdvanceSerialQueueWithReader(ctx, reader, r.Client, job.Namespace, execLabel, jobIDLabel); err != nil {
@@ -135,6 +165,9 @@ func (r *K8sJobCallbackReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 
 		clearCallbackPending(job.Namespace, execLabel, job.Name)
+		if (podCleanupErr != nil || livePodsRemain) && !shouldBypassRemoteCleanup(ctx, reader, &job) {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
 		if err := proxyexecutor.AdvanceSerialQueueWithReader(ctx, reader, r.Client, job.Namespace, execLabel, jobIDLabel); err != nil {
 			logger.Error(err, "Failed to advance SERIAL_EXECUTION queue on Job deletion", "job", job.Name)
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
@@ -283,20 +316,96 @@ func (r *K8sJobCallbackReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	return ctrl.Result{}, nil
 }
 
+func isBackgroundDeletingJob(job *batchv1.Job) bool {
+	if job == nil || job.DeletionTimestamp.IsZero() {
+		return false
+	}
+	return !controllerutil.ContainsFinalizer(job, metav1.FinalizerDeleteDependents) &&
+		!proxyexecutor.IsOrphanDeletingJob(job)
+}
+
+func (r *K8sJobCallbackReconciler) terminateBackgroundDeletingJobPods(
+	ctx context.Context,
+	reader client.Reader,
+	job *batchv1.Job,
+) (int, bool, bool, bool, error) {
+	if proxyexecutor.IsOrphanDeletingJob(job) {
+		return 0, true, false, false, nil
+	}
+	if !isBackgroundDeletingJob(job) {
+		return 0, false, false, false, nil
+	}
+	pods, orphaned, authoritative, err := proxyexecutor.ListOwnedAndOrphanedJobPodsAuthoritative(ctx, reader, job)
+	if err != nil {
+		return 0, false, false, false, err
+	}
+	if orphaned {
+		return 0, true, false, authoritative, nil
+	}
+	liveRemain := false
+	var firstErr error
+	for i := range pods {
+		pod := &pods[i]
+		if proxyexecutor.IsPodTerminal(pod) {
+			continue
+		}
+		if pod.DeletionTimestamp.IsZero() {
+			if delErr := r.Delete(ctx, pod); delErr != nil {
+				if apierrors.IsNotFound(delErr) {
+					continue
+				}
+				if firstErr == nil {
+					firstErr = delErr
+				}
+				liveRemain = true
+				continue
+			}
+			var latestPod corev1.Pod
+			if getErr := reader.Get(ctx, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, &latestPod); getErr != nil {
+				if apierrors.IsNotFound(getErr) {
+					continue
+				}
+				if firstErr == nil {
+					firstErr = getErr
+				}
+				liveRemain = true
+				continue
+			}
+			if !proxyexecutor.IsPodTerminal(&latestPod) {
+				liveRemain = true
+			}
+			continue
+		}
+		liveRemain = true
+	}
+	return len(pods), orphaned, liveRemain, authoritative, firstErr
+}
+
 func (r *K8sJobCallbackReconciler) persistJobCallbackState(
 	ctx context.Context,
 	reader client.Reader,
 	job *batchv1.Job,
 	markCallbackSent bool,
 	removeFinalizer bool,
+	extraFlags ...bool,
 ) error {
+	setBgPods := len(extraFlags) > 0 && extraFlags[0]
+	setOrphan := len(extraFlags) > 1 && extraFlags[1]
 	current := job.DeepCopy()
 	for attempt := 0; attempt < 4; attempt++ {
-		if markCallbackSent {
+		if markCallbackSent || setBgPods || setOrphan {
 			if current.Annotations == nil {
 				current.Annotations = make(map[string]string)
 			}
-			current.Annotations[proxyexecutor.AnnotationCallbackSent] = "true"
+			if markCallbackSent {
+				current.Annotations[proxyexecutor.AnnotationCallbackSent] = "true"
+			}
+			if setBgPods {
+				current.Annotations[proxyexecutor.AnnotationBackgroundPodsTerminating] = "true"
+			}
+			if setOrphan {
+				current.Annotations[proxyexecutor.AnnotationOrphanPodsRequested] = "true"
+			}
 		}
 		if removeFinalizer {
 			controllerutil.RemoveFinalizer(current, proxyexecutor.JobCallbackFinalizer)
@@ -378,7 +487,9 @@ func (r *K8sJobCallbackReconciler) deliverCallback(
 	var origAdminName string
 	var origAdminURL string
 	var origAdminUID string
+	var origAdminManaged string
 	var origAdminDBHash string
+	var origAdminLegacyDBHash string
 	var logID int64
 	var logDateTime int64
 
@@ -390,7 +501,9 @@ func (r *K8sJobCallbackReconciler) deliverCallback(
 		origAdminName = strings.TrimSpace(job.Annotations[proxyexecutor.AnnotationAdminName])
 		origAdminURL = strings.TrimRight(strings.TrimSpace(job.Annotations[proxyexecutor.AnnotationAdminURL]), "/")
 		origAdminUID = strings.TrimSpace(job.Annotations[proxyexecutor.AnnotationAdminUID])
+		origAdminManaged = strings.TrimSpace(job.Annotations[proxyexecutor.AnnotationAdminManaged])
 		origAdminDBHash = strings.TrimSpace(job.Annotations[proxyexecutor.AnnotationAdminDatasourceHash])
+		origAdminLegacyDBHash = strings.TrimSpace(job.Annotations[proxyexecutor.AnnotationAdminLegacyDatasourceHash])
 		logID, _ = strconv.ParseInt(job.Annotations[proxyexecutor.AnnotationLogID], 10, 64)
 		logDateTime, _ = strconv.ParseInt(job.Annotations[proxyexecutor.AnnotationLogDateTime], 10, 64)
 	}
@@ -418,7 +531,10 @@ func (r *K8sJobCallbackReconciler) deliverCallback(
 		execName = job.Labels[proxyexecutor.LabelExecutorName]
 	}
 
-	xxlCli, matchedAdmin, err := r.resolveCallbackAdminClient(ctx, reader, ns, execName, origAdminName, origAdminURL, origAdminUID, origAdminDBHash)
+	xxlCli, matchedAdmin, err := r.resolveCallbackAdminClient(
+		ctx, reader, ns, execName,
+		origAdminName, origAdminURL, origAdminUID, origAdminManaged, origAdminDBHash, origAdminLegacyDBHash,
+	)
 	bypassOriginAdmin := matchedAdmin != nil && !matchedAdmin.DeletionTimestamp.IsZero() && shouldBypassRemoteCleanup(ctx, reader, matchedAdmin)
 	if err != nil {
 		if bypassOriginAdmin {
@@ -457,30 +573,74 @@ func (r *K8sJobCallbackReconciler) deliverCallback(
 	return err
 }
 
+func buildCallbackSavedMeta(
+	namespace, origAdminName, origAdminURL, origAdminUID, origAdminManaged, origAdminDBHash, origAdminLegacyDBHash string,
+	adminCR *xxljobv1alpha1.XxlJobAdmin,
+) *syncedAdminEndpointMeta {
+	if origAdminName == "" && origAdminUID == "" && origAdminManaged == "" && origAdminDBHash == "" && origAdminLegacyDBHash == "" {
+		return nil
+	}
+	hasDBHash := origAdminDBHash != "" || origAdminLegacyDBHash != ""
+	managedInCluster := false
+	modeCaptured := false
+	switch strings.ToLower(origAdminManaged) {
+	case "true":
+		managedInCluster = true
+		modeCaptured = true
+	case "false":
+		managedInCluster = hasDBHash
+		modeCaptured = true
+	default:
+		if hasDBHash {
+			managedInCluster = true
+			modeCaptured = true
+		} else if origAdminName != "" && origAdminURL != "" && proxyexecutor.IsClusterLocalAdminServiceURL(origAdminURL, origAdminName, namespace) {
+			managedInCluster = true
+			modeCaptured = origAdminUID != ""
+		} else if origAdminUID != "" {
+			if recMeta := lookupPreUpgradeAdminEndpointMeta(adminCR, origAdminURL); recMeta != nil &&
+				recMeta.HasExplicitMode() && recMeta.ManagedInCluster && !recMeta.HasDatasourceHash() {
+				managedInCluster = true
+			} else {
+				managedInCluster = false
+			}
+			modeCaptured = true
+		}
+	}
+	return &syncedAdminEndpointMeta{
+		AdminName:            origAdminName,
+		AdminUID:             origAdminUID,
+		AdminURL:             origAdminURL,
+		ManagedInCluster:     managedInCluster,
+		ModeCaptured:         modeCaptured,
+		DatasourceHash:       origAdminDBHash,
+		LegacyDatasourceHash: origAdminLegacyDBHash,
+	}
+}
+
 func (r *K8sJobCallbackReconciler) resolveCallbackAdminClient(
 	ctx context.Context,
 	reader client.Reader,
-	namespace, execName, origAdminName, origAdminURL, origAdminUID, origAdminDBHash string,
+	namespace, execName, origAdminName, origAdminURL, origAdminUID, origAdminManaged, origAdminDBHash, origAdminLegacyDBHash string,
 ) (*xxlclient.Client, *xxljobv1alpha1.XxlJobAdmin, error) {
+	if reader == nil {
+		reader = r.Client
+	}
 	// 1. When the Job recorded its originating XxlJobAdmin at trigger time, route /api/callback strictly to that
 	// originating Admin even if XxlJobExecutor.Spec.AdminRef was migrated or XxlJobAdmin.Spec.ExternalURL / Port /
 	// ContextPath was edited in place while the Job was in flight (fixes EG2-09).
 	if origAdminName != "" || origAdminURL != "" {
-		var savedMeta *syncedAdminEndpointMeta
-		if origAdminName != "" || origAdminUID != "" || origAdminDBHash != "" {
-			savedMeta = &syncedAdminEndpointMeta{
-				AdminName:        origAdminName,
-				AdminUID:         origAdminUID,
-				AdminURL:         origAdminURL,
-				ManagedInCluster: origAdminDBHash != "",
-				DatasourceHash:   origAdminDBHash,
-			}
-		}
+		savedMeta := buildCallbackSavedMeta(
+			namespace, origAdminName, origAdminURL, origAdminUID, origAdminManaged, origAdminDBHash, origAdminLegacyDBHash, nil,
+		)
 		if origAdminName != "" {
 			adminCR, cli, err := ResolveAdminAndClientWithReader(
-				ctx, r.Client, reader, r.ClientFactory,
+				ctx, reader, reader, r.ClientFactory,
 				xxljobv1alpha1.LocalObjectReference{Name: origAdminName},
 				namespace,
+			)
+			savedMeta = buildCallbackSavedMeta(
+				namespace, origAdminName, origAdminURL, origAdminUID, origAdminManaged, origAdminDBHash, origAdminLegacyDBHash, adminCR,
 			)
 			sameUID := origAdminUID == "" || adminCR == nil || adminCR.UID == "" || string(adminCR.UID) == origAdminUID
 			sameDB := !isAdminInstanceOrDBReplaced(adminCR, savedMeta)
@@ -508,15 +668,20 @@ func (r *K8sJobCallbackReconciler) resolveCallbackAdminClient(
 		}
 		if origAdminURL != "" {
 			matchedAdmin, cli, err := resolveReachablePreviousAdminClient(
-				ctx, r.Client, reader, r.ClientFactory,
+				ctx, reader, reader, r.ClientFactory,
 				namespace, origAdminURL, savedMeta, origAdminName,
 			)
+			if matchedAdmin != nil && origAdminManaged == "" {
+				savedMeta = buildCallbackSavedMeta(
+					namespace, origAdminName, origAdminURL, origAdminUID, origAdminManaged, origAdminDBHash, origAdminLegacyDBHash, matchedAdmin,
+				)
+			}
 			if matchedAdmin != nil && origAdminUID != "" && matchedAdmin.UID != "" && string(matchedAdmin.UID) != origAdminUID {
 				return nil, nil, nil
 			}
 			if matchedAdmin != nil && isSameManagedAdminDBUpdate(matchedAdmin, origAdminURL, savedMeta) {
 				updatedAdmin, updatedCli, updatedErr := ResolveAdminAndClientWithReader(
-					ctx, r.Client, reader, r.ClientFactory,
+					ctx, reader, reader, r.ClientFactory,
 					xxljobv1alpha1.LocalObjectReference{Name: matchedAdmin.Name},
 					namespace,
 				)
@@ -545,7 +710,7 @@ func (r *K8sJobCallbackReconciler) resolveCallbackAdminClient(
 		}
 		return nil, nil, err
 	}
-	adminCR, cli, err := ResolveAdminAndClientWithReader(ctx, r.Client, reader, r.ClientFactory, execCR.Spec.AdminRef, namespace)
+	adminCR, cli, err := ResolveAdminAndClientWithReader(ctx, reader, reader, r.ClientFactory, execCR.Spec.AdminRef, namespace)
 	if err != nil {
 		return nil, adminCR, err
 	}
@@ -621,7 +786,38 @@ func shouldBypassCompletedJobCleanup(ctx context.Context, reader client.Reader, 
 	return false
 }
 
-// SetupWithManager sets up the K8sJobCallbackReconciler with label filtering on managed batch/v1.Jobs.
+func jobPodLifecyclePredicate() predicate.Predicate {
+	isManagedJobPod := func(obj client.Object) bool {
+		if obj == nil {
+			return false
+		}
+		labels := obj.GetLabels()
+		return labels != nil && labels[proxyexecutor.LabelManagedBy] == proxyexecutor.ManagedByValue
+	}
+	return predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool {
+			return false
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldPod, ok1 := e.ObjectOld.(*corev1.Pod)
+			newPod, ok2 := e.ObjectNew.(*corev1.Pod)
+			if !ok1 || !ok2 || !isManagedJobPod(newPod) {
+				return false
+			}
+			return !proxyexecutor.IsPodTerminal(oldPod) && proxyexecutor.IsPodTerminal(newPod)
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return isManagedJobPod(e.Object)
+		},
+		GenericFunc: func(event.GenericEvent) bool {
+			return false
+		},
+	}
+}
+
+// SetupWithManager sets up the K8sJobCallbackReconciler with label filtering on managed batch/v1.Jobs
+// and terminal/delete event notifications on owned corev1.Pods so Background-deleted Jobs release
+// callback-guard and advance SERIAL_EXECUTION immediately when owned Pods exit.
 func (r *K8sJobCallbackReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	managedJobPredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		labels := obj.GetLabels()
@@ -630,5 +826,6 @@ func (r *K8sJobCallbackReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		WithOptions(ctrlcontroller.Options{MaxConcurrentReconciles: 4}).
 		For(&batchv1.Job{}, builder.WithPredicates(managedJobPredicate)).
+		Owns(&corev1.Pod{}, builder.WithPredicates(jobPodLifecyclePredicate())).
 		Complete(r)
 }

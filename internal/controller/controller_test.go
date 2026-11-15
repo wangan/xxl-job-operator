@@ -19,11 +19,13 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -6358,6 +6360,2451 @@ func TestAdversarialReviewManagedSameURLDBSwapHybridAndRestartAuthRotation(t *te
 		muOld.Unlock()
 		if remOldGroups != 0 || remOldJobs != 0 {
 			t.Fatalf("expected srvOld fully cleaned up after restart, remaining groups=%d jobs=%d", remOldGroups, remOldJobs)
+		}
+	})
+}
+
+func TestCodexRound2ReviewRegressions(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = rbacv1.AddToScheme(scheme)
+	_ = xxljobv1alpha1.AddToScheme(scheme)
+
+	// 1. Default Background Job deletion (kubectl delete job without --cascade=foreground) actively deletes
+	// non-terminal owned Pods, preserves terminal & foreign Pods, gates SERIAL_EXECUTION until terminating
+	// Pods exit, and config/manager/manager.yaml grants delete on pods without granting delete on endpoints/namespaces.
+	t.Run("BackgroundJobDeleteTerminatesOwnedPodsAndGatesSerialQueue", func(t *testing.T) {
+		manifestBytes, readErr := os.ReadFile(filepath.Join("..", "..", "config", "manager", "manager.yaml"))
+		if readErr != nil {
+			t.Fatalf("read config/manager/manager.yaml: %v", readErr)
+		}
+		decoder := k8syaml.NewYAMLOrJSONDecoder(strings.NewReader(string(manifestBytes)), 4096)
+		foundClusterRole := false
+		podHasDelete := false
+		for {
+			var raw map[string]any
+			if decErr := decoder.Decode(&raw); decErr != nil {
+				break
+			}
+			if raw == nil || raw["kind"] != "ClusterRole" {
+				continue
+			}
+			rawJSON, _ := json.Marshal(raw)
+			var cr rbacv1.ClusterRole
+			if err := json.Unmarshal(rawJSON, &cr); err != nil {
+				t.Fatalf("unmarshal ClusterRole: %v", err)
+			}
+			foundClusterRole = true
+			for _, rule := range cr.Rules {
+				hasCoreGroup := false
+				for _, g := range rule.APIGroups {
+					if g == "" {
+						hasCoreGroup = true
+					}
+				}
+				if !hasCoreGroup {
+					continue
+				}
+				hasVerbDelete := false
+				for _, v := range rule.Verbs {
+					if v == "delete" || v == "*" {
+						hasVerbDelete = true
+					}
+				}
+				for _, res := range rule.Resources {
+					if res == "pods" && hasVerbDelete {
+						podHasDelete = true
+					}
+					if (res == "endpoints" || res == "namespaces") && hasVerbDelete {
+						t.Fatalf("least-privilege violation: ClusterRole grants delete on %q", res)
+					}
+				}
+			}
+		}
+		if !foundClusterRole || !podHasDelete {
+			t.Fatalf("expected ClusterRole in config/manager/manager.yaml to grant delete on pods (foundRole=%v podHasDelete=%v)", foundClusterRole, podHasDelete)
+		}
+
+		var failCB atomic.Bool
+		failCB.Store(true)
+		srv, mu, _, _, _, cbs := setupTestAdminServer(t, &failCB)
+		defer srv.Close()
+
+		admin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "bg-del-admin", Namespace: "default", UID: types.UID("uid-bg-del")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srv.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "bg-del-tok"},
+			},
+			Status: xxljobv1alpha1.XxlJobAdminStatus{AdminURL: srv.URL},
+		}
+
+		suspendFalse := false
+		suspendTrue := true
+		isController := true
+		jobUID := types.UID("uid-bg-job-1")
+		delJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName("bg-del-exec", 77, 1),
+				Namespace:  "default",
+				UID:        jobUID,
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel("bg-del-exec"),
+					proxyexecutor.LabelJobID:        "77",
+					proxyexecutor.LabelLogID:        "1",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:  "bg-del-exec",
+					proxyexecutor.AnnotationAdminName:     admin.Name,
+					proxyexecutor.AnnotationAdminUID:      string(admin.UID),
+					proxyexecutor.AnnotationAdminURL:      srv.URL,
+					proxyexecutor.AnnotationLogID:         "1",
+					proxyexecutor.AnnotationLogDateTime:   "1700000000001",
+					proxyexecutor.AnnotationBlockStrategy: "SERIAL_EXECUTION",
+				},
+			},
+			Spec: batchv1.JobSpec{
+				Suspend: &suspendFalse,
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"batch.kubernetes.io/controller-uid": string(jobUID),
+					},
+				},
+			},
+			Status: batchv1.JobStatus{Active: 1},
+		}
+		nextJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName("bg-del-exec", 77, 2),
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel("bg-del-exec"),
+					proxyexecutor.LabelJobID:        "77",
+					proxyexecutor.LabelLogID:        "2",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:  "bg-del-exec",
+					proxyexecutor.AnnotationAdminName:     admin.Name,
+					proxyexecutor.AnnotationAdminUID:      string(admin.UID),
+					proxyexecutor.AnnotationAdminURL:      srv.URL,
+					proxyexecutor.AnnotationLogID:         "2",
+					proxyexecutor.AnnotationLogDateTime:   "1700000000002",
+					proxyexecutor.AnnotationBlockStrategy: "SERIAL_EXECUTION",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendTrue},
+		}
+
+		ownedRunningPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       delJob.Name + "-run",
+				Namespace:  "default",
+				Finalizers: []string{"test.io/kubelet-grace"},
+				Labels: map[string]string{
+					"batch.kubernetes.io/controller-uid": string(jobUID),
+					"batch.kubernetes.io/job-name":       delJob.Name,
+					"job-name":                           delJob.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       "Job",
+					Name:       delJob.Name,
+					UID:        jobUID,
+					Controller: &isController,
+				}},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		ownedPendingPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      delJob.Name + "-pending",
+				Namespace: "default",
+				Labels: map[string]string{
+					"batch.kubernetes.io/controller-uid": string(jobUID),
+					"batch.kubernetes.io/job-name":       delJob.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       "Job",
+					Name:       delJob.Name,
+					UID:        jobUID,
+					Controller: &isController,
+				}},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodPending},
+		}
+		ownedTerminalPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      delJob.Name + "-succeeded",
+				Namespace: "default",
+				Labels: map[string]string{
+					"batch.kubernetes.io/controller-uid": string(jobUID),
+					"batch.kubernetes.io/job-name":       delJob.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       "Job",
+					Name:       delJob.Name,
+					UID:        jobUID,
+					Controller: &isController,
+				}},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+		}
+		foreignRSPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "unrelated-rs-pod",
+				Namespace: "default",
+				Labels: map[string]string{
+					// Even if a malicious/misconfigured Pod copied the controller-uid label, its ReplicaSet OwnerReference must protect it!
+					"batch.kubernetes.io/controller-uid": string(jobUID),
+					"job-name":                           delJob.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "apps/v1",
+					Kind:       "ReplicaSet",
+					Name:       "web-rs",
+					UID:        types.UID("uid-rs"),
+					Controller: &isController,
+				}},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(admin, delJob, nextJob, ownedRunningPod, ownedPendingPod, ownedTerminalPod, foreignRSPod).
+			WithStatusSubresource(&batchv1.Job{}, &corev1.Pod{}).
+			Build()
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+
+		// Issue default Background delete (NO PropagationPolicy -> NO foregroundDeletion finalizer!).
+		if err := k8sCli.Delete(ctx, delJob); err != nil {
+			t.Fatalf("background delete job: %v", err)
+		}
+
+		// 1st Reconcile while Admin callback fails (HTTP 500): owned non-terminal Pods MUST still be deleted immediately!
+		res1, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: delJob.Name}})
+		if err != nil || res1.RequeueAfter == 0 {
+			t.Fatalf("expected retry requeue while callback fails, got res=%+v err=%v", res1, err)
+		}
+		var checkPending corev1.Pod
+		if getErr := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: ownedPendingPod.Name}, &checkPending); !apierrors.IsNotFound(getErr) {
+			t.Fatalf("expected ownedPendingPod deleted immediately on 1st reconcile, got err=%v", getErr)
+		}
+		var checkRunning corev1.Pod
+		if getErr := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: ownedRunningPod.Name}, &checkRunning); getErr != nil || checkRunning.DeletionTimestamp.IsZero() {
+			t.Fatalf("expected ownedRunningPod to have DeletionTimestamp set on 1st reconcile, got pod=%+v err=%v", checkRunning, getErr)
+		}
+		var checkSucceeded, checkForeign corev1.Pod
+		if getErr := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: ownedTerminalPod.Name}, &checkSucceeded); getErr != nil || !checkSucceeded.DeletionTimestamp.IsZero() {
+			t.Fatalf("expected terminal Succeeded Pod preserved untouched, got pod=%+v err=%v", checkSucceeded, getErr)
+		}
+		if getErr := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: foreignRSPod.Name}, &checkForeign); getErr != nil || !checkForeign.DeletionTimestamp.IsZero() {
+			t.Fatalf("expected foreign ReplicaSet Pod preserved untouched, got pod=%+v err=%v", checkForeign, getErr)
+		}
+
+		// 2nd Reconcile: Admin recovers (failCB=false), but ownedRunningPod is still gracefully terminating!
+		failCB.Store(false)
+		res2, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: delJob.Name}})
+		if err != nil || res2.RequeueAfter != 2*time.Second {
+			t.Fatalf("expected 2s requeue while ownedRunningPod is still terminating, got res=%+v err=%v", res2, err)
+		}
+		mu.Lock()
+		gotCBs := len(*cbs)
+		mu.Unlock()
+		if gotCBs != 1 {
+			t.Fatalf("expected 1 failure callback delivered on 2nd reconcile, got %d", gotCBs)
+		}
+		var checkNext batchv1.Job
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: nextJob.Name}, &checkNext)
+		if checkNext.Spec.Suspend == nil || !*checkNext.Spec.Suspend {
+			t.Fatalf("expected next SERIAL_EXECUTION Job to stay suspended while ownedRunningPod is still terminating")
+		}
+
+		// Simulate kubelet finishing container termination (removing test.io/kubelet-grace finalizer).
+		// Notice we intentionally do NOT mutate delJob.Status.Active (still 1 in fake.Client, matching real JobController skipping deleting Jobs)!
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: ownedRunningPod.Name}, &checkRunning)
+		checkRunning.Finalizers = nil
+		if err := k8sCli.Update(ctx, &checkRunning); err != nil {
+			t.Fatalf("release kubelet finalizer on ownedRunningPod: %v", err)
+		}
+
+		// 3rd Reconcile: JobCallbackFinalizer is removed, delJob is GC'd, and nextJob unsuspends!
+		res3, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: delJob.Name}})
+		if err != nil || res3.RequeueAfter != 0 {
+			t.Fatalf("expected clean completion once ownedRunningPod exited, got res=%+v err=%v", res3, err)
+		}
+		var checkDelJob batchv1.Job
+		if getErr := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: delJob.Name}, &checkDelJob); !apierrors.IsNotFound(getErr) {
+			t.Fatalf("expected delJob to be completely removed after Pod exit, still exists: %+v", checkDelJob)
+		}
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: nextJob.Name}, &checkNext)
+		if checkNext.Spec.Suspend != nil && *checkNext.Spec.Suspend {
+			t.Fatalf("expected next SERIAL_EXECUTION Job to unsuspend once background-deleting Job's Pods exited")
+		}
+		mu.Lock()
+		finalCBs := len(*cbs)
+		mu.Unlock()
+		if finalCBs != 1 {
+			t.Fatalf("expected callback delivered exactly once across reconciles, got %d", finalCBs)
+		}
+	})
+
+	// 2. Reordering equivalent JDBC query options (even simultaneously with an in-place Port edit) preserves
+	// shared DB JobGroup/JobInfo continuity AND routes in-flight batch/v1.Job completion callbacks to the live Admin.
+	t.Run("JdbcOptionReorderingPreservesInFlightCallbackAndAvoidsUnnecessaryMigration", func(t *testing.T) {
+		sharedSrv, sharedMu, _, sharedGroups, sharedJobs, sharedCBs := setupTestAdminServer(t, nil)
+		defer sharedSrv.Close()
+
+		svc8080 := "http://jdbc-admin.default.svc.cluster.local:8080/xxl-job-admin"
+		svc8081 := "http://jdbc-admin.default.svc.cluster.local:8081/xxl-job-admin"
+		var liveEndpoint atomic.Value
+		liveEndpoint.Store(svc8080)
+
+		routingFactory := func(cfg xxlclient.Config) (*xxlclient.Client, error) {
+			currentLive := liveEndpoint.Load().(string)
+			if strings.TrimRight(cfg.BaseURL, "/") != currentLive {
+				return xxlclient.NewClient(xxlclient.Config{
+					BaseURL:     "http://127.0.0.1:1/dead-port",
+					Username:    cfg.Username,
+					Password:    cfg.Password,
+					AccessToken: cfg.AccessToken,
+					Timeout:     100 * time.Millisecond,
+				})
+			}
+			rewritten := cfg
+			rewritten.BaseURL = sharedSrv.URL
+			return xxlclient.NewClient(rewritten)
+		}
+
+		jdbcV1 := "jdbc:mysql://mysql.default.svc:3306/xxl_job?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai"
+		jdbcV2Reordered := "jdbc:mysql://MYSQL.default.svc/xxl_job?serverTimezone=Asia%2FShanghai&characterEncoding=UTF-8&useUnicode=true&"
+
+		adminCR := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "jdbc-admin", Namespace: "default", UID: types.UID("uid-jdbc-admin"), Generation: 1},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Image:       "xuxueli/xxl-job-admin:2.4.1",
+				Port:        8080,
+				ContextPath: "/xxl-job-admin",
+				Datasource: xxljobv1alpha1.DatasourceSpec{
+					URL:      jdbcV1,
+					Username: "root",
+					Password: "pw",
+				},
+				Auth: xxljobv1alpha1.AuthSpec{AccessToken: "jdbc-tok"},
+			},
+		}
+		execCR := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "jdbc-exec", Namespace: "default", Generation: 1},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: "jdbc-admin"},
+				AppName:  "jdbc-exec-app",
+				Title:    "JDBC Exec",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+		}
+		taskCR := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "jdbc-task", Namespace: "default", Generation: 1},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: "jdbc-exec"},
+				JobDesc:         "JDBC Reorder Task",
+				Author:          "ops",
+				ScheduleType:    "NONE",
+				ExecutorHandler: "jdbcHandler",
+				K8sJobTemplate:  &xxljobv1alpha1.K8sJobTemplateSpec{Image: "busybox:1.36"},
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(adminCR, execCR, taskCR).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+			Build()
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		execRec := &XxlJobExecutorReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: routingFactory}
+		taskRec := &XxlJobTaskReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: routingFactory}
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: routingFactory}
+
+		for i := 0; i < 2; i++ {
+			_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}})
+			_, _ = execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}})
+			_, _ = taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}})
+		}
+
+		var syncedTask xxljobv1alpha1.XxlJobTask
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: taskCR.Name}, &syncedTask)
+		origGroupID := syncedTask.Status.JobGroupID
+		origJobID := syncedTask.Status.JobID
+
+		// Spawn an in-flight batch/v1.Job recorded against jdbcV1 + svc8080.
+		suspendFalse := false
+		inFlightJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName(execCR.Name, origJobID, 701),
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel(execCR.Name),
+					proxyexecutor.LabelJobID:        strconv.Itoa(origJobID),
+					proxyexecutor.LabelLogID:        "701",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationTaskNamespace:       "default",
+					proxyexecutor.AnnotationTaskName:            taskCR.Name,
+					proxyexecutor.AnnotationExecutorName:        execCR.Name,
+					proxyexecutor.AnnotationAdminName:           adminCR.Name,
+					proxyexecutor.AnnotationAdminUID:            string(adminCR.UID),
+					proxyexecutor.AnnotationAdminURL:            svc8080,
+					proxyexecutor.AnnotationAdminDatasourceHash: proxyexecutor.DatasourceURLHash(jdbcV1),
+					proxyexecutor.AnnotationLogID:               "701",
+					proxyexecutor.AnnotationLogDateTime:         "1700000000701",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{
+				Succeeded:  1,
+				Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+			},
+		}
+		_ = k8sCli.Create(ctx, inFlightJob)
+		_ = k8sCli.Status().Update(ctx, inFlightJob)
+
+		// Reorder JDBC options AND update Port 8080 -> 8081 simultaneously!
+		var liveAdmin xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminCR.Name}, &liveAdmin)
+		liveAdmin.Spec.Datasource.URL = jdbcV2Reordered
+		liveAdmin.Spec.Port = 8081
+		liveAdmin.Generation++
+		_ = k8sCli.Update(ctx, &liveAdmin)
+		liveEndpoint.Store(svc8081)
+
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}}); err != nil {
+			t.Fatalf("admin reconcile after JDBC option reorder: %v", err)
+		}
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execCR.Name}}); err != nil {
+			t.Fatalf("exec reconcile after JDBC option reorder must not treat equivalent URL as DB replacement: %v", err)
+		}
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskCR.Name}}); err != nil {
+			t.Fatalf("task reconcile after JDBC option reorder: %v", err)
+		}
+
+		// Deliver completion callback for inFlightJob: MUST route to live svc8081 and succeed!
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: inFlightJob.Name}}); err != nil {
+			t.Fatalf("callback reconcile after JDBC option reorder failed: %v", err)
+		}
+		sharedMu.Lock()
+		_, grpStillExists := sharedGroups[origGroupID]
+		_, jobStillExists := sharedJobs[origJobID]
+		gotCBs := len(*sharedCBs)
+		sharedMu.Unlock()
+		if !grpStillExists || !jobStillExists || gotCBs != 1 {
+			t.Fatalf("expected shared DB JobGroup (%v) & JobInfo (%v) preserved and 1 in-flight callback delivered (%d)",
+				grpStillExists, jobStillExists, gotCBs)
+		}
+	})
+
+	// 3. Saved Admin identity (AdminName/AdminUID) takes priority over generic URL matching when another
+	// XxlJobAdmin shares prevAdminURL, preserving per-Admin auth snapshots and blocking cross-Admin leakage.
+	t.Run("SavedAdminIdentityTakesPriorityOverSharedURLAliasOnCallbackAndCleanup", func(t *testing.T) {
+		var oldCBsFromA atomic.Int32
+		var wrongAuthHits atomic.Int32
+		srvSharedOld := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Path == "/login" {
+				_ = r.ParseForm()
+				u := r.FormValue("userName")
+				p := r.FormValue("password")
+				switch {
+				case u == "user-a" && p == "pass-a-v1":
+					http.SetCookie(w, &http.Cookie{Name: "XXL_JOB_LOGIN_IDENTITY", Value: "cookie-a-v1", Path: "/"})
+					_, _ = w.Write([]byte(`{"code":200}`))
+				case u == "user-b" && p == "pass-b":
+					http.SetCookie(w, &http.Cookie{Name: "XXL_JOB_LOGIN_IDENTITY", Value: "cookie-b", Path: "/"})
+					_, _ = w.Write([]byte(`{"code":200}`))
+				default:
+					wrongAuthHits.Add(1)
+					_, _ = w.Write([]byte(`{"code":500,"msg":"bad login"}`))
+				}
+				return
+			}
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				if r.Header.Get("XXL-JOB-ACCESS-TOKEN") != "tok-a-v1" {
+					wrongAuthHits.Add(1)
+					_, _ = w.Write([]byte(`{"code":500,"msg":"wrong access token"}`))
+					return
+				}
+				if r.URL.Path == "/api/callback" {
+					oldCBsFromA.Add(1)
+				}
+				_, _ = w.Write([]byte(`{"code":200}`))
+				return
+			}
+			// Admin console endpoints (/jobgroup/*, /jobinfo/*): verify cookie belongs to Admin A when cleaning up Admin A's CRs!
+			if c, err := r.Cookie("XXL_JOB_LOGIN_IDENTITY"); err == nil && c.Value == "cookie-b" && (r.URL.Path == "/jobgroup/remove" || r.URL.Path == "/jobinfo/remove") {
+				wrongAuthHits.Add(1)
+				_, _ = w.Write([]byte(`{"code":500,"msg":"wrong admin cookie on remove"}`))
+				return
+			}
+			switch r.URL.Path {
+			case "/jobgroup/pageList":
+				_, _ = w.Write([]byte(`{"recordsTotal":1,"recordsFiltered":1,"data":[{"id":11,"appname":"shared-exec-a-app","title":"ExecA","addressType":1}]}`))
+			case "/jobinfo/pageList":
+				_, _ = w.Write([]byte(`{"recordsTotal":1,"recordsFiltered":1,"data":[{"id":22,"jobGroup":11,"jobDesc":"TaskA [xxljob-task:default/shared-task-a]","executorHandler":"hA"}]}`))
+			default:
+				_, _ = w.Write([]byte(`{"code":200,"content":"22"}`))
+			}
+		}))
+		defer srvSharedOld.Close()
+
+		srvNewA, _, _, _, _, _ := setupTestAdminServer(t, nil)
+		defer srvNewA.Close()
+
+		adminA := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "shared-admin-a", Namespace: "default", UID: types.UID("uid-shared-a"), Generation: 1},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srvSharedOld.URL,
+				Auth: xxljobv1alpha1.AuthSpec{
+					Username:    "user-a",
+					Password:    "pass-a-v1",
+					AccessToken: "tok-a-v1",
+				},
+			},
+		}
+		adminB := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "shared-admin-b", Namespace: "default", UID: types.UID("uid-shared-b"), Generation: 1},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srvSharedOld.URL,
+				Auth: xxljobv1alpha1.AuthSpec{
+					Username:    "user-b",
+					Password:    "pass-b",
+					AccessToken: "tok-b",
+				},
+			},
+		}
+		execA := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "shared-exec-a", Namespace: "default", Generation: 1},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: adminA.Name},
+				AppName:  "shared-exec-a-app",
+				Title:    "ExecA",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+		}
+		taskA := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "shared-task-a", Namespace: "default", Generation: 1},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: execA.Name},
+				JobDesc:         "TaskA",
+				Author:          "ops",
+				ScheduleType:    "NONE",
+				ExecutorHandler: "hA",
+				K8sJobTemplate:  &xxljobv1alpha1.K8sJobTemplateSpec{Image: "busybox:1.36"},
+			},
+		}
+
+		// Put shared-admin-a and shared-admin-b into fake client; reconcile Admin A + Exec A + Task A,
+		// and THEN reconcile Admin B (and resolve its client) so Admin B overwrites the shared URL key in endpointAuthCache!
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(adminB, adminA, execA, taskA).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+			Build()
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		execRec := &XxlJobExecutorReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		taskRec := &XxlJobTaskReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+
+		for i := 0; i < 2; i++ {
+			_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminA.Name}})
+			_, _ = execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execA.Name}})
+			_, _ = taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskA.Name}})
+			_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminB.Name}})
+		}
+		// Explicitly populate Admin B's snapshot on srvSharedOld.URL AFTER Admin A's!
+		_, _, _ = ResolveAdminAndClientWithReader(ctx, k8sCli, k8sCli, nil, xxljobv1alpha1.LocalObjectReference{Name: adminB.Name}, "default")
+
+		// Create a completed in-flight Job from Admin A on srvSharedOld.URL.
+		suspendFalse := false
+		jobFromA := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName(execA.Name, 22, 801),
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel(execA.Name),
+					proxyexecutor.LabelJobID:        "22",
+					proxyexecutor.LabelLogID:        "801",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationTaskNamespace: "default",
+					proxyexecutor.AnnotationTaskName:      taskA.Name,
+					proxyexecutor.AnnotationExecutorName:  execA.Name,
+					proxyexecutor.AnnotationAdminName:     adminA.Name,
+					proxyexecutor.AnnotationAdminUID:      string(adminA.UID),
+					proxyexecutor.AnnotationAdminURL:      srvSharedOld.URL,
+					proxyexecutor.AnnotationLogID:         "801",
+					proxyexecutor.AnnotationLogDateTime:   "1700000000801",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{
+				Succeeded:  1,
+				Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+			},
+		}
+		_ = k8sCli.Create(ctx, jobFromA)
+		_ = k8sCli.Status().Update(ctx, jobFromA)
+
+		// Edit Admin A in place to srvNewA.URL AND simultaneously rotate inline credentials (pass-a-v2 / tok-a-v2),
+		// BEFORE XxlJobAdminReconciler runs on Admin A (while Admin B still has Spec.ExternalURL == srvSharedOld.URL!).
+		var liveA xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminA.Name}, &liveA)
+		liveA.Spec.ExternalURL = srvNewA.URL
+		liveA.Spec.Auth.Password = "pass-a-v2"
+		liveA.Spec.Auth.AccessToken = "tok-a-v2"
+		liveA.Generation++
+		_ = k8sCli.Update(ctx, &liveA)
+
+		// Deliver jobFromA's callback BEFORE Admin A reconciles: MUST pick Admin A (NOT Admin B!) and authenticate with tok-a-v1!
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: jobFromA.Name}}); err != nil {
+			t.Fatalf("callback reconcile when Admin B shares Admin A's old URL failed: %v", err)
+		}
+		if oldCBsFromA.Load() != 1 || wrongAuthHits.Load() != 0 {
+			t.Fatalf("expected 1 callback on srvSharedOld using Admin A's tok-a-v1 and 0 wrong auth hits, got cbs=%d wrongAuth=%d",
+				oldCBsFromA.Load(), wrongAuthHits.Load())
+		}
+
+		// Reconcile Admin A, Exec A, and Task A: previous-Admin cleanup on srvSharedOld MUST also use Admin A's saved auth (NOT Admin B's)!
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminA.Name}}); err != nil {
+			t.Fatalf("adminA reconcile: %v", err)
+		}
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execA.Name}}); err != nil {
+			t.Fatalf("execA migration reconcile failed: %v", err)
+		}
+		for i := 0; i < 2; i++ {
+			if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskA.Name}}); err != nil {
+				t.Fatalf("taskA migration reconcile failed: %v", err)
+			}
+		}
+		if wrongAuthHits.Load() != 0 {
+			t.Fatalf("expected 0 wrong auth hits during ExecA/TaskA cleanup on shared URL, got %d", wrongAuthHits.Load())
+		}
+
+		// Also verify: if Admin A is completely removed from K8s while Admin B remains at srvSharedOld.URL,
+		// a Job carrying AnnotationAdminName=shared-admin-a (even with empty AnnotationAdminUID) must NOT fall through to Admin B!
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminA.Name}, &liveA)
+		liveA.Finalizers = nil
+		_ = k8sCli.Update(ctx, &liveA)
+		_ = k8sCli.Delete(ctx, &liveA)
+
+		uidLessJobFromDeletedA := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName(execA.Name, 22, 802),
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel(execA.Name),
+					proxyexecutor.LabelJobID:        "22",
+					proxyexecutor.LabelLogID:        "802",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName: execA.Name,
+					proxyexecutor.AnnotationAdminName:    adminA.Name,
+					proxyexecutor.AnnotationAdminURL:     srvSharedOld.URL,
+					proxyexecutor.AnnotationLogID:        "802",
+					proxyexecutor.AnnotationLogDateTime:  "1700000000802",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{
+				Succeeded:  1,
+				Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+			},
+		}
+		_ = k8sCli.Create(ctx, uidLessJobFromDeletedA)
+		_ = k8sCli.Status().Update(ctx, uidLessJobFromDeletedA)
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: uidLessJobFromDeletedA.Name}}); err != nil {
+			t.Fatalf("reconcile uidLessJobFromDeletedA: %v", err)
+		}
+		if wrongAuthHits.Load() != 0 {
+			t.Fatalf("expected deleted Admin A's Job never to fall through to Admin B's credentials, got wrongAuth=%d", wrongAuthHits.Load())
+		}
+	})
+
+	// 4. Deleting managed XxlJobAdmin (retained by AdminFinalizer) after an in-place Port/ContextPath edit on the
+	// same database still delivers in-flight batch/v1.Job callbacks to the live endpoint.
+	t.Run("DeletingManagedAdminPreservesSameDBCallbackRouting", func(t *testing.T) {
+		sharedSrv, sharedMu, _, _, _, sharedCBs := setupTestAdminServer(t, nil)
+		defer sharedSrv.Close()
+
+		svc8080 := "http://del-mgr.default.svc.cluster.local:8080/xxl-job-admin"
+		svc8081 := "http://del-mgr.default.svc.cluster.local:8081/xxl-job-admin"
+		var liveEndpoint atomic.Value
+		liveEndpoint.Store(svc8080)
+
+		routingFactory := func(cfg xxlclient.Config) (*xxlclient.Client, error) {
+			currentLive := liveEndpoint.Load().(string)
+			if strings.TrimRight(cfg.BaseURL, "/") != currentLive {
+				return xxlclient.NewClient(xxlclient.Config{
+					BaseURL:     "http://127.0.0.1:1/dead-port",
+					Username:    cfg.Username,
+					Password:    cfg.Password,
+					AccessToken: cfg.AccessToken,
+					Timeout:     100 * time.Millisecond,
+				})
+			}
+			rewritten := cfg
+			rewritten.BaseURL = sharedSrv.URL
+			return xxlclient.NewClient(rewritten)
+		}
+
+		dbURL := "jdbc:mysql://mysql.default.svc:3306/xxl_job"
+		adminCR := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "del-mgr",
+				Namespace:  "default",
+				UID:        types.UID("uid-del-mgr"),
+				Finalizers: []string{AdminFinalizer},
+				Generation: 1,
+			},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Image:       "xuxueli/xxl-job-admin:2.4.1",
+				Port:        8080,
+				ContextPath: "/xxl-job-admin",
+				Datasource:  xxljobv1alpha1.DatasourceSpec{URL: dbURL, Username: "root", Password: "pw"},
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "del-mgr-tok"},
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(adminCR).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &batchv1.Job{}).
+			Build()
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: routingFactory}
+
+		for i := 0; i < 2; i++ {
+			_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}})
+		}
+
+		suspendFalse := false
+		inFlightJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName("del-mgr-exec", 15, 901),
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel("del-mgr-exec"),
+					proxyexecutor.LabelJobID:        "15",
+					proxyexecutor.LabelLogID:        "901",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:        "del-mgr-exec",
+					proxyexecutor.AnnotationAdminName:           adminCR.Name,
+					proxyexecutor.AnnotationAdminUID:            string(adminCR.UID),
+					proxyexecutor.AnnotationAdminURL:            svc8080,
+					proxyexecutor.AnnotationAdminDatasourceHash: proxyexecutor.DatasourceURLHash(dbURL),
+					proxyexecutor.AnnotationLogID:               "901",
+					proxyexecutor.AnnotationLogDateTime:         "1700000000901",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{
+				Succeeded:  1,
+				Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+			},
+		}
+		_ = k8sCli.Create(ctx, inFlightJob)
+		_ = k8sCli.Status().Update(ctx, inFlightJob)
+
+		// Update Port 8080 -> 8081 on the same DB, reconcile Admin, and then mark Admin for deletion (held by AdminFinalizer).
+		var liveAdmin xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminCR.Name}, &liveAdmin)
+		liveAdmin.Spec.Port = 8081
+		liveAdmin.Generation++
+		_ = k8sCli.Update(ctx, &liveAdmin)
+		liveEndpoint.Store(svc8081)
+		if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}}); err != nil {
+			t.Fatalf("admin reconcile after port change: %v", err)
+		}
+		if err := k8sCli.Delete(ctx, &liveAdmin); err != nil {
+			t.Fatalf("delete admin with finalizer: %v", err)
+		}
+
+		// Reconcile inFlightJob callback while liveAdmin has DeletionTimestamp != nil: MUST deliver callback to live svc8081!
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: inFlightJob.Name}}); err != nil {
+			t.Fatalf("callback reconcile for deleting managed Admin failed: %v", err)
+		}
+		sharedMu.Lock()
+		gotCBCount := len(*sharedCBs)
+		sharedMu.Unlock()
+		if gotCBCount != 1 {
+			t.Fatalf("expected in-flight callback routed to deleting managed Admin's live :8081 endpoint (1 callback), got %d", gotCBCount)
+		}
+	})
+
+	// 5. Rolling upgrade compatibility: in-flight Jobs carrying pre-canonicalization LegacyRawDatasourceURLHash
+	// for config/samples/01-xxljob-admin.yaml's JDBC URL still deliver callbacks (even across Port edits) instead of dropping them.
+	t.Run("RollingUpgradePreservesPreCanonicalDatasourceHashCallbacks", func(t *testing.T) {
+		sharedSrv, sharedMu, _, _, _, sharedCBs := setupTestAdminServer(t, nil)
+		defer sharedSrv.Close()
+
+		svc8080 := "http://upg-mgr.default.svc.cluster.local:8080/xxl-job-admin"
+		svc8081 := "http://upg-mgr.default.svc.cluster.local:8081/xxl-job-admin"
+		var liveEndpoint atomic.Value
+		liveEndpoint.Store(svc8080)
+
+		routingFactory := func(cfg xxlclient.Config) (*xxlclient.Client, error) {
+			if strings.TrimRight(cfg.BaseURL, "/") != liveEndpoint.Load().(string) {
+				return xxlclient.NewClient(xxlclient.Config{
+					BaseURL:     "http://127.0.0.1:1/unreachable",
+					Username:    cfg.Username,
+					Password:    cfg.Password,
+					AccessToken: cfg.AccessToken,
+					Timeout:     100 * time.Millisecond,
+				})
+			}
+			rewritten := cfg
+			rewritten.BaseURL = sharedSrv.URL
+			return xxlclient.NewClient(rewritten)
+		}
+
+		sampleURL := "jdbc:mysql://mysql.default.svc.cluster.local:3306/xxl_job?useUnicode=true&characterEncoding=UTF-8&autoReconnect=true&serverTimezone=Asia/Shanghai"
+		legacyRawHash := proxyexecutor.LegacyRawDatasourceURLHash(sampleURL)
+		if legacyRawHash == proxyexecutor.DatasourceURLHash(sampleURL) {
+			t.Fatalf("expected legacyRawHash to differ from canonical DatasourceURLHash for sampleURL")
+		}
+
+		adminCR := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "upg-mgr", Namespace: "default", UID: types.UID("uid-upg-mgr"), Generation: 1},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Image:       "xuxueli/xxl-job-admin:2.4.1",
+				Port:        8080,
+				ContextPath: "/xxl-job-admin",
+				Datasource:  xxljobv1alpha1.DatasourceSpec{URL: sampleURL, Username: "root", Password: "pw"},
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "upg-mgr-tok"},
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(adminCR).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &batchv1.Job{}).
+			Build()
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: routingFactory}
+		for i := 0; i < 2; i++ {
+			_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}})
+		}
+
+		suspendFalse := false
+		mkPreUpgradeJob := func(logID int64) *batchv1.Job {
+			logIDStr := strconv.FormatInt(logID, 10)
+			j := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       proxyexecutor.BuildJobName("upg-mgr-exec", 19, logID),
+					Namespace:  "default",
+					Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+					Labels: map[string]string{
+						proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+						proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel("upg-mgr-exec"),
+						proxyexecutor.LabelJobID:        "19",
+						proxyexecutor.LabelLogID:        logIDStr,
+					},
+					Annotations: map[string]string{
+						proxyexecutor.AnnotationExecutorName:        "upg-mgr-exec",
+						proxyexecutor.AnnotationAdminName:           adminCR.Name,
+						proxyexecutor.AnnotationAdminUID:            string(adminCR.UID),
+						proxyexecutor.AnnotationAdminURL:            svc8080,
+						proxyexecutor.AnnotationAdminDatasourceHash: legacyRawHash,
+						proxyexecutor.AnnotationLogID:               logIDStr,
+						proxyexecutor.AnnotationLogDateTime:         "1700000001000",
+					},
+				},
+				Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+				Status: batchv1.JobStatus{
+					Succeeded:  1,
+					Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+				},
+			}
+			_ = k8sCli.Create(ctx, j)
+			_ = k8sCli.Status().Update(ctx, j)
+			return j
+		}
+
+		job1 := mkPreUpgradeJob(951)
+		job2 := mkPreUpgradeJob(952)
+
+		// Deliver job1 directly on :8080 with pre-upgrade legacyRawHash -> MUST deliver callback!
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: job1.Name}}); err != nil {
+			t.Fatalf("reconcile job1 with legacyRawHash failed: %v", err)
+		}
+
+		// Edit Port 8080 -> 8081 without changing sampleURL -> job2 with legacyRawHash MUST route to live :8081!
+		var liveAdmin xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminCR.Name}, &liveAdmin)
+		liveAdmin.Spec.Port = 8081
+		liveAdmin.Generation++
+		_ = k8sCli.Update(ctx, &liveAdmin)
+		liveEndpoint.Store(svc8081)
+		_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminCR.Name}})
+
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: job2.Name}}); err != nil {
+			t.Fatalf("reconcile job2 with legacyRawHash after port change failed: %v", err)
+		}
+
+		sharedMu.Lock()
+		gotCBs := len(*sharedCBs)
+		sharedMu.Unlock()
+		if gotCBs != 2 {
+			t.Fatalf("expected both pre-upgrade legacyRawHash callbacks delivered (2), got %d", gotCBs)
+		}
+	})
+
+	// 6. Background deletion when owned Pod already reached terminal phase (Status.Active frozen at 1) AND
+	// --cascade=orphan Pod preservation (both before and after Kubernetes GarbageCollector strips OwnerReferences).
+	t.Run("BackgroundDeleteTerminalPodAndOrphanCascadeSafety", func(t *testing.T) {
+		pred := jobPodLifecyclePredicate()
+		unmanagedPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "other-pod", Namespace: "default"},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		managedRunningPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "mgr-pod",
+				Namespace: "default",
+				Labels:    map[string]string{proxyexecutor.LabelManagedBy: proxyexecutor.ManagedByValue},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		managedSucceededPod := managedRunningPod.DeepCopy()
+		managedSucceededPod.Status.Phase = corev1.PodSucceeded
+		if pred.Create(event.CreateEvent{Object: managedRunningPod}) {
+			t.Fatalf("expected jobPodLifecyclePredicate to ignore Pod Create")
+		}
+		if pred.Update(event.UpdateEvent{ObjectOld: managedRunningPod, ObjectNew: managedRunningPod.DeepCopy()}) {
+			t.Fatalf("expected jobPodLifecyclePredicate to ignore non-terminal Pod Update")
+		}
+		if !pred.Update(event.UpdateEvent{ObjectOld: managedRunningPod, ObjectNew: managedSucceededPod}) {
+			t.Fatalf("expected jobPodLifecyclePredicate to trigger when managed Pod transitions Running -> Succeeded")
+		}
+		if !pred.Delete(event.DeleteEvent{Object: managedRunningPod}) || pred.Delete(event.DeleteEvent{Object: unmanagedPod}) {
+			t.Fatalf("expected jobPodLifecyclePredicate Delete to match only managed Job Pods")
+		}
+
+		adminSrv, adminMu, _, _, _, cbs := setupTestAdminServer(t, nil)
+		defer adminSrv.Close()
+
+		adminCR := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "bg-term-admin", Namespace: "default", UID: types.UID("uid-bg-term")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: adminSrv.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "bg-term-tok"},
+			},
+		}
+
+		// Case A: Background-deleted SERIAL_EXECUTION Job 1 whose owned Pod ALREADY reached PodSucceeded while Job.Status.Active=1.
+		suspendFalse := false
+		suspendTrue := true
+		isCtrl := true
+		job1 := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName("bg-term-exec", 31, 1001),
+				Namespace:  "default",
+				UID:        types.UID("uid-bg-term-job1"),
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel("bg-term-exec"),
+					proxyexecutor.LabelJobID:        "31",
+					proxyexecutor.LabelLogID:        "1001",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:  "bg-term-exec",
+					proxyexecutor.AnnotationAdminName:     adminCR.Name,
+					proxyexecutor.AnnotationAdminUID:      string(adminCR.UID),
+					proxyexecutor.AnnotationAdminURL:      adminSrv.URL,
+					proxyexecutor.AnnotationLogID:         "1001",
+					proxyexecutor.AnnotationLogDateTime:   "1700000001001",
+					proxyexecutor.AnnotationBlockStrategy: "SERIAL_EXECUTION",
+				},
+			},
+			Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{Active: 1},
+		}
+		pod1Done := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      job1.Name + "-done",
+				Namespace: "default",
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:         proxyexecutor.ManagedByValue,
+					"batch.kubernetes.io/job-name":       job1.Name,
+					"batch.kubernetes.io/controller-uid": string(job1.UID),
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       "Job",
+					Name:       job1.Name,
+					UID:        job1.UID,
+					Controller: &isCtrl,
+				}},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodSucceeded},
+		}
+		job2Queued := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName("bg-term-exec", 31, 1002),
+				Namespace:  "default",
+				UID:        types.UID("uid-bg-term-job2"),
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel("bg-term-exec"),
+					proxyexecutor.LabelJobID:        "31",
+					proxyexecutor.LabelLogID:        "1002",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:  "bg-term-exec",
+					proxyexecutor.AnnotationAdminName:     adminCR.Name,
+					proxyexecutor.AnnotationAdminUID:      string(adminCR.UID),
+					proxyexecutor.AnnotationAdminURL:      adminSrv.URL,
+					proxyexecutor.AnnotationLogID:         "1002",
+					proxyexecutor.AnnotationLogDateTime:   "1700000001002",
+					proxyexecutor.AnnotationBlockStrategy: "SERIAL_EXECUTION",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendTrue},
+		}
+
+		// Case B: --cascade=orphan Job 3 (GC already stripped OwnerReferences and removed "orphan" finalizer before Reconcile!)
+		job3Orphaned := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName("bg-term-exec", 32, 2001),
+				Namespace:  "default",
+				UID:        types.UID("uid-orphan-job3"),
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel("bg-term-exec"),
+					proxyexecutor.LabelJobID:        "32",
+					proxyexecutor.LabelLogID:        "2001",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:  "bg-term-exec",
+					proxyexecutor.AnnotationAdminName:     adminCR.Name,
+					proxyexecutor.AnnotationAdminUID:      string(adminCR.UID),
+					proxyexecutor.AnnotationAdminURL:      adminSrv.URL,
+					proxyexecutor.AnnotationLogID:         "2001",
+					proxyexecutor.AnnotationLogDateTime:   "1700000002001",
+					proxyexecutor.AnnotationBlockStrategy: "SERIAL_EXECUTION",
+				},
+			},
+			Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{Active: 1},
+		}
+		pod3OrphanedRunning := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      job3Orphaned.Name + "-orphaned",
+				Namespace: "default",
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:         proxyexecutor.ManagedByValue,
+					"batch.kubernetes.io/job-name":       job3Orphaned.Name,
+					"batch.kubernetes.io/controller-uid": string(job3Orphaned.UID),
+				},
+				// OwnerReferences intentionally empty: simulates GarbageCollector orphanDependents having stripped OwnerReferences!
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(adminCR, job1, pod1Done, job2Queued, job3Orphaned, pod3OrphanedRunning).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &batchv1.Job{}, &corev1.Pod{}).
+			Build()
+
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+
+		// Delete job1 (default Background): MUST release finalizer on the VERY FIRST reconcile (RequeueAfter == 0) and wake job2Queued!
+		if err := k8sCli.Delete(ctx, job1); err != nil {
+			t.Fatalf("delete job1: %v", err)
+		}
+		res1, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: job1.Name}})
+		if err != nil || res1.RequeueAfter != 0 {
+			t.Fatalf("expected immediate finalizer release (RequeueAfter=0) when owned Pod already Succeeded, got res=%+v err=%v", res1, err)
+		}
+		var goneJob1 batchv1.Job
+		if err := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: job1.Name}, &goneJob1); !apierrors.IsNotFound(err) {
+			t.Fatalf("expected job1 removed from etcd immediately, got err=%v finalizers=%v", err, goneJob1.Finalizers)
+		}
+		var liveJob2 batchv1.Job
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: job2Queued.Name}, &liveJob2)
+		if liveJob2.Spec.Suspend != nil && *liveJob2.Spec.Suspend {
+			t.Fatalf("expected queued SERIAL_EXECUTION job2 unsuspended immediately after job1 cleanup")
+		}
+
+		// Delete job3Orphaned (post-GC --cascade=orphan state): MUST NOT delete pod3OrphanedRunning AND MUST release finalizer immediately!
+		if err := k8sCli.Delete(ctx, job3Orphaned); err != nil {
+			t.Fatalf("delete job3Orphaned: %v", err)
+		}
+		res3, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: job3Orphaned.Name}})
+		if err != nil || res3.RequeueAfter != 0 {
+			t.Fatalf("expected immediate finalizer release (RequeueAfter=0) on GC-orphaned Job, got res=%+v err=%v", res3, err)
+		}
+		var preservedOrphanPod corev1.Pod
+		if err := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: pod3OrphanedRunning.Name}, &preservedOrphanPod); err != nil {
+			t.Fatalf("expected orphaned Pod %s to be preserved, got err=%v", pod3OrphanedRunning.Name, err)
+		}
+		if !preservedOrphanPod.DeletionTimestamp.IsZero() {
+			t.Fatalf("expected orphaned Pod %s not to receive DeletionTimestamp", pod3OrphanedRunning.Name)
+		}
+		adminMu.Lock()
+		totalCBs := len(*cbs)
+		adminMu.Unlock()
+		if totalCBs != 2 {
+			t.Fatalf("expected 2 deletion callbacks delivered, got %d", totalCBs)
+		}
+	})
+
+	// 7. Simultaneous Admin A delete + Executor repoint (and orphan Task with missing Executor) when Admin B shares Admin A's URL:
+	// AdminFinalizer MUST hold Admin A until dependents clean up using Admin A's credentials, and orphan Task MUST detect Admin A deleting.
+	t.Run("SharedURLSimultaneousAdminDeleteHoldsUntilCleanupAndUnblocksOrphanTask", func(t *testing.T) {
+		var wrongAuth atomic.Int32
+		var groupRemoves atomic.Int32
+		var jobRemoves atomic.Int32
+		srvShared := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Path == "/login" {
+				_ = r.ParseForm()
+				if r.FormValue("userName") == "user-b" {
+					http.SetCookie(w, &http.Cookie{Name: "XXL_JOB_LOGIN_IDENTITY", Value: "cookie-b", Path: "/"})
+					_ = json.NewEncoder(w).Encode(map[string]any{"code": 200, "msg": "ok"})
+					return
+				}
+				http.SetCookie(w, &http.Cookie{Name: "XXL_JOB_LOGIN_IDENTITY", Value: "cookie-a", Path: "/"})
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 200, "msg": "ok"})
+				return
+			}
+			if c, err := r.Cookie("XXL_JOB_LOGIN_IDENTITY"); err == nil && c.Value == "cookie-b" &&
+				(r.URL.Path == "/jobgroup/remove" || r.URL.Path == "/jobinfo/remove") {
+				wrongAuth.Add(1)
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 500, "msg": "wrong admin B cookie on remove"})
+				return
+			}
+			switch r.URL.Path {
+			case "/jobgroup/pageList":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"recordsTotal": 1,
+					"data":         []map[string]any{{"id": 1, "appname": "sh-del-app", "title": "ShDel", "addressType": 1}},
+				})
+			case "/jobgroup/save", "/jobgroup/update", "/api/registry", "/api/registryRemove":
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 200})
+			case "/jobgroup/remove":
+				groupRemoves.Add(1)
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 200})
+			case "/jobinfo/pageList":
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"recordsTotal":    2,
+					"recordsFiltered": 2,
+					"data": []map[string]any{
+						{"id": 88, "jobGroup": 1, "jobDesc": "sh-del-task [xxljob-task:default/sh-del-task]", "executorHandler": "shDelHandler"},
+						{"id": 89, "jobGroup": 1, "jobDesc": "sh-del-orphan [xxljob-task:default/sh-del-orphan-task]", "executorHandler": "orphanHandler"},
+					},
+				})
+			case "/jobinfo/add":
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 200, "content": "88"})
+			case "/jobinfo/update", "/jobinfo/stop":
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 200})
+			case "/jobinfo/remove":
+				jobRemoves.Add(1)
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 200})
+			default:
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 200})
+			}
+		}))
+		defer srvShared.Close()
+
+		srvC, _, _, _, _, _ := setupTestAdminServer(t, nil)
+		defer srvC.Close()
+
+		adminA := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "sh-del-a", Namespace: "default", UID: types.UID("uid-sh-del-a"), Generation: 1},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srvShared.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{Username: "user-a", Password: "pw-a", AccessToken: "tok-a"},
+			},
+		}
+		adminB := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "sh-del-b", Namespace: "default", UID: types.UID("uid-sh-del-b"), Generation: 1},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srvShared.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{Username: "user-b", Password: "pw-b", AccessToken: "tok-b"},
+			},
+		}
+		adminC := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "sh-del-c", Namespace: "default", UID: types.UID("uid-sh-del-c"), Generation: 1},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srvC.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{Username: "admin", Password: "123456", AccessToken: "tok-c"},
+			},
+		}
+		execA := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "sh-del-exec", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: adminA.Name},
+				AppName:  "sh-del-app",
+				Title:    "ShDel",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+		}
+		taskA := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "sh-del-task", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: execA.Name},
+				JobDesc:         "sh-del-task",
+				Author:          "dev",
+				ScheduleType:    "CRON",
+				ScheduleConf:    "0 * * * * ?",
+				ExecutorHandler: "shDelHandler",
+			},
+		}
+		orphanTaskA := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "sh-del-orphan-task", Namespace: "default", Finalizers: []string{TaskFinalizer}},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: "missing-executor"},
+				JobDesc:         "sh-del-orphan",
+				Author:          "dev",
+				ScheduleType:    "CRON",
+				ScheduleConf:    "0 * * * * ?",
+				ExecutorHandler: "orphanHandler",
+			},
+			Status: xxljobv1alpha1.XxlJobTaskStatus{
+				JobID:      89,
+				JobGroupID: 1,
+				AdminURL:   srvShared.URL,
+				Synced:     true,
+				Conditions: []metav1.Condition{{
+					Type:    ConditionAdminEndpointSynced,
+					Status:  metav1.ConditionTrue,
+					Message: proxyexecutor.EncodeSyncedAdminEndpointMeta(adminA, srvShared.URL),
+				}},
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(adminA, adminB, adminC, execA, taskA, orphanTaskA).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}).
+			Build()
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		execRec := &XxlJobExecutorReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, DefaultProxyExecutorAddr: "http://proxy.xxl.svc:9999/"}
+		taskRec := &XxlJobTaskReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+
+		for i := 0; i < 2; i++ {
+			_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminA.Name}})
+			_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminB.Name}})
+			_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminC.Name}})
+			_, _ = execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execA.Name}})
+			_, _ = taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskA.Name}})
+		}
+		// Populate adminB's snapshot on srvShared.URL AFTER adminA's so generic URL cache key points to adminB!
+		_, _, _ = ResolveAdminAndClientWithReader(ctx, k8sCli, k8sCli, nil, xxljobv1alpha1.LocalObjectReference{Name: adminB.Name}, "default")
+
+		// Simultaneously repoint execA -> adminC AND delete adminA while adminB still shares srvShared.URL!
+		var liveExec xxljobv1alpha1.XxlJobExecutor
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: execA.Name}, &liveExec)
+		liveExec.Spec.AdminRef.Name = adminC.Name
+		_ = k8sCli.Update(ctx, &liveExec)
+
+		if err := k8sCli.Delete(ctx, adminA); err != nil {
+			t.Fatalf("delete adminA: %v", err)
+		}
+
+		// Reconcile adminA FIRST: AdminFinalizer MUST hold adminA despite adminB sharing srvShared.URL!
+		holdRes, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminA.Name}})
+		if err != nil || holdRes.RequeueAfter == 0 {
+			t.Fatalf("expected AdminFinalizer to hold deleting adminA until bound dependents clean up, got res=%+v err=%v", holdRes, err)
+		}
+
+		// Reconcile taskA, execA, AND orphanTaskA: all MUST clean up on srvShared using adminA's credentials (0 wrongAuth)!
+		for i := 0; i < 2; i++ {
+			_, _ = taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: taskA.Name}})
+		}
+		if _, err := execRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: execA.Name}}); err != nil {
+			t.Fatalf("execA migration reconcile: %v", err)
+		}
+		_, _ = taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: orphanTaskA.Name}})
+
+		if wrongAuth.Load() != 0 {
+			t.Fatalf("expected 0 wrongAuth hits during shared-URL cleanup, got %d", wrongAuth.Load())
+		}
+		if jobRemoves.Load() < 2 || groupRemoves.Load() < 1 {
+			t.Fatalf("expected both tasks and executor cleaned up on srvShared before adminA deletion, got jobRemoves=%d groupRemoves=%d",
+				jobRemoves.Load(), groupRemoves.Load())
+		}
+
+		// Now adminA's bound dependents have all cleaned up -> next reconcile releases AdminFinalizer and deletes adminA!
+		finRes, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminA.Name}})
+		if err != nil || finRes.RequeueAfter != 0 {
+			t.Fatalf("expected adminA finalizer released cleanly after dependent cleanup, got res=%+v err=%v", finRes, err)
+		}
+		var goneA xxljobv1alpha1.XxlJobAdmin
+		if err := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminA.Name}, &goneA); !apierrors.IsNotFound(err) {
+			t.Fatalf("expected adminA deleted from etcd after cleanup, got err=%v", err)
+		}
+	})
+}
+
+func TestCallbackModeTransitionsDeletedTaskLegacyFallbackAndZeroPodBgDelete(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = xxljobv1alpha1.AddToScheme(scheme)
+
+	flushCaches := func() {
+		endpointAuthMu.Lock()
+		clear(endpointAuthCache)
+		endpointAuthOrder = nil
+		endpointAuthMu.Unlock()
+		clientCacheMu.Lock()
+		clear(clientCache)
+		clear(clientCacheByAdmin)
+		clientCacheOrder = nil
+		clientCacheMu.Unlock()
+	}
+
+	// 1. K8sJobCallbackReconciler mode transitions (Pure-External <-> Managed, empty <-> non-empty Datasource.URL)
+	// and AnnotationAdminLegacyDatasourceHash compatibility (including 1cf04b3 in-flight Jobs and SecretRef auth preservation).
+	t.Run("CallbackModeTransitionsAndLegacyDatasourceHash", func(t *testing.T) {
+		flushCaches()
+
+		var extHits, hybridHits, newMgrHits atomic.Int32
+		extSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/callback" {
+				if r.Header.Get(xxlclient.AccessTokenHeader) != "old-secret-tok" {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				extHits.Add(1)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":200}`))
+		}))
+		defer extSrv.Close()
+
+		hybridSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/callback" {
+				hybridHits.Add(1)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":200}`))
+		}))
+		defer hybridSrv.Close()
+
+		newMgrSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/callback" {
+				newMgrHits.Add(1)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":200}`))
+		}))
+		defer newMgrSrv.Close()
+
+		// (a) Same-URL Pure-External -> Hybrid Managed (Image + Datasource.URL) drops both explicit AnnotationAdminManaged="false"
+		// and 1cf04b3 rolling-upgrade (AnnotationAdminUID only) in-flight callbacks instead of hitting the new Hybrid DB.
+		hybridAdmin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "mode-hybrid-adm", Namespace: "default", UID: types.UID("uid-mode-hybrid")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: hybridSrv.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "hyb-tok"},
+			},
+		}
+		// (b) Cross-URL Pure-External (with SecretRef auth!) -> Managed in-cluster still delivers in-flight Pure-External callback
+		// to reachable extSrv.URL using PreviousAdminEndpoints SecretRef (proving ModeCaptured never wipes AuthCaptured SecretRefs!).
+		oldTokSec := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext-old-tok-sec", Namespace: "default"},
+			Data:       map[string][]byte{"token": []byte("old-secret-tok")},
+		}
+		extToMgrAdmin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "ext-to-mgr-adm", Namespace: "default", UID: types.UID("uid-ext-to-mgr")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: extSrv.URL,
+				Auth: xxljobv1alpha1.AuthSpec{
+					AccessTokenSecretRef: &xxljobv1alpha1.SecretKeyReference{Name: oldTokSec.Name, Key: "token"},
+				},
+			},
+		}
+		// (c) Managed empty Datasource.URL -> Managed non-empty Datasource.URL (across Port 8080->8081) AND -> Pure-External:
+		// must NEVER route empty-DB callbacks to the new DB or Pure-External server.
+		emptyMgrAdmin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "empty-db-adm", Namespace: "default", UID: types.UID("uid-empty-db")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Image:       "xuxueli/xxl-job-admin:2.4.1",
+				Port:        8080,
+				ContextPath: "/xxl-job-admin",
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "emp-tok"},
+			},
+		}
+		// (d) AnnotationAdminLegacyDatasourceHash compatibility across Port 8080->8081 + multiple unsorted JDBC reorderings.
+		jdbcOrder1 := "jdbc:mysql://mysql.default.svc:3306/xxl_job?zParam=3&mParam=2&aParam=1"
+		jdbcOrder2 := "jdbc:mysql://mysql.default.svc:3306/xxl_job?mParam=2&zParam=3&aParam=1"
+		legacyHashOrder1 := proxyexecutor.LegacyRawDatasourceURLHash(jdbcOrder1)
+		canonHash := proxyexecutor.DatasourceURLHash(jdbcOrder1)
+		legacyMgrAdmin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "legacy-hash-adm", Namespace: "default", UID: types.UID("uid-legacy-hash")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Image:       "xuxueli/xxl-job-admin:2.4.1",
+				Port:        8080,
+				ContextPath: "/xxl-job-admin",
+				Datasource:  xxljobv1alpha1.DatasourceSpec{URL: jdbcOrder1, Username: "root", Password: "pw"},
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "leg-tok"},
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(oldTokSec, hybridAdmin, extToMgrAdmin, emptyMgrAdmin, legacyMgrAdmin).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &batchv1.Job{}).
+			Build()
+
+		routingFactory := func(cfg xxlclient.Config) (*xxlclient.Client, error) {
+			switch strings.TrimRight(cfg.BaseURL, "/") {
+			case "http://ext-to-mgr-adm.default.svc.cluster.local:8080/xxl-job-admin",
+				"http://empty-db-adm.default.svc.cluster.local:8080/xxl-job-admin",
+				"http://empty-db-adm.default.svc.cluster.local:8081/xxl-job-admin",
+				"http://legacy-hash-adm.default.svc.cluster.local:8081/xxl-job-admin":
+				rewritten := cfg
+				rewritten.BaseURL = newMgrSrv.URL
+				return xxlclient.NewClient(rewritten)
+			default:
+				return xxlclient.NewClient(cfg)
+			}
+		}
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme, ClientFactory: routingFactory}
+		for _, n := range []string{hybridAdmin.Name, extToMgrAdmin.Name, emptyMgrAdmin.Name, legacyMgrAdmin.Name} {
+			for i := 0; i < 2; i++ {
+				_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: n}})
+			}
+		}
+
+		suspendFalse := false
+		mkCompletedJob := func(name string, ann map[string]string) *batchv1.Job {
+			j := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       name,
+					Namespace:  "default",
+					Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+					Labels: map[string]string{
+						proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+						proxyexecutor.LabelExecutorName: "mode-exec",
+						proxyexecutor.LabelJobID:        "10",
+						proxyexecutor.LabelLogID:        ann[proxyexecutor.AnnotationLogID],
+					},
+					Annotations: ann,
+				},
+				Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+				Status: batchv1.JobStatus{
+					Succeeded:  1,
+					Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+				},
+			}
+			_ = k8sCli.Create(ctx, j)
+			_ = k8sCli.Status().Update(ctx, j)
+			return j
+		}
+
+		// Transition (a): hybridAdmin Pure-External -> Hybrid Managed (same URL)
+		jobPureExplicit := mkCompletedJob("job-pure-explicit", map[string]string{
+			proxyexecutor.AnnotationAdminName:    hybridAdmin.Name,
+			proxyexecutor.AnnotationAdminUID:     string(hybridAdmin.UID),
+			proxyexecutor.AnnotationAdminURL:     hybridSrv.URL,
+			proxyexecutor.AnnotationAdminManaged: "false",
+			proxyexecutor.AnnotationLogID:        "101",
+		})
+		jobPure1cf04b3 := mkCompletedJob("job-pure-1cf04b3", map[string]string{
+			proxyexecutor.AnnotationAdminName: hybridAdmin.Name,
+			proxyexecutor.AnnotationAdminUID:  string(hybridAdmin.UID),
+			proxyexecutor.AnnotationAdminURL:  hybridSrv.URL,
+			proxyexecutor.AnnotationLogID:     "102",
+		})
+		var liveHybrid xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: hybridAdmin.Name}, &liveHybrid)
+		liveHybrid.Spec.Image = "xuxueli/xxl-job-admin:2.4.1"
+		liveHybrid.Spec.Datasource = xxljobv1alpha1.DatasourceSpec{URL: "jdbc:mysql://hybrid-db:3306/xxl_job", Username: "root", Password: "pw"}
+		liveHybrid.Generation++
+		_ = k8sCli.Update(ctx, &liveHybrid)
+		// Reconcile jobPureExplicit BEFORE adminRec runs, and jobPure1cf04b3 AFTER adminRec runs!
+		_, _ = cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: jobPureExplicit.Name}})
+		_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: hybridAdmin.Name}})
+		_, _ = cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: jobPure1cf04b3.Name}})
+		if hybridHits.Load() != 0 {
+			t.Fatalf("expected 0 callbacks leaked from Pure-External Jobs to newly added Hybrid DB, got %d", hybridHits.Load())
+		}
+
+		// Transition (b): extToMgrAdmin Pure-External (with SecretRef) -> Managed in-cluster, flush cache -> must hit extSrv with SecretRef!
+		jobExtCrossURL := mkCompletedJob("job-ext-cross-url", map[string]string{
+			proxyexecutor.AnnotationAdminName:    extToMgrAdmin.Name,
+			proxyexecutor.AnnotationAdminUID:     string(extToMgrAdmin.UID),
+			proxyexecutor.AnnotationAdminURL:     extSrv.URL,
+			proxyexecutor.AnnotationAdminManaged: "false",
+			proxyexecutor.AnnotationLogID:        "103",
+		})
+		var liveExtToMgr xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: extToMgrAdmin.Name}, &liveExtToMgr)
+		liveExtToMgr.Spec.ExternalURL = ""
+		liveExtToMgr.Spec.Image = "xuxueli/xxl-job-admin:2.4.1"
+		liveExtToMgr.Spec.Port = 8080
+		liveExtToMgr.Spec.Datasource = xxljobv1alpha1.DatasourceSpec{URL: "jdbc:mysql://mgr-db:3306/xxl_job", Username: "root", Password: "pw"}
+		liveExtToMgr.Spec.Auth = xxljobv1alpha1.AuthSpec{AccessToken: "new-mgr-inline-tok"}
+		liveExtToMgr.Generation++
+		_ = k8sCli.Update(ctx, &liveExtToMgr)
+		_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: extToMgrAdmin.Name}})
+		flushCaches()
+
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: jobExtCrossURL.Name}}); err != nil {
+			t.Fatalf("reconcile jobExtCrossURL failed: %v", err)
+		}
+		if extHits.Load() != 1 || newMgrHits.Load() != 0 {
+			t.Fatalf("expected Pure-External callback routed to reachable extSrv with preserved SecretRef (extHits=1, newMgrHits=0), got ext=%d mgr=%d",
+				extHits.Load(), newMgrHits.Load())
+		}
+
+		// Transition (c): emptyMgrAdmin Managed empty Datasource.URL -> Managed non-empty Datasource.URL (with Port 8080->8081) AND -> Pure-External
+		emptySvc8080 := "http://empty-db-adm.default.svc.cluster.local:8080/xxl-job-admin"
+		jobEmptyToFull := mkCompletedJob("job-empty-to-full", map[string]string{
+			proxyexecutor.AnnotationAdminName:    emptyMgrAdmin.Name,
+			proxyexecutor.AnnotationAdminUID:     string(emptyMgrAdmin.UID),
+			proxyexecutor.AnnotationAdminURL:     emptySvc8080,
+			proxyexecutor.AnnotationAdminManaged: "true",
+			proxyexecutor.AnnotationLogID:        "104",
+		})
+		jobEmpty1cf04b3ToExt := mkCompletedJob("job-empty-1cf04b3-to-ext", map[string]string{
+			proxyexecutor.AnnotationAdminName: emptyMgrAdmin.Name,
+			proxyexecutor.AnnotationAdminUID:  string(emptyMgrAdmin.UID),
+			proxyexecutor.AnnotationAdminURL:  emptySvc8080,
+			proxyexecutor.AnnotationLogID:     "105",
+		})
+		var liveEmpty xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: emptyMgrAdmin.Name}, &liveEmpty)
+		liveEmpty.Spec.Port = 8081
+		liveEmpty.Spec.Datasource = xxljobv1alpha1.DatasourceSpec{URL: "jdbc:mysql://newly-bound:3306/xxl_job", Username: "root", Password: "pw"}
+		liveEmpty.Generation++
+		_ = k8sCli.Update(ctx, &liveEmpty)
+		_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: emptyMgrAdmin.Name}})
+		_, _ = cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: jobEmptyToFull.Name}})
+		if newMgrHits.Load() != 0 {
+			t.Fatalf("expected 0 callbacks leaked across empty->non-empty Datasource.URL + Port 8080->8081 switch, got %d", newMgrHits.Load())
+		}
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: emptyMgrAdmin.Name}, &liveEmpty)
+		liveEmpty.Spec.Image = ""
+		liveEmpty.Spec.Datasource = xxljobv1alpha1.DatasourceSpec{}
+		liveEmpty.Spec.ExternalURL = hybridSrv.URL
+		liveEmpty.Generation++
+		_ = k8sCli.Update(ctx, &liveEmpty)
+		_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: emptyMgrAdmin.Name}})
+		_, _ = cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: jobEmpty1cf04b3ToExt.Name}})
+		if hybridHits.Load() != 0 {
+			t.Fatalf("expected 0 callbacks leaked across Managed empty-DB -> Pure-External switch, got %d", hybridHits.Load())
+		}
+
+		// Transition (d): Job carrying AnnotationAdminLegacyDatasourceHash across Port 8080->8081 + unsorted JDBC reorderings
+		legSvc8080 := "http://legacy-hash-adm.default.svc.cluster.local:8080/xxl-job-admin"
+		jobLegacyOnlyAnnot := mkCompletedJob("job-legacy-annot-only", map[string]string{
+			proxyexecutor.AnnotationAdminName:                 legacyMgrAdmin.Name,
+			proxyexecutor.AnnotationAdminUID:                  string(legacyMgrAdmin.UID),
+			proxyexecutor.AnnotationAdminURL:                  legSvc8080,
+			proxyexecutor.AnnotationAdminLegacyDatasourceHash: legacyHashOrder1,
+			proxyexecutor.AnnotationLogID:                     "106",
+		})
+		jobLegacyAfterDBSwap := mkCompletedJob("job-legacy-annot-dbswap", map[string]string{
+			proxyexecutor.AnnotationAdminName:                 legacyMgrAdmin.Name,
+			proxyexecutor.AnnotationAdminUID:                  string(legacyMgrAdmin.UID),
+			proxyexecutor.AnnotationAdminURL:                  legSvc8080,
+			proxyexecutor.AnnotationAdminDatasourceHash:       canonHash,
+			proxyexecutor.AnnotationAdminLegacyDatasourceHash: legacyHashOrder1,
+			proxyexecutor.AnnotationLogID:                     "107",
+		})
+		var liveLeg xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: legacyMgrAdmin.Name}, &liveLeg)
+		liveLeg.Spec.Port = 8081
+		liveLeg.Spec.Datasource.URL = jdbcOrder2
+		liveLeg.Generation++
+		_ = k8sCli.Update(ctx, &liveLeg)
+		_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: legacyMgrAdmin.Name}})
+
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: jobLegacyOnlyAnnot.Name}}); err != nil {
+			t.Fatalf("reconcile jobLegacyOnlyAnnot failed: %v", err)
+		}
+		if newMgrHits.Load() != 1 {
+			t.Fatalf("expected Job with AnnotationAdminLegacyDatasourceHash to deliver callback across Port+JDBC reorder (1), got %d", newMgrHits.Load())
+		}
+
+		// Now swap legacyMgrAdmin to a genuinely different DB -> jobLegacyAfterDBSwap MUST be dropped!
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: legacyMgrAdmin.Name}, &liveLeg)
+		liveLeg.Spec.Datasource.URL = "jdbc:mysql://different-db.default.svc:3306/xxl_job_v2"
+		liveLeg.Generation++
+		_ = k8sCli.Update(ctx, &liveLeg)
+		_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: legacyMgrAdmin.Name}})
+		_, _ = cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: jobLegacyAfterDBSwap.Name}})
+		if newMgrHits.Load() != 1 {
+			t.Fatalf("expected callback dropped after genuine DB swap, got newMgrHits=%d", newMgrHits.Load())
+		}
+	})
+
+	// 2. jobMatchesDeletedTaskFallback canonical / legacy DatasourceHash equivalence across rolling upgrade & JDBC param reorder.
+	t.Run("DeletedTaskFallbackLegacyAndCanonicalDatasourceHash", func(t *testing.T) {
+		jdbcU1 := "jdbc:mysql://db.default.svc:3306/xxl_job?c=3&b=2&a=1"
+		jdbcU2 := "jdbc:mysql://db.default.svc:3306/xxl_job?b=2&c=3&a=1"
+		rawU1 := proxyexecutor.LegacyRawDatasourceURLHash(jdbcU1)
+		rawU2 := proxyexecutor.LegacyRawDatasourceURLHash(jdbcU2)
+		canonU := proxyexecutor.DatasourceURLHash(jdbcU1)
+		otherHash := proxyexecutor.DatasourceURLHash("jdbc:mysql://other-db.default.svc:3306/xxl_job")
+
+		svc8080 := "http://fb-adm.default.svc.cluster.local:8080/xxl-job-admin"
+		svc8081 := "http://fb-adm.default.svc.cluster.local:8081/xxl-job-admin"
+
+		task := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{Name: "fb-task", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef: xxljobv1alpha1.LocalObjectReference{Name: "fb-exec"},
+			},
+			Status: xxljobv1alpha1.XxlJobTaskStatus{
+				JobID:    42,
+				AdminURL: svc8081,
+			},
+		}
+		taskMetaPostReorder := &syncedAdminEndpointMeta{
+			AdminName:            "fb-adm",
+			AdminUID:             "uid-fb-adm",
+			AdminURL:             svc8081,
+			ManagedInCluster:     true,
+			ModeCaptured:         true,
+			DatasourceHash:       canonU,
+			LegacyDatasourceHash: rawU1,
+			AuthCaptured:         true,
+		}
+		taskMetaPreUpgrade := &syncedAdminEndpointMeta{
+			AdminName:        "fb-adm",
+			AdminUID:         "uid-fb-adm",
+			AdminURL:         svc8080,
+			ManagedInCluster: true,
+			DatasourceHash:   rawU2,
+			AuthCaptured:     true,
+		}
+
+		// (a) 1cf04b3 fallback Job (rawU1 in AnnotationAdminDatasourceHash on :8080) vs post-reorder taskMeta on :8081 -> MUST match!
+		job1cf04b3OnOldPort := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "fb-job-1cf04b3",
+				Namespace: "default",
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: "fb-exec",
+					proxyexecutor.LabelJobID:        "42",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:        "fb-exec",
+					proxyexecutor.AnnotationAdminName:           "fb-adm",
+					proxyexecutor.AnnotationAdminUID:            "uid-fb-adm",
+					proxyexecutor.AnnotationAdminURL:            svc8080,
+					proxyexecutor.AnnotationAdminDatasourceHash: rawU1,
+				},
+			},
+		}
+		if !jobMatchesDeletedTaskFallback(job1cf04b3OnOldPort, task, taskMetaPostReorder) {
+			t.Fatalf("expected 1cf04b3 fallback Job with legacy raw hash on old port to match deleted task after port+JDBC reorder")
+		}
+
+		// (b) Post-upgrade fallback Job (canonU + AnnotationAdminLegacyDatasourceHash=rawU2 on :8081) vs pre-upgrade taskMeta (rawU2 on :8080) -> MUST match!
+		jobPostUpgradeDual := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "fb-job-post-dual",
+				Namespace: "default",
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: "fb-exec",
+					proxyexecutor.LabelJobID:        "42",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:              "fb-exec",
+					proxyexecutor.AnnotationAdminName:                 "fb-adm",
+					proxyexecutor.AnnotationAdminUID:                  "uid-fb-adm",
+					proxyexecutor.AnnotationAdminURL:                  svc8081,
+					proxyexecutor.AnnotationAdminManaged:              "true",
+					proxyexecutor.AnnotationAdminDatasourceHash:       canonU,
+					proxyexecutor.AnnotationAdminLegacyDatasourceHash: rawU2,
+				},
+			},
+		}
+		taskPre := task.DeepCopy()
+		taskPre.Status.AdminURL = svc8080
+		if !jobMatchesDeletedTaskFallback(jobPostUpgradeDual, taskPre, taskMetaPreUpgrade) {
+			t.Fatalf("expected post-upgrade dual-hash fallback Job to match pre-upgrade taskMeta carrying legacy raw hash")
+		}
+
+		// (c) Different DB hash or Pure-External mode mismatch -> MUST NOT match!
+		jobDifferentDB := jobPostUpgradeDual.DeepCopy()
+		jobDifferentDB.Annotations[proxyexecutor.AnnotationAdminDatasourceHash] = otherHash
+		jobDifferentDB.Annotations[proxyexecutor.AnnotationAdminLegacyDatasourceHash] = ""
+		if jobMatchesDeletedTaskFallback(jobDifferentDB, task, taskMetaPostReorder) {
+			t.Fatalf("expected fallback Job from different DB NOT to match deleted task")
+		}
+		jobPureExtMismatch := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "fb-job-pure-ext",
+				Namespace: "default",
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName: "fb-exec",
+					proxyexecutor.AnnotationAdminName:    "fb-adm",
+					proxyexecutor.AnnotationAdminUID:     "uid-fb-adm",
+					proxyexecutor.AnnotationAdminURL:     svc8081,
+					proxyexecutor.AnnotationAdminManaged: "false",
+				},
+			},
+		}
+		if jobMatchesDeletedTaskFallback(jobPureExtMismatch, task, taskMetaPostReorder) {
+			t.Fatalf("expected Pure-External fallback Job NOT to match Managed deleted task")
+		}
+
+		// End-to-end XxlJobTaskReconciler deletion cleanup across canonical/legacy hash mismatch & port edit:
+		delSrv, _, _, _, _, _ := setupTestAdminServer(t, nil)
+		defer delSrv.Close()
+		delAdmin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "fb-adm", Namespace: "default", UID: types.UID("uid-fb-adm")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Image:       "xuxueli/xxl-job-admin:2.4.1",
+				Port:        8081,
+				ContextPath: "/xxl-job-admin",
+				Datasource:  xxljobv1alpha1.DatasourceSpec{URL: jdbcU2, Username: "root", Password: "pw"},
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "fb-tok"},
+			},
+			Status: xxljobv1alpha1.XxlJobAdminStatus{AdminURL: svc8081},
+		}
+		delExec := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "fb-exec", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: "fb-adm"},
+				AppName:  "fb-app",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+			Status: xxljobv1alpha1.XxlJobExecutorStatus{JobGroupID: 1, AdminURL: svc8081, Synced: true},
+		}
+		rawMetaBytes, _ := json.Marshal(taskMetaPostReorder)
+		delTask := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "fb-task",
+				Namespace:  "default",
+				Finalizers: []string{TaskFinalizer},
+			},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: "fb-exec"},
+				ExecutorHandler: "fbHandler",
+			},
+			Status: xxljobv1alpha1.XxlJobTaskStatus{
+				JobID:      42,
+				JobGroupID: 1,
+				AdminURL:   svc8081,
+				Synced:     true,
+				Conditions: []metav1.Condition{{
+					Type:    ConditionAdminEndpointSynced,
+					Status:  metav1.ConditionTrue,
+					Message: string(rawMetaBytes),
+				}},
+			},
+		}
+		e2eOldJob := job1cf04b3OnOldPort.DeepCopy()
+		e2eOldJob.Finalizers = []string{proxyexecutor.JobCallbackFinalizer}
+		e2eForeignJob := jobDifferentDB.DeepCopy()
+		e2eForeignJob.Name = "fb-job-foreign-db"
+		e2eForeignJob.Finalizers = []string{proxyexecutor.JobCallbackFinalizer}
+
+		fbCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(delAdmin, delExec, delTask, e2eOldJob, e2eForeignJob).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+			Build()
+		_ = fbCli.Delete(ctx, delTask)
+
+		taskRec := &XxlJobTaskReconciler{
+			Client:    fbCli,
+			APIReader: fbCli,
+			Scheme:    scheme,
+			ClientFactory: func(cfg xxlclient.Config) (*xxlclient.Client, error) {
+				rewritten := cfg
+				rewritten.BaseURL = delSrv.URL
+				return xxlclient.NewClient(rewritten)
+			},
+		}
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: delTask.Name}}); err != nil {
+			t.Fatalf("reconcile deleting fb-task: %v", err)
+		}
+		var checkOld, checkForeign batchv1.Job
+		_ = fbCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: e2eOldJob.Name}, &checkOld)
+		_ = fbCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: e2eForeignJob.Name}, &checkForeign)
+		if checkOld.DeletionTimestamp.IsZero() {
+			t.Fatalf("expected XxlJobTask deletion to delete 1cf04b3 fallback Job across port+JDBC reorder")
+		}
+		if !checkForeign.DeletionTimestamp.IsZero() {
+			t.Fatalf("expected XxlJobTask deletion NOT to delete fallback Job belonging to different DB")
+		}
+	})
+
+	// 3. Default Background deletion when owned Pod already vanished from etcd before first Reconcile while Status.Active=1 is frozen:
+	// real-UID Job (job.UID != "") immediately releases callback-guard and advances SERIAL_EXECUTION without 10m wait,
+	// whereas synthetic UID-less Job (job.UID == "") preserves synthetic test requeue behavior.
+	t.Run("BackgroundDeleteVanishedPodsWithFrozenActiveCount", func(t *testing.T) {
+		adminSrv, adminMu, _, _, _, cbs := setupTestAdminServer(t, nil)
+		defer adminSrv.Close()
+
+		adminCR := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "vanished-pod-adm", Namespace: "default", UID: types.UID("uid-vanished-adm")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: adminSrv.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "vanished-tok"},
+			},
+		}
+		suspendFalse := false
+		suspendTrue := true
+		realJob1 := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName("vanished-exec", 61, 1),
+				Namespace:  "default",
+				UID:        types.UID("uid-real-vanished-job1"),
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel("vanished-exec"),
+					proxyexecutor.LabelJobID:        "61",
+					proxyexecutor.LabelLogID:        "1",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:  "vanished-exec",
+					proxyexecutor.AnnotationAdminName:     adminCR.Name,
+					proxyexecutor.AnnotationAdminUID:      string(adminCR.UID),
+					proxyexecutor.AnnotationAdminURL:      adminSrv.URL,
+					proxyexecutor.AnnotationAdminManaged:  "false",
+					proxyexecutor.AnnotationLogID:         "1",
+					proxyexecutor.AnnotationLogDateTime:   "1700000000001",
+					proxyexecutor.AnnotationBlockStrategy: "SERIAL_EXECUTION",
+				},
+			},
+			Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{Active: 1}, // Frozen Active=1 while Pod already vanished from etcd!
+		}
+		realJob2Queued := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName("vanished-exec", 61, 2),
+				Namespace:  "default",
+				UID:        types.UID("uid-real-vanished-job2"),
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel("vanished-exec"),
+					proxyexecutor.LabelJobID:        "61",
+					proxyexecutor.LabelLogID:        "2",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:  "vanished-exec",
+					proxyexecutor.AnnotationAdminName:     adminCR.Name,
+					proxyexecutor.AnnotationAdminUID:      string(adminCR.UID),
+					proxyexecutor.AnnotationAdminURL:      adminSrv.URL,
+					proxyexecutor.AnnotationAdminManaged:  "false",
+					proxyexecutor.AnnotationLogID:         "2",
+					proxyexecutor.AnnotationLogDateTime:   "1700000000002",
+					proxyexecutor.AnnotationBlockStrategy: "SERIAL_EXECUTION",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendTrue},
+		}
+		syntheticUIDLessJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName("vanished-exec", 62, 1),
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel("vanished-exec"),
+					proxyexecutor.LabelJobID:        "62",
+					proxyexecutor.LabelLogID:        "1",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:  "vanished-exec",
+					proxyexecutor.AnnotationAdminName:     adminCR.Name,
+					proxyexecutor.AnnotationAdminURL:      adminSrv.URL,
+					proxyexecutor.AnnotationLogID:         "1",
+					proxyexecutor.AnnotationBlockStrategy: "SERIAL_EXECUTION",
+				},
+			},
+			Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{Active: 1},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(adminCR, realJob1, realJob2Queued, syntheticUIDLessJob).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &batchv1.Job{}).
+			Build()
+
+		// realJob1 carries a non-empty UID (modeling real kube-apiserver objects), whereas syntheticUIDLessJob keeps UID == "".
+		if err := k8sCli.Delete(ctx, realJob1); err != nil {
+			t.Fatalf("background delete realJob1: %v", err)
+		}
+		if err := k8sCli.Delete(ctx, syntheticUIDLessJob); err != nil {
+			t.Fatalf("background delete syntheticUIDLessJob: %v", err)
+		}
+
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		res1, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: realJob1.Name}})
+		if err != nil || res1.RequeueAfter != 0 {
+			t.Fatalf("expected immediate finalizer release (RequeueAfter=0) when APIReader confirms 0 owned Pods for real-UID Job, got res=%+v err=%v", res1, err)
+		}
+		var checkGone batchv1.Job
+		if err := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: realJob1.Name}, &checkGone); !apierrors.IsNotFound(err) {
+			t.Fatalf("expected realJob1 removed from etcd on first reconcile, got err=%v", err)
+		}
+		var checkJob2 batchv1.Job
+		if err := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: realJob2Queued.Name}, &checkJob2); err != nil {
+			t.Fatalf("get realJob2Queued: %v", err)
+		}
+		if checkJob2.Spec.Suspend != nil && *checkJob2.Spec.Suspend {
+			t.Fatalf("expected queued SERIAL_EXECUTION realJob2Queued to unsuspend immediately without 10m wait")
+		}
+		adminMu.Lock()
+		gotRealCBs := len(*cbs)
+		adminMu.Unlock()
+		if gotRealCBs != 1 {
+			t.Fatalf("expected 1 failure callback delivered for realJob1, got %d", gotRealCBs)
+		}
+
+		// Synthetic UID-less Job (UID == "") still conservatively requeues while Status.Active=1.
+		synRes, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: syntheticUIDLessJob.Name}})
+		if err != nil || synRes.RequeueAfter == 0 {
+			t.Fatalf("expected synthetic UID-less Job with Status.Active=1 to requeue, got res=%+v err=%v", synRes, err)
+		}
+	})
+}
+
+func TestAdversarialRound2CallbackModeHistoryInformerLagAndOrphanPods(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = xxljobv1alpha1.AddToScheme(scheme)
+
+	flushCaches := func() {
+		endpointAuthMu.Lock()
+		endpointAuthCache = make(map[string]cachedEndpointAuthSnapshot)
+		endpointAuthOrder = nil
+		endpointAuthMu.Unlock()
+		clientCacheMu.Lock()
+		clientCache = make(map[string]*xxlclient.Client)
+		clientCacheByAdmin = make(map[string]string)
+		clientCacheOrder = nil
+		clientCacheMu.Unlock()
+	}
+
+	// 1. 1cf04b3 in-flight Jobs (AnnotationAdminUID set, AnnotationAdminManaged & AnnotationAdminDatasourceHash empty)
+	// across same-ExternalURL Pure-External <-> Hybrid Managed (empty Datasource.URL) transitions in BOTH directions,
+	// both BEFORE and AFTER XxlJobAdminReconciler overwrites ConditionAdminEndpointSynced (plus steady-state delivery).
+	t.Run("SameURL1cf04b3PureExternalAndHybridEmptyDBTransitionsBothDirections", func(t *testing.T) {
+		flushCaches()
+		var cbHits atomic.Int32
+		extSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/callback" {
+				cbHits.Add(1)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":200}`))
+		}))
+		defer extSrv.Close()
+
+		adminPure := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "sameurl-pure-to-emp", Namespace: "default", UID: types.UID("uid-p2e")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: extSrv.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "p2e-tok"},
+			},
+		}
+		adminHybridEmpty := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "sameurl-emp-to-pure", Namespace: "default", UID: types.UID("uid-e2p")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Image:       "xuxueli/xxl-job-admin:2.4.1",
+				ExternalURL: extSrv.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "e2p-tok"},
+			},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(adminPure, adminHybridEmpty).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &batchv1.Job{}).
+			Build()
+
+		adminRec := &XxlJobAdminReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+
+		for _, n := range []string{adminPure.Name, adminHybridEmpty.Name} {
+			for i := 0; i < 2; i++ {
+				if _, err := adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: n}}); err != nil {
+					t.Fatalf("initial reconcile %s: %v", n, err)
+				}
+			}
+		}
+
+		suspendFalse := false
+		mk1cfJob := func(name, adminName, adminUID, logID string) *batchv1.Job {
+			j := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       name,
+					Namespace:  "default",
+					Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+					Labels: map[string]string{
+						proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+						proxyexecutor.LabelExecutorName: "adv-r2-exec",
+						proxyexecutor.LabelJobID:        "12",
+						proxyexecutor.LabelLogID:        logID,
+					},
+					Annotations: map[string]string{
+						proxyexecutor.AnnotationExecutorName: "adv-r2-exec",
+						proxyexecutor.AnnotationAdminName:    adminName,
+						proxyexecutor.AnnotationAdminUID:     adminUID,
+						proxyexecutor.AnnotationAdminURL:     extSrv.URL,
+						proxyexecutor.AnnotationLogID:        logID,
+					},
+				},
+				Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+				Status: batchv1.JobStatus{
+					Succeeded:  1,
+					Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+				},
+			}
+			_ = k8sCli.Create(ctx, j)
+			_ = k8sCli.Status().Update(ctx, j)
+			return j
+		}
+
+		// Steady-state 1cf04b3 Pure-External AND steady-state 1cf04b3 Hybrid empty-DB MUST both deliver callbacks!
+		steadyPure := mk1cfJob("steady-1cf-pure", adminPure.Name, string(adminPure.UID), "201")
+		steadyEmp := mk1cfJob("steady-1cf-emp", adminHybridEmpty.Name, string(adminHybridEmpty.UID), "202")
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: steadyPure.Name}}); err != nil {
+			t.Fatalf("steadyPure callback: %v", err)
+		}
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: steadyEmp.Name}}); err != nil {
+			t.Fatalf("steadyEmp callback: %v", err)
+		}
+		if cbHits.Load() != 2 {
+			t.Fatalf("expected both steady-state 1cf04b3 Pure-External and Hybrid empty-DB callbacks delivered (2), got %d", cbHits.Load())
+		}
+
+		// Direction (i): adminPure switches in-place on SAME extSrv.URL to Hybrid Managed with EMPTY Datasource.URL!
+		inFlightPureBefore := mk1cfJob("inflight-1cf-pure-before", adminPure.Name, string(adminPure.UID), "203")
+		inFlightPureAfter := mk1cfJob("inflight-1cf-pure-after", adminPure.Name, string(adminPure.UID), "204")
+		var livePure xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminPure.Name}, &livePure)
+		livePure.Spec.Image = "xuxueli/xxl-job-admin:2.4.1"
+		livePure.Spec.Datasource = xxljobv1alpha1.DatasourceSpec{} // empty Datasource.URL!
+		livePure.Generation++
+		_ = k8sCli.Update(ctx, &livePure)
+
+		cbHits.Store(0)
+		// Reconcile inFlightPureBefore BEFORE adminRec runs, then run adminRec twice (Progressing + Running), then reconcile inFlightPureAfter!
+		_, _ = cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: inFlightPureBefore.Name}})
+		for i := 0; i < 2; i++ {
+			_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminPure.Name}})
+		}
+		_, _ = cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: inFlightPureAfter.Name}})
+		if cbHits.Load() != 0 {
+			t.Fatalf("expected 0 callbacks leaked across same-URL Pure-External -> Hybrid empty-DB switch (before & after adminRec), got %d", cbHits.Load())
+		}
+
+		// Direction (ii): adminHybridEmpty switches in-place on SAME extSrv.URL to Pure-External!
+		inFlightEmpBefore := mk1cfJob("inflight-1cf-emp-before", adminHybridEmpty.Name, string(adminHybridEmpty.UID), "205")
+		inFlightEmpAfter := mk1cfJob("inflight-1cf-emp-after", adminHybridEmpty.Name, string(adminHybridEmpty.UID), "206")
+		var liveEmp xxljobv1alpha1.XxlJobAdmin
+		_ = k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: adminHybridEmpty.Name}, &liveEmp)
+		liveEmp.Spec.Image = ""
+		liveEmp.Generation++
+		_ = k8sCli.Update(ctx, &liveEmp)
+
+		_, _ = cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: inFlightEmpBefore.Name}})
+		for i := 0; i < 2; i++ {
+			_, _ = adminRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: adminHybridEmpty.Name}})
+		}
+		_, _ = cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: inFlightEmpAfter.Name}})
+		if cbHits.Load() != 0 {
+			t.Fatalf("expected 0 callbacks leaked across same-URL Hybrid empty-DB -> Pure-External switch (before & after adminRec), got %d", cbHits.Load())
+		}
+	})
+
+	// 2. Informer cache lag on r.Client vs fresh APIReader, AND UID-less Job vs recreated unrelated XxlJobAdmin.
+	t.Run("CallbackAPIReaderFreshnessAndUIDLessRecreatedAdminSafety", func(t *testing.T) {
+		flushCaches()
+		var srvOldHits, leakedNewTokenHits atomic.Int32
+		srvOld := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/api/callback" {
+				srvOldHits.Add(1)
+				if r.Header.Get(xxlclient.AccessTokenHeader) == "new-recreated-secret-token" {
+					leakedNewTokenHits.Add(1)
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":200}`))
+		}))
+		defer srvOld.Close()
+		srvNew := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"code":200}`))
+		}))
+		defer srvNew.Close()
+
+		staleAdmin := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "lag-adm", Namespace: "default", UID: types.UID("uid-lag")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srvOld.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "old-tok"},
+			},
+		}
+		freshAdmin := staleAdmin.DeepCopy()
+		freshAdmin.Spec.Image = "xuxueli/xxl-job-admin:2.4.1"
+		freshAdmin.Spec.Datasource = xxljobv1alpha1.DatasourceSpec{URL: "jdbc:mysql://new-db:3306/xxl_job"}
+
+		suspendFalse := false
+		lagJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "lag-job",
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: "lag-exec",
+					proxyexecutor.LabelJobID:        "1",
+					proxyexecutor.LabelLogID:        "301",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName: "lag-exec",
+					proxyexecutor.AnnotationAdminName:    "lag-adm",
+					proxyexecutor.AnnotationAdminUID:     "uid-lag",
+					proxyexecutor.AnnotationAdminURL:     srvOld.URL,
+					proxyexecutor.AnnotationAdminManaged: "false",
+					proxyexecutor.AnnotationLogID:        "301",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{
+				Succeeded:  1,
+				Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+			},
+		}
+
+		etcdCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(freshAdmin, lagJob).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &batchv1.Job{}).
+			Build()
+		// Wrap r.Client so Get/List on XxlJobAdmin simulates a lagging informer returning staleAdmin (Pure-External).
+		laggingCacheCli := interceptor.NewClient(etcdCli, interceptor.Funcs{
+			Get: func(ctx context.Context, cli client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if out, ok := obj.(*xxljobv1alpha1.XxlJobAdmin); ok && key.Name == "lag-adm" {
+					staleAdmin.DeepCopyInto(out)
+					return nil
+				}
+				return cli.Get(ctx, key, obj, opts...)
+			},
+		})
+		cbRec := &K8sJobCallbackReconciler{Client: laggingCacheCli, APIReader: etcdCli, Scheme: scheme}
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: lagJob.Name}}); err != nil {
+			t.Fatalf("reconcile lagJob: %v", err)
+		}
+		if srvOldHits.Load() != 0 {
+			t.Fatalf("expected APIReader to see fresh XxlJobAdmin mode switch and drop callback (0 hits), got %d", srvOldHits.Load())
+		}
+
+		// UID-less legacy Job must NOT match a recreated same-name XxlJobAdmin that never owned srvOld.URL!
+		flushCaches()
+		recreatedUnrelated := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "recreated-adm", Namespace: "default", UID: types.UID("uid-brand-new")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: srvNew.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "new-recreated-secret-token"},
+			},
+			Status: xxljobv1alpha1.XxlJobAdminStatus{AdminURL: srvNew.URL},
+		}
+		uidLessLegacyJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "uidless-recreated-job",
+				Namespace:  "default",
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: "lag-exec",
+					proxyexecutor.LabelJobID:        "1",
+					proxyexecutor.LabelLogID:        "302",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName: "lag-exec",
+					proxyexecutor.AnnotationAdminName:    "recreated-adm",
+					proxyexecutor.AnnotationAdminURL:     srvOld.URL,
+					proxyexecutor.AnnotationLogID:        "302",
+				},
+			},
+			Spec: batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{
+				Succeeded:  1,
+				Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+			},
+		}
+		_ = etcdCli.Create(ctx, recreatedUnrelated)
+		_ = etcdCli.Create(ctx, uidLessLegacyJob)
+		_ = etcdCli.Status().Update(ctx, uidLessLegacyJob)
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: uidLessLegacyJob.Name}}); err != nil {
+			t.Fatalf("reconcile uidLessLegacyJob: %v", err)
+		}
+		if leakedNewTokenHits.Load() != 0 || srvOldHits.Load() != 0 {
+			t.Fatalf("expected recreated unrelated XxlJobAdmin never to leak credentials to srvOld, got hits=%d leaked=%d",
+				srvOldHits.Load(), leakedNewTokenHits.Load())
+		}
+	})
+
+	// 3. Task deletion fallback: live-Admin canonical<->raw bridge when taskMeta lacks LegacyDatasourceHash,
+	// AND protection of 1cf04b3 Pure-External fallback Jobs against newly switched Hybrid Managed task deletion.
+	t.Run("DeletedTaskFallbackLiveAdminBridgeAnd1cf04b3CrossModeIsolation", func(t *testing.T) {
+		jdbcUnsorted := "jdbc:mysql://mysql.default.svc:3306/xxl_job?zParam=9&aParam=1"
+		rawUnsorted := proxyexecutor.LegacyRawDatasourceURLHash(jdbcUnsorted)
+		canonHash := proxyexecutor.DatasourceURLHash(jdbcUnsorted)
+		extURL := "http://ext-fb.example.com:8080/xxl-job-admin"
+
+		delSrv, _, _, _, _, _ := setupTestAdminServer(t, nil)
+		defer delSrv.Close()
+
+		adm := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "bridge-adm", Namespace: "default", UID: types.UID("uid-bridge-adm")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				Image:       "xuxueli/xxl-job-admin:2.4.1",
+				ExternalURL: extURL,
+				Datasource:  xxljobv1alpha1.DatasourceSpec{URL: jdbcUnsorted, Username: "root", Password: "pw"},
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "br-tok"},
+			},
+			Status: xxljobv1alpha1.XxlJobAdminStatus{AdminURL: extURL},
+		}
+		// taskMeta synced earlier when JDBC URL was already in canonical order -> LegacyDatasourceHash is empty!
+		canonOnlyMeta := &syncedAdminEndpointMeta{
+			AdminName:        adm.Name,
+			AdminUID:         string(adm.UID),
+			AdminURL:         extURL,
+			ManagedInCluster: true,
+			ModeCaptured:     true,
+			DatasourceHash:   canonHash,
+			AuthCaptured:     true,
+		}
+		rawMetaJSON, _ := json.Marshal(canonOnlyMeta)
+		execCR := &xxljobv1alpha1.XxlJobExecutor{
+			ObjectMeta: metav1.ObjectMeta{Name: "bridge-exec", Namespace: "default"},
+			Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+				AdminRef: xxljobv1alpha1.LocalObjectReference{Name: adm.Name},
+				AppName:  "bridge-app",
+				Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+			},
+			Status: xxljobv1alpha1.XxlJobExecutorStatus{JobGroupID: 1, AdminURL: extURL, Synced: true},
+		}
+		delTask := &xxljobv1alpha1.XxlJobTask{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "bridge-task",
+				Namespace:  "default",
+				Finalizers: []string{TaskFinalizer},
+			},
+			Spec: xxljobv1alpha1.XxlJobTaskSpec{
+				ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: execCR.Name},
+				ExecutorHandler: "brHandler",
+			},
+			Status: xxljobv1alpha1.XxlJobTaskStatus{
+				JobID:      77,
+				JobGroupID: 1,
+				AdminURL:   extURL,
+				Synced:     true,
+				Conditions: []metav1.Condition{{
+					Type:    ConditionAdminEndpointSynced,
+					Status:  metav1.ConditionTrue,
+					Message: string(rawMetaJSON),
+				}},
+			},
+		}
+		suspendFalse := false
+		// Canary 1cf04b3 fallback Job stamped rawUnsorted (without AnnotationTaskName or AnnotationAdminManaged): MUST be deleted!
+		canaryFallbackJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "canary-raw-fb-job",
+				Namespace: "default",
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: execCR.Name,
+					proxyexecutor.LabelJobID:        "77",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName:        execCR.Name,
+					proxyexecutor.AnnotationAdminName:           adm.Name,
+					proxyexecutor.AnnotationAdminUID:            string(adm.UID),
+					proxyexecutor.AnnotationAdminURL:            extURL,
+					proxyexecutor.AnnotationAdminDatasourceHash: rawUnsorted,
+				},
+			},
+			Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{Active: 1},
+		}
+		// 1cf04b3 Pure-External fallback Job (AnnotationAdminUID set, NO AnnotationAdminManaged, NO dbHash) on same extURL: MUST SURVIVE!
+		pureExt1cfFallbackJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "pure-ext-1cf-fb-job",
+				Namespace: "default",
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: execCR.Name,
+					proxyexecutor.LabelJobID:        "77",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName: execCR.Name,
+					proxyexecutor.AnnotationAdminName:    adm.Name,
+					proxyexecutor.AnnotationAdminUID:     string(adm.UID),
+					proxyexecutor.AnnotationAdminURL:     extURL,
+				},
+			},
+			Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{Active: 1},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(adm, execCR, delTask, canaryFallbackJob, pureExt1cfFallbackJob).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+			Build()
+		_ = k8sCli.Delete(ctx, delTask)
+
+		taskRec := &XxlJobTaskReconciler{
+			Client:    k8sCli,
+			APIReader: k8sCli,
+			Scheme:    scheme,
+			ClientFactory: func(cfg xxlclient.Config) (*xxlclient.Client, error) {
+				rewritten := cfg
+				rewritten.BaseURL = delSrv.URL
+				return xxlclient.NewClient(rewritten)
+			},
+		}
+		if _, err := taskRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: delTask.Name}}); err != nil {
+			t.Fatalf("delete reconcile bridge-task: %v", err)
+		}
+		if err := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: canaryFallbackJob.Name}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("expected canaryFallbackJob bridged via live XxlJobAdmin to be deleted, got err=%v", err)
+		}
+		if err := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: pureExt1cfFallbackJob.Name}, &batchv1.Job{}); err != nil {
+			t.Fatalf("expected 1cf04b3 Pure-External fallback Job NOT to be falsely killed by Hybrid Managed task deletion, got err=%v", err)
+		}
+	})
+
+	// 4. Multi-Pod --cascade=orphan mid-GC race: when Pod 1 is already orphaned (OwnerReferences stripped) while Pod 2
+	// transiently still holds OwnerReferences, terminateBackgroundDeletingJobPods MUST NOT delete Pod 2!
+	t.Run("MultiPodOrphanCascadeMidGCRacePreservesRemainingPods", func(t *testing.T) {
+		adminSrv, _, _, _, _, _ := setupTestAdminServer(t, nil)
+		defer adminSrv.Close()
+		adminCR := &xxljobv1alpha1.XxlJobAdmin{
+			ObjectMeta: metav1.ObjectMeta{Name: "orphan-race-adm", Namespace: "default", UID: types.UID("uid-orphan-race")},
+			Spec: xxljobv1alpha1.XxlJobAdminSpec{
+				ExternalURL: adminSrv.URL,
+				Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "or-tok"},
+			},
+			Status: xxljobv1alpha1.XxlJobAdminStatus{AdminURL: adminSrv.URL},
+		}
+		suspendFalse := false
+		isCtrl := true
+		orphanJob := &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       proxyexecutor.BuildJobName("orphan-exec", 99, 1),
+				Namespace:  "default",
+				UID:        types.UID("uid-multi-orphan-job"),
+				Finalizers: []string{proxyexecutor.JobCallbackFinalizer},
+				Labels: map[string]string{
+					proxyexecutor.LabelManagedBy:    proxyexecutor.ManagedByValue,
+					proxyexecutor.LabelExecutorName: proxyexecutor.SanitizeLabel("orphan-exec"),
+					proxyexecutor.LabelJobID:        "99",
+					proxyexecutor.LabelLogID:        "1",
+				},
+				Annotations: map[string]string{
+					proxyexecutor.AnnotationExecutorName: "orphan-exec",
+					proxyexecutor.AnnotationAdminName:    adminCR.Name,
+					proxyexecutor.AnnotationAdminUID:     string(adminCR.UID),
+					proxyexecutor.AnnotationAdminURL:     adminSrv.URL,
+					proxyexecutor.AnnotationAdminManaged: "false",
+					proxyexecutor.AnnotationLogID:        "1",
+				},
+			},
+			Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+			Status: batchv1.JobStatus{Active: 2},
+		}
+		pod1AlreadyOrphaned := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      orphanJob.Name + "-pod1",
+				Namespace: "default",
+				Labels: map[string]string{
+					"batch.kubernetes.io/job-name":       orphanJob.Name,
+					"batch.kubernetes.io/controller-uid": string(orphanJob.UID),
+				},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		pod2StillOwnedMidGC := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      orphanJob.Name + "-pod2",
+				Namespace: "default",
+				Labels: map[string]string{
+					"batch.kubernetes.io/job-name":       orphanJob.Name,
+					"batch.kubernetes.io/controller-uid": string(orphanJob.UID),
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: batchv1.SchemeGroupVersion.String(),
+					Kind:       "Job",
+					Name:       orphanJob.Name,
+					UID:        orphanJob.UID,
+					Controller: &isCtrl,
+				}},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+
+		k8sCli := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(adminCR, orphanJob, pod1AlreadyOrphaned, pod2StillOwnedMidGC).
+			WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &batchv1.Job{}).
+			Build()
+		_ = k8sCli.Delete(ctx, orphanJob)
+
+		cbRec := &K8sJobCallbackReconciler{Client: k8sCli, APIReader: k8sCli, Scheme: scheme}
+		if _, err := cbRec.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: orphanJob.Name}}); err != nil {
+			t.Fatalf("reconcile multi-pod orphan job: %v", err)
+		}
+		for _, podName := range []string{pod1AlreadyOrphaned.Name, pod2StillOwnedMidGC.Name} {
+			var checkPod corev1.Pod
+			if err := k8sCli.Get(ctx, types.NamespacedName{Namespace: "default", Name: podName}, &checkPod); err != nil {
+				t.Fatalf("expected --cascade=orphan Pod %s to survive mid-GC race, got err=%v", podName, err)
+			}
 		}
 	})
 }

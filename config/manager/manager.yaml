@@ -17,7 +17,10 @@ metadata:
   name: xxl-job-operator-manager-role
 rules:
   - apiGroups: [""]
-    resources: ["pods", "endpoints", "namespaces"]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["endpoints", "namespaces"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods/log"]

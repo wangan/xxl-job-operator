@@ -3394,3 +3394,1254 @@ func TestManagedOriginSameURLDBSwapHybridAndGCdCoverEarlyPrefix(t *testing.T) {
 		t.Fatalf("expected db2 SERIAL_EXECUTION Job to unsuspend independently of db1's active Job on the same URL")
 	}
 }
+
+func TestRejectTriggerBeforeDatasourceStatusConverges(t *testing.T) {
+	ctx := context.Background()
+	// Intentionally register ONLY batchv1 + xxljobv1alpha1 (without corev1) to also verify minimal-scheme safety.
+	minScheme := runtime.NewScheme()
+	_ = batchv1.AddToScheme(minScheme)
+	_ = xxljobv1alpha1.AddToScheme(minScheme)
+
+	dbOld := "jdbc:mysql://mysql-old.default.svc:3306/xxl_job?useUnicode=true&characterEncoding=UTF-8"
+	dbNew := "jdbc:mysql://mysql-new.default.svc:3306/xxl_job?useUnicode=true&characterEncoding=UTF-8"
+	hashOld := DatasourceURLHash(dbOld)
+	hashNew := DatasourceURLHash(dbNew)
+
+	svcURL8080 := "http://ds-admin.default.svc.cluster.local:8080/xxl-job-admin"
+	adminCR := &xxljobv1alpha1.XxlJobAdmin{
+		ObjectMeta: metav1.ObjectMeta{Name: "ds-admin", Namespace: "default", UID: types.UID("uid-ds-admin")},
+		Spec: xxljobv1alpha1.XxlJobAdminSpec{
+			Image:       "xuxueli/xxl-job-admin:2.4.1",
+			Port:        8080,
+			ContextPath: "/xxl-job-admin",
+			Datasource:  xxljobv1alpha1.DatasourceSpec{URL: dbOld},
+			Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "ds-tok"},
+		},
+		Status: xxljobv1alpha1.XxlJobAdminStatus{
+			AdminURL: svcURL8080,
+			Conditions: []metav1.Condition{{
+				Type:    ConditionAdminEndpointSynced,
+				Status:  metav1.ConditionTrue,
+				Message: "",
+			}},
+		},
+	}
+	syncedMetaOld := EncodeSyncedAdminEndpointMeta(adminCR, svcURL8080)
+	adminCR.Status.Conditions[0].Message = syncedMetaOld
+
+	execCR := &xxljobv1alpha1.XxlJobExecutor{
+		ObjectMeta: metav1.ObjectMeta{Name: "ds-proxy", Namespace: "default"},
+		Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+			AdminRef: xxljobv1alpha1.LocalObjectReference{Name: "ds-admin"},
+			AppName:  "ds-proxy-app",
+			Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+		},
+		Status: xxljobv1alpha1.XxlJobExecutorStatus{
+			JobGroupID: 2,
+			AdminURL:   svcURL8080,
+			Synced:     true,
+			Conditions: []metav1.Condition{{
+				Type:    ConditionAdminEndpointSynced,
+				Status:  metav1.ConditionTrue,
+				Message: syncedMetaOld,
+			}},
+		},
+	}
+	taskCR := &xxljobv1alpha1.XxlJobTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "ds-task", Namespace: "default"},
+		Spec: xxljobv1alpha1.XxlJobTaskSpec{
+			ExecutorRef:           xxljobv1alpha1.LocalObjectReference{Name: "ds-proxy"},
+			ExecutorHandler:       "dsHandler",
+			ExecutorBlockStrategy: "DISCARD_LATER",
+			K8sJobTemplate: &xxljobv1alpha1.K8sJobTemplateSpec{
+				Image:   "busybox:1.36",
+				Command: []string{"sh", "-c", "echo ok"},
+			},
+		},
+		Status: xxljobv1alpha1.XxlJobTaskStatus{
+			JobID:      42,
+			JobGroupID: 2,
+			AdminURL:   svcURL8080,
+			Synced:     true,
+			Conditions: []metav1.Condition{{
+				Type:    ConditionAdminEndpointSynced,
+				Status:  metav1.ConditionTrue,
+				Message: syncedMetaOld,
+			}},
+		},
+	}
+
+	fakeK8s := fake.NewClientBuilder().
+		WithScheme(minScheme).
+		WithObjects(adminCR, execCR, taskCR).
+		WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+		Build()
+
+	srv := NewServer(fakeK8s, ":0", "default", "ds-tok")
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	post := func(path string, body any) xxlclient.ReturnT {
+		raw, _ := json.Marshal(body)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(string(raw)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("XXL-JOB-ACCESS-TOKEN", "ds-tok")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		var ret xxlclient.ReturnT
+		_ = json.NewDecoder(resp.Body).Decode(&ret)
+		return ret
+	}
+
+	// Baseline: trigger on dbOld succeeds and stamps hashOld.
+	if baseRet := post("/proxy/default/ds-proxy/run", xxlclient.TriggerParam{
+		JobID:                 42,
+		ExecutorHandler:       "dsHandler",
+		ExecutorBlockStrategy: "DISCARD_LATER",
+		LogID:                 100,
+		LogDateTime:           1700000000100,
+	}); !baseRet.IsSuccess() {
+		t.Fatalf("expected baseline trigger on dbOld to succeed: %+v", baseRet)
+	}
+	var oldJob batchv1.Job
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: BuildJobName("ds-proxy", 42, 100)}, &oldJob); err != nil {
+		t.Fatalf("get oldJob: %v", err)
+	}
+	if oldJob.Annotations[AnnotationAdminDatasourceHash] != hashOld {
+		t.Fatalf("expected oldJob stamped with hashOld=%s, got %q", hashOld, oldJob.Annotations[AnnotationAdminDatasourceHash])
+	}
+	oldJob.Status.Active = 1
+	_ = fakeK8s.Status().Update(ctx, &oldJob)
+
+	// Switch Admin Datasource.URL to dbNew BEFORE Executor or Task status converges (both still hold hashOld).
+	var liveAdmin xxljobv1alpha1.XxlJobAdmin
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "ds-admin"}, &liveAdmin)
+	liveAdmin.Spec.Datasource.URL = dbNew
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+
+	// Both routed /proxy/default/ds-proxy/run and legacy /run MUST reject stale JobID=42 and NEVER stamp hashNew.
+	for _, p := range []string{"/proxy/default/ds-proxy/run", "/run"} {
+		ret := post(p, xxlclient.TriggerParam{
+			JobID:                 42,
+			ExecutorHandler:       "dsHandler",
+			ExecutorBlockStrategy: "SERIAL_EXECUTION",
+			LogID:                 200,
+			LogDateTime:           1700000000200,
+		})
+		if ret.IsSuccess() {
+			t.Fatalf("path %s: expected trigger to be rejected before Executor/Task converge to dbNew, got %+v", p, ret)
+		}
+	}
+	var jobList batchv1.JobList
+	_ = fakeK8s.List(ctx, &jobList, client.InNamespace("default"))
+	if len(jobList.Items) != 1 {
+		t.Fatalf("expected no new Job created during pre-convergence db switch window, got %d Jobs", len(jobList.Items))
+	}
+
+	// Meanwhile, /kill for in-flight oldJob on dbOld still matches hashOld (from unconverged execCR condition) and deletes oldJob cleanly.
+	if killRet := post("/proxy/default/ds-proxy/kill", xxlclient.KillParam{JobID: 42}); !killRet.IsSuccess() {
+		t.Fatalf("expected /kill on in-flight dbOld Job before status convergence to succeed: %+v", killRet)
+	}
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: oldJob.Name}, &oldJob)
+	if oldJob.DeletionTimestamp.IsZero() {
+		t.Fatalf("expected in-flight dbOld Job to receive DeletionTimestamp on /kill")
+	}
+
+	// Simultaneous Port (8080->8081) + Datasource.URL (dbNew) edit before convergence MUST also reject.
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "ds-admin"}, &liveAdmin)
+	liveAdmin.Spec.Port = 8081
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+	if portSwitchRet := post("/proxy/default/ds-proxy/run", xxlclient.TriggerParam{
+		JobID:                 42,
+		ExecutorHandler:       "dsHandler",
+		ExecutorBlockStrategy: "SERIAL_EXECUTION",
+		LogID:                 201,
+		LogDateTime:           1700000000201,
+	}); portSwitchRet.IsSuccess() {
+		t.Fatalf("expected trigger during simultaneous Port+Datasource switch before convergence to be rejected, got %+v", portSwitchRet)
+	}
+
+	// Once Executor AND Task converge to dbNew on :8081, triggers succeed and stamp hashNew!
+	svcURL8081 := "http://ds-admin.default.svc.cluster.local:8081/xxl-job-admin"
+	syncedMetaNew := EncodeSyncedAdminEndpointMeta(&liveAdmin, svcURL8081)
+
+	var liveExec xxljobv1alpha1.XxlJobExecutor
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "ds-proxy"}, &liveExec)
+	liveExec.Status.AdminURL = svcURL8081
+	liveExec.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: syncedMetaNew,
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+
+	var liveTask xxljobv1alpha1.XxlJobTask
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "ds-task"}, &liveTask)
+	liveTask.Status.AdminURL = svcURL8081
+	liveTask.Status.LastExecutionJobName = ""
+	liveTask.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: syncedMetaNew,
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	if convRet := post("/proxy/default/ds-proxy/run", xxlclient.TriggerParam{
+		JobID:                 42,
+		ExecutorHandler:       "dsHandler",
+		ExecutorBlockStrategy: "SERIAL_EXECUTION",
+		LogID:                 300,
+		LogDateTime:           1700000000300,
+	}); !convRet.IsSuccess() {
+		t.Fatalf("expected trigger after Executor & Task converge to dbNew to succeed: %+v", convRet)
+	}
+	var newJob batchv1.Job
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: BuildJobName("ds-proxy", 42, 300)}, &newJob); err != nil {
+		t.Fatalf("get newJob: %v", err)
+	}
+	if newJob.Annotations[AnnotationAdminDatasourceHash] != hashNew {
+		t.Fatalf("expected converged Job stamped with hashNew=%s, got %q", hashNew, newJob.Annotations[AnnotationAdminDatasourceHash])
+	}
+
+	// Switching Managed -> Pure External (ExternalURL != "", Image == "") before Task/Executor converge must also reject.
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: "ds-admin"}, &liveAdmin)
+	liveAdmin.Spec.ExternalURL = "http://ext-xxl.corp.local:8080/xxl-job-admin"
+	liveAdmin.Spec.Image = ""
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+	if extRet := post("/proxy/default/ds-proxy/run", xxlclient.TriggerParam{
+		JobID:                 42,
+		ExecutorHandler:       "dsHandler",
+		ExecutorBlockStrategy: "SERIAL_EXECUTION",
+		LogID:                 301,
+		LogDateTime:           1700000000301,
+	}); extRet.IsSuccess() {
+		t.Fatalf("expected Managed->PureExternal transition before status convergence to reject stale JobID, got %+v", extRet)
+	}
+}
+
+func TestDatasourceURLHashCanonicalizationAndEquivalence(t *testing.T) {
+	if got := DatasourceURLHash("   \t  "); got != "" {
+		t.Fatalf("expected empty hash for whitespace URL, got %q", got)
+	}
+
+	// 1. Equivalent JDBC URLs must produce identical hashes.
+	equivalentGroups := [][]string{
+		{
+			"jdbc:mysql://mysql.default.svc:3306/xxl_job?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai",
+			"  JDBC:MySQL://MYSQL.default.svc/xxl_job?serverTimezone=Asia%2FShanghai&characterEncoding=UTF-8&useUnicode=true&  ",
+			"jdbc:mysql://mysql.default.svc:3306/xxl_job?CHARACTERENCODING=UTF-8&&useunicode=true&servertimezone=Asia/Shanghai",
+			"jdbc:mysql://address=(protocol=tcp)(host=MYSQL.default.svc)(port=3306)/xxl_job?characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&useUnicode=true",
+			"jdbc:mysql://(host=mysql.default.svc,port=3306)/xxl_job?serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=UTF-8",
+		},
+		{
+			"jdbc:mysql://[::1]:3306/xxl_job?serverTimezone=GMT+8&useSSL=true",
+			"jdbc:mysql://[::1]/xxl_job?useSSL=false&useSSL=true&serverTimezone=GMT%2B8",
+		},
+		{
+			"jdbc:mysql://db.default.svc:3306",
+			"jdbc:mysql://db.default.svc/",
+		},
+		{
+			"jdbc:postgresql://PG.default.svc/xxl_job?currentSchema=public&sslmode=disable",
+			"jdbc:postgresql://pg.default.svc:5432/xxl_job?sslmode=disable&currentSchema=public",
+		},
+		{
+			"jdbc:mysql://address=(protocol=pipe)(path=/var/run/mysqld/mysqld.sock)/xxl_job?useSSL=false&autoReconnect=true",
+			"jdbc:mysql://address=(path=/var/run/mysqld/mysqld.sock)(protocol=pipe)/xxl_job?autoReconnect=true&useSSL=false",
+		},
+		{
+			"jdbc:sqlserver://SQL.default.svc;databaseName=xxl_job;encrypt=true;trustServerCertificate=true",
+			"jdbc:sqlserver://sql.default.svc:1433;trustServerCertificate=true;encrypt=true;DATABASENAME=xxl_job;",
+			"jdbc:sqlserver://sql.default.svc:1433;database=xxl_job;encrypt=true;trustServerCertificate=true",
+		},
+		{
+			"jdbc:sqlserver://sql.default.svc:1433;password={pa;ss};databaseName=xxl_job",
+			"jdbc:sqlserver://SQL.default.svc;database=xxl_job;password={pa;ss}",
+		},
+		{
+			"jdbc:mysql://u:p@[HOST1,host2:3306]/xxl_job?b=2&a=1",
+			"jdbc:mysql://u:p@[host1:3306,HOST2]/xxl_job?a=1&b=2",
+		},
+		{
+			"jdbc:mysql://localhost:3306/xxl_job?a=1&b=2",
+			"jdbc:mysql:///xxl_job?b=2&a=1",
+			"jdbc:mysql://:3306/xxl_job?b=2&a=1",
+			"jdbc:mysql://address=(port=3306)/xxl_job?b=2&a=1",
+		},
+		{
+			"jdbc:postgresql://localhost:5432/xxl_job?a=1&b=2",
+			"jdbc:postgresql:///xxl_job?b=2&a=1",
+			"jdbc:postgresql:xxl_job?b=2&a=1",
+		},
+		{
+			"jdbc:oracle:thin:@//ora.default.svc:1521/xxl_job?a=1&b=2",
+			"JDBC:ORACLE:THIN:@//ORA.default.svc/xxl_job?b=2&a=1",
+		},
+	}
+
+	for gIdx, grp := range equivalentGroups {
+		expected := DatasourceURLHash(grp[0])
+		if expected == "" {
+			t.Fatalf("group %d: expected non-empty hash for %q", gIdx, grp[0])
+		}
+		for _, candidate := range grp[1:] {
+			got := DatasourceURLHash(candidate)
+			if got != expected {
+				t.Fatalf("group %d: expected %q (canon=%q) and %q (canon=%q) to produce identical hash, got %s vs %s",
+					gIdx, grp[0], canonicalJDBCURL(grp[0]), candidate, canonicalJDBCURL(candidate), expected, got)
+			}
+		}
+	}
+
+	// 2. Distinct databases/targets must NEVER collide.
+	distinctPairs := [][2]string{
+		{
+			"jdbc:mysql://mysql.default.svc:3306/xxl_job?useUnicode=true",
+			"jdbc:mysql://mysql.default.svc:3306/xxl_job_v2?useUnicode=true",
+		},
+		{
+			"jdbc:mysql://mysql.default.svc:3306/xxl_job",
+			"jdbc:mysql://mysql.default.svc:3306/XXL_JOB",
+		},
+		{
+			"jdbc:mysql://mysql.default.svc:3306/xxl_job",
+			"jdbc:mysql://mysql.default.svc:3307/xxl_job",
+		},
+		{
+			"jdbc:mysql://host1:3306,host2:3306/xxl_job",
+			"jdbc:mysql://host2:3306,host1:3306/xxl_job",
+		},
+		{
+			"jdbc:mysql://db.default.svc?DBNAME=xxl_job_a",
+			"jdbc:mysql://db.default.svc?DBNAME=xxl_job_b",
+		},
+		{
+			"jdbc:postgresql://pg.default.svc:5432/xxl_job?currentSchema=schema_a",
+			"jdbc:postgresql://pg.default.svc:5432/xxl_job?currentSchema=schema_b",
+		},
+		{
+			"jdbc:mysql+srv://cluster.default.svc/xxl_job",
+			"jdbc:mysql://cluster.default.svc:3306/xxl_job",
+		},
+		{
+			"jdbc:sqlserver://sql.default.svc:1433;databaseName=xxl_job_a;encrypt=true",
+			"jdbc:sqlserver://sql.default.svc:1433;databaseName=xxl_job_b;encrypt=true",
+		},
+		{
+			"jdbc:mysql://u:p@[host1,host2]/xxl_job",
+			"jdbc:mysql://u:p@host1,host2/xxl_job",
+		},
+	}
+	for pIdx, pair := range distinctPairs {
+		h1 := DatasourceURLHash(pair[0])
+		h2 := DatasourceURLHash(pair[1])
+		if h1 == h2 {
+			t.Fatalf("pair %d: expected distinct hashes for %q and %q, both produced %s", pIdx, pair[0], pair[1], h1)
+		}
+	}
+}
+
+func TestRollingUpgradeLegacyRawDatasourceHashAndModeTransitions(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = xxljobv1alpha1.AddToScheme(scheme)
+
+	// Exact sample JDBC URL from config/samples/01-xxljob-admin.yaml whose pre-canonicalization hash differs from canonical hash.
+	sampleURL := "jdbc:mysql://mysql.default.svc.cluster.local:3306/xxl_job?useUnicode=true&characterEncoding=UTF-8&autoReconnect=true&serverTimezone=Asia/Shanghai"
+	legacyHash := LegacyRawDatasourceURLHash(sampleURL)
+	canonHash := DatasourceURLHash(sampleURL)
+	if legacyHash == "" || canonHash == "" || legacyHash == canonHash {
+		t.Fatalf("expected distinct non-empty legacyHash=%q and canonHash=%q for sampleURL", legacyHash, canonHash)
+	}
+
+	svcURL := "http://upg-admin.default.svc.cluster.local:8080/xxl-job-admin"
+	adminCR := &xxljobv1alpha1.XxlJobAdmin{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "upg-admin",
+			Namespace: "default",
+			UID:       "uid-upg-admin",
+		},
+		Spec: xxljobv1alpha1.XxlJobAdminSpec{
+			Image:       "xuxueli/xxl-job-admin:2.4.1",
+			Port:        8080,
+			ContextPath: "/xxl-job-admin",
+			Datasource:  xxljobv1alpha1.DatasourceSpec{URL: sampleURL},
+		},
+	}
+
+	preUpgradeMetaRaw, _ := json.Marshal(SyncedAdminEndpointMeta{
+		AdminName:        adminCR.Name,
+		AdminUID:         string(adminCR.UID),
+		AdminURL:         svcURL,
+		ManagedInCluster: true,
+		DatasourceHash:   legacyHash,
+		AuthCaptured:     true,
+	})
+	preUpgradeCond := metav1.Condition{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: string(preUpgradeMetaRaw),
+	}
+
+	execCR := &xxljobv1alpha1.XxlJobExecutor{
+		ObjectMeta: metav1.ObjectMeta{Name: "upg-proxy", Namespace: "default"},
+		Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+			AdminRef: xxljobv1alpha1.LocalObjectReference{Name: adminCR.Name},
+			AppName:  "upg-proxy-app",
+			Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+		},
+		Status: xxljobv1alpha1.XxlJobExecutorStatus{
+			JobGroupID: 1,
+			AdminURL:   svcURL,
+			Synced:     true,
+			Conditions: []metav1.Condition{preUpgradeCond},
+		},
+	}
+	taskCR := &xxljobv1alpha1.XxlJobTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "upg-task", Namespace: "default"},
+		Spec: xxljobv1alpha1.XxlJobTaskSpec{
+			ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: execCR.Name},
+			JobDesc:         "upg-task",
+			Author:          "test",
+			ScheduleType:    "CRON",
+			ScheduleConf:    "0 * * * * ?",
+			ExecutorHandler: "upgHandler",
+			K8sJobTemplate: &xxljobv1alpha1.K8sJobTemplateSpec{
+				Image:   "alpine:3.19",
+				Command: []string{"/bin/sh", "-c"},
+				Args:    []string{"echo upg"},
+			},
+		},
+		Status: xxljobv1alpha1.XxlJobTaskStatus{
+			JobID:      77,
+			JobGroupID: 1,
+			AdminURL:   svcURL,
+			Synced:     true,
+			Conditions: []metav1.Condition{preUpgradeCond},
+		},
+	}
+
+	// Pre-upgrade in-flight SERIAL_EXECUTION Job carrying legacy raw DatasourceHash.
+	suspendFalse := false
+	preUpgradeJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       BuildJobName("upg-proxy", 77, 500),
+			Namespace:  "default",
+			Finalizers: []string{JobCallbackFinalizer},
+			Labels: map[string]string{
+				LabelManagedBy:    ManagedByValue,
+				LabelExecutorName: SanitizeLabel("upg-proxy"),
+				LabelJobID:        "77",
+				LabelLogID:        "500",
+			},
+			Annotations: map[string]string{
+				AnnotationTaskNamespace:       "default",
+				AnnotationTaskName:            "upg-task",
+				AnnotationExecutorName:        "upg-proxy",
+				AnnotationAdminName:           adminCR.Name,
+				AnnotationAdminUID:            string(adminCR.UID),
+				AnnotationAdminURL:            svcURL,
+				AnnotationAdminDatasourceHash: legacyHash,
+				AnnotationLogID:               "500",
+				AnnotationLogDateTime:         "1700000000500",
+				AnnotationBlockStrategy:       "SERIAL_EXECUTION",
+				AnnotationCallbackSent:        "false",
+			},
+		},
+		Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+		Status: batchv1.JobStatus{Active: 1},
+	}
+
+	fakeK8s := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(adminCR, execCR, taskCR, preUpgradeJob).
+		WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+		Build()
+
+	srv := NewServer(fakeK8s, ":0", "default", "upg-tok")
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	post := func(action string, body any) xxlclient.ReturnT {
+		t.Helper()
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/proxy/default/upg-proxy/"+action, bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(xxlclient.AccessTokenHeader, "upg-tok")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s failed: %v", action, err)
+		}
+		defer resp.Body.Close()
+		var ret xxlclient.ReturnT
+		_ = json.NewDecoder(resp.Body).Decode(&ret)
+		return ret
+	}
+
+	// 1. Before Executor/Task reconcile after upgrade, /idleBeat sees preUpgradeJob and /run succeeds!
+	if ib := post("idleBeat", xxlclient.IdleBeatParam{JobID: 77}); ib.IsSuccess() {
+		t.Fatalf("expected /idleBeat to see running preUpgradeJob across rolling upgrade, got %+v", ib)
+	}
+
+	// Partial reconcile window: Executor reconciles canonical hash while Task still holds legacyHash.
+	var liveExec xxljobv1alpha1.XxlJobExecutor
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: execCR.Name}, &liveExec)
+	liveExec.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: EncodeSyncedAdminEndpointMeta(adminCR, svcURL),
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+
+	if runRet := post("run", xxlclient.TriggerParam{
+		JobID:                 77,
+		ExecutorHandler:       "upgHandler",
+		ExecutorBlockStrategy: "SERIAL_EXECUTION",
+		LogID:                 501,
+		LogDateTime:           1700000000501,
+	}); !runRet.IsSuccess() {
+		t.Fatalf("expected /run during Executor-converged / Task-pre-upgrade rolling window to succeed, got %+v", runRet)
+	}
+
+	// SERIAL_EXECUTION partition MUST group preUpgradeJob (legacyHash) and postUpgradeJob (canonHash + alt legacyHash)!
+	if err := AdvanceSerialQueueWithReader(ctx, fakeK8s, fakeK8s, "default", SanitizeLabel("upg-proxy"), "77"); err != nil {
+		t.Fatalf("AdvanceSerialQueueWithReader: %v", err)
+	}
+	var postUpgradeJob batchv1.Job
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: BuildJobName("upg-proxy", 77, 501)}, &postUpgradeJob); err != nil {
+		t.Fatalf("get postUpgradeJob: %v", err)
+	}
+	if postUpgradeJob.Spec.Suspend == nil || !*postUpgradeJob.Spec.Suspend {
+		t.Fatalf("expected postUpgradeJob to remain suspended while preUpgradeJob (legacyHash) is still Active=1")
+	}
+
+	// /kill matches and deletes preUpgradeJob (and postUpgradeJob) across the hash format upgrade!
+	if killRet := post("kill", xxlclient.KillParam{JobID: 77}); !killRet.IsSuccess() {
+		t.Fatalf("expected /kill to succeed: %+v", killRet)
+	}
+	var killedPre batchv1.Job
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: preUpgradeJob.Name}, &killedPre)
+	if killedPre.DeletionTimestamp.IsZero() {
+		t.Fatalf("expected /kill to set DeletionTimestamp on preUpgradeJob carrying legacyHash")
+	}
+
+	// 2. Empty -> non-empty Datasource.URL on a Managed Admin before status convergence MUST reject stale JobID!
+	var liveAdmin xxljobv1alpha1.XxlJobAdmin
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: adminCR.Name}, &liveAdmin)
+	liveAdmin.Spec.Datasource.URL = ""
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+
+	emptyMeta := EncodeSyncedAdminEndpointMeta(&liveAdmin, svcURL)
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: execCR.Name}, &liveExec)
+	liveExec.Status.Conditions = []metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: emptyMeta}}
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+
+	var liveTask xxljobv1alpha1.XxlJobTask
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: taskCR.Name}, &liveTask)
+	liveTask.Status.Conditions = []metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: emptyMeta}}
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	liveAdmin.Spec.Datasource.URL = "jdbc:mysql://new-db.default.svc:3306/xxl_job_fresh"
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+	if emptyToFullRet := post("run", xxlclient.TriggerParam{
+		JobID:                 77,
+		ExecutorHandler:       "upgHandler",
+		ExecutorBlockStrategy: "SERIAL_EXECUTION",
+		LogID:                 502,
+		LogDateTime:           1700000000502,
+	}); emptyToFullRet.IsSuccess() {
+		t.Fatalf("expected empty->non-empty Datasource.URL switch before convergence to reject stale JobID, got %+v", emptyToFullRet)
+	}
+
+	// 3. Pure External -> Hybrid Managed transition at the same ExternalURL before convergence MUST reject stale JobID!
+	extURL := "http://hybrid-ext.corp.local:8080/xxl-job-admin"
+	liveAdmin.Spec.ExternalURL = extURL
+	liveAdmin.Spec.Image = ""
+	liveAdmin.Spec.Datasource.URL = ""
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+
+	pureExtMeta := EncodeSyncedAdminEndpointMeta(&liveAdmin, extURL)
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: execCR.Name}, &liveExec)
+	liveExec.Status.AdminURL = extURL
+	liveExec.Status.Conditions = []metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: pureExtMeta}}
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: taskCR.Name}, &liveTask)
+	liveTask.Status.AdminURL = extURL
+	liveTask.Status.Conditions = []metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: pureExtMeta}}
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	liveAdmin.Spec.Image = "xuxueli/xxl-job-admin:2.4.1"
+	liveAdmin.Spec.Datasource.URL = "jdbc:mysql://hybrid-db.default.svc:3306/xxl_job_hybrid"
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+	if extToHybridRet := post("run", xxlclient.TriggerParam{
+		JobID:                 77,
+		ExecutorHandler:       "upgHandler",
+		ExecutorBlockStrategy: "SERIAL_EXECUTION",
+		LogID:                 503,
+		LogDateTime:           1700000000503,
+	}); extToHybridRet.IsSuccess() {
+		t.Fatalf("expected PureExternal->HybridManaged transition before convergence to reject stale JobID, got %+v", extToHybridRet)
+	}
+}
+
+func TestModeOriginIsolationZeroPodBgDrainAndHalfConvergedUpgrade(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = xxljobv1alpha1.AddToScheme(scheme)
+
+	extURL := "http://mode-iso.corp.local:8080/xxl-job-admin"
+	adminCR := &xxljobv1alpha1.XxlJobAdmin{
+		ObjectMeta: metav1.ObjectMeta{Name: "mode-iso-adm", Namespace: "default", UID: types.UID("uid-mode-iso")},
+		Spec: xxljobv1alpha1.XxlJobAdminSpec{
+			ExternalURL: extURL,
+			Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "mode-iso-tok"},
+		},
+	}
+	initMeta := EncodeSyncedAdminEndpointMeta(adminCR, extURL)
+	adminCR.Status.AdminURL = extURL
+	adminCR.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: initMeta,
+	}}
+
+	execCR := &xxljobv1alpha1.XxlJobExecutor{
+		ObjectMeta: metav1.ObjectMeta{Name: "mode-iso-proxy", Namespace: "default"},
+		Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+			AdminRef: xxljobv1alpha1.LocalObjectReference{Name: adminCR.Name},
+			AppName:  "mode-iso-app",
+			Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+		},
+		Status: xxljobv1alpha1.XxlJobExecutorStatus{
+			JobGroupID: 1,
+			AdminURL:   extURL,
+			Synced:     true,
+			Conditions: []metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: initMeta}},
+		},
+	}
+	taskCR := &xxljobv1alpha1.XxlJobTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "mode-iso-task", Namespace: "default"},
+		Spec: xxljobv1alpha1.XxlJobTaskSpec{
+			ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: execCR.Name},
+			JobDesc:         "mode-iso",
+			Author:          "ops",
+			ScheduleType:    "CRON",
+			ScheduleConf:    "0 * * * * ?",
+			ExecutorHandler: "modeIsoHandler",
+			K8sJobTemplate: &xxljobv1alpha1.K8sJobTemplateSpec{
+				Image:   "alpine:3.19",
+				Command: []string{"/bin/sh", "-c"},
+				Args:    []string{"echo iso"},
+			},
+		},
+		Status: xxljobv1alpha1.XxlJobTaskStatus{
+			JobID:      88,
+			JobGroupID: 1,
+			AdminURL:   extURL,
+			Synced:     true,
+			Conditions: []metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: initMeta}},
+		},
+	}
+
+	fakeK8s := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(adminCR, execCR, taskCR).
+		WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+		Build()
+
+	srv := NewServer(fakeK8s, ":0", "default", "mode-iso-tok")
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	post := func(action string, body any) xxlclient.ReturnT {
+		t.Helper()
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/proxy/default/mode-iso-proxy/"+action, bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(xxlclient.AccessTokenHeader, "mode-iso-tok")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s failed: %v", action, err)
+		}
+		defer resp.Body.Close()
+		var ret xxlclient.ReturnT
+		_ = json.NewDecoder(resp.Body).Decode(&ret)
+		return ret
+	}
+
+	// 1. Trigger Pure-External Job -> stamps AnnotationAdminManaged="false"; then switch to Hybrid Managed (empty DB, then non-empty DB)
+	// on the SAME URL and verify colliding (jobId=88, logId=1) & /idleBeat & DISCARD_LATER isolate all three origins!
+	if r1 := post("run", xxlclient.TriggerParam{
+		JobID:                 88,
+		ExecutorHandler:       "modeIsoHandler",
+		ExecutorBlockStrategy: "DISCARD_LATER",
+		LogID:                 1,
+		LogDateTime:           1700000000001,
+	}); !r1.IsSuccess() {
+		t.Fatalf("Pure-External /run failed: %+v", r1)
+	}
+	baseJobName := BuildJobName("mode-iso-proxy", 88, 1)
+	var pureExtJob batchv1.Job
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: baseJobName}, &pureExtJob); err != nil {
+		t.Fatalf("get pureExtJob: %v", err)
+	}
+	if pureExtJob.Annotations[AnnotationAdminManaged] != "false" {
+		t.Fatalf("expected AnnotationAdminManaged=false on Pure-External Job, got %+v", pureExtJob.Annotations)
+	}
+	pureExtJob.Status.Active = 1
+	_ = fakeK8s.Status().Update(ctx, &pureExtJob)
+
+	// Switch in place to Hybrid Managed with empty Datasource.URL and converge Admin + Executor + Task
+	var liveAdmin xxljobv1alpha1.XxlJobAdmin
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: adminCR.Name}, &liveAdmin)
+	liveAdmin.Spec.Image = "xuxueli/xxl-job-admin:2.4.1"
+	liveAdmin.Spec.Datasource.URL = ""
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+	emptyHybridMeta := EncodeSyncedAdminEndpointMeta(&liveAdmin, extURL)
+	liveAdmin.Status.Conditions = []metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: emptyHybridMeta}}
+	_ = fakeK8s.Status().Update(ctx, &liveAdmin)
+
+	var liveExec xxljobv1alpha1.XxlJobExecutor
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: execCR.Name}, &liveExec)
+	liveExec.Status.Conditions = []metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: emptyHybridMeta}}
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+
+	var liveTask xxljobv1alpha1.XxlJobTask
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: taskCR.Name}, &liveTask)
+	liveTask.Status.LastExecutionJobName = ""
+	liveTask.Status.Conditions = []metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: emptyHybridMeta}}
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	if ib := post("idleBeat", xxlclient.IdleBeatParam{JobID: 88}); !ib.IsSuccess() {
+		t.Fatalf("expected /idleBeat on Hybrid Managed empty-DB not to be blocked by active Pure-External Job, got %+v", ib)
+	}
+	if r2 := post("run", xxlclient.TriggerParam{
+		JobID:                 88,
+		ExecutorHandler:       "modeIsoHandler",
+		ExecutorBlockStrategy: "DISCARD_LATER",
+		LogID:                 1,
+		LogDateTime:           1700000000002,
+	}); !r2.IsSuccess() {
+		t.Fatalf("expected colliding logId=1 on Hybrid Managed empty-DB to succeed via distinct origin key, got %+v", r2)
+	}
+	emptyHybridKey := CanonicalAdminOriginKey(adminCR.Name, extURL, string(adminCR.UID)) + "|db=empty"
+	emptyHybridJobName := BuildJobName("mode-iso-proxy", 88, 1, emptyHybridKey)
+	var emptyHybridJob batchv1.Job
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: emptyHybridJobName}, &emptyHybridJob); err != nil {
+		t.Fatalf("get emptyHybridJob (%s): %v", emptyHybridJobName, err)
+	}
+	if emptyHybridJob.Annotations[AnnotationAdminManaged] != "true" {
+		t.Fatalf("expected AnnotationAdminManaged=true on Hybrid Managed empty-DB Job, got %+v", emptyHybridJob.Annotations)
+	}
+	emptyHybridJob.Status.Active = 1
+	_ = fakeK8s.Status().Update(ctx, &emptyHybridJob)
+
+	// 2. Half-converged rolling-upgrade window:
+	// Admin and Executor update to non-empty Datasource.URL (admMeta & execMeta = dbNew), while legacy Task has taskMeta == nil!
+	// Stale JobID=88 MUST be rejected until Task also converges ConditionAdminEndpointSynced!
+	dbNew := "jdbc:mysql://new-db.default.svc:3306/xxl_job_prod"
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: adminCR.Name}, &liveAdmin)
+	liveAdmin.Spec.Datasource.URL = dbNew
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+	dbNewMeta := EncodeSyncedAdminEndpointMeta(&liveAdmin, extURL)
+	liveAdmin.Status.Conditions = []metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: dbNewMeta}}
+	_ = fakeK8s.Status().Update(ctx, &liveAdmin)
+
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: execCR.Name}, &liveExec)
+	liveExec.Status.Conditions = []metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: dbNewMeta}}
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: taskCR.Name}, &liveTask)
+	liveTask.Status.Conditions = nil // Legacy unconverged XxlJobTask (taskMeta == nil)!
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	if halfConvRet := post("run", xxlclient.TriggerParam{
+		JobID:                 88,
+		ExecutorHandler:       "modeIsoHandler",
+		ExecutorBlockStrategy: "DISCARD_LATER",
+		LogID:                 1,
+		LogDateTime:           1700000000003,
+	}); halfConvRet.IsSuccess() {
+		t.Fatalf("expected half-converged window (Admin+Exec synced dbNew, legacy Task taskMeta==nil) to reject stale JobID, got %+v", halfConvRet)
+	}
+
+	// Also reject when Admin already synced dbNew (admMeta != nil) while BOTH Exec and Task still have nil Conditions:
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: execCR.Name}, &liveExec)
+	liveExec.Status.Conditions = nil
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+	if adminOnlyConvRet := post("run", xxlclient.TriggerParam{
+		JobID:                 88,
+		ExecutorHandler:       "modeIsoHandler",
+		ExecutorBlockStrategy: "DISCARD_LATER",
+		LogID:                 1,
+		LogDateTime:           1700000000003,
+	}); adminOnlyConvRet.IsSuccess() {
+		t.Fatalf("expected half-converged window (Managed Admin synced dbNew, legacy Exec+Task nil) to reject stale JobID, got %+v", adminOnlyConvRet)
+	}
+
+	// Once Executor and Task converge ConditionAdminEndpointSynced to dbNew, trigger succeeds and isolates from emptyHybridJob & pureExtJob!
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: execCR.Name}, &liveExec)
+	liveExec.Status.Conditions = []metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: dbNewMeta}}
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: taskCR.Name}, &liveTask)
+	liveTask.Status.Conditions = []metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: dbNewMeta}}
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	if fullConvRet := post("run", xxlclient.TriggerParam{
+		JobID:                 88,
+		ExecutorHandler:       "modeIsoHandler",
+		ExecutorBlockStrategy: "DISCARD_LATER",
+		LogID:                 1,
+		LogDateTime:           1700000000003,
+	}); !fullConvRet.IsSuccess() {
+		t.Fatalf("expected converged dbNew DISCARD_LATER trigger to succeed without blocking on Pure-External or empty-DB Jobs: %+v", fullConvRet)
+	}
+
+	// 3. Background-deleted Job with real UID (UID != "", as assigned by kube-apiserver), frozen Status.Active=1, and 0 owned Pods in etcd:
+	// MUST NOT block /idleBeat, DISCARD_LATER (including LastExecutionJobName winner replacement), or SERIAL_EXECUTION for 10m!
+	dbNewKey := CanonicalAdminOriginKey(adminCR.Name, extURL, string(adminCR.UID)) + "|db=" + DatasourceURLHash(dbNew)
+	dbNewJob1Name := BuildJobName("mode-iso-proxy", 88, 1, dbNewKey)
+	var dbNewJob1 batchv1.Job
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: dbNewJob1Name}, &dbNewJob1); err != nil {
+		t.Fatalf("get dbNewJob1: %v", err)
+	}
+	dbNewJob1.UID = types.UID("uid-real-apiserver-dbnew-job1")
+	_ = fakeK8s.Update(ctx, &dbNewJob1)
+	dbNewJob1.Status.Active = 1 // Frozen Active=1 while 0 Pods exist in etcd!
+	_ = fakeK8s.Status().Update(ctx, &dbNewJob1)
+	// Default Background delete (no foregroundDeletion finalizer, no AnnotationBackgroundPodsTerminating)
+	if err := fakeK8s.Delete(ctx, &dbNewJob1); err != nil {
+		t.Fatalf("background delete dbNewJob1: %v", err)
+	}
+
+	if ibAfterBgDel := post("idleBeat", xxlclient.IdleBeatParam{JobID: 88}); !ibAfterBgDel.IsSuccess() {
+		t.Fatalf("expected /idleBeat to succeed immediately when background-deleted real-UID Job has 0 Pods in etcd, got %+v", ibAfterBgDel)
+	}
+	if nextDiscardRet := post("run", xxlclient.TriggerParam{
+		JobID:                 88,
+		ExecutorHandler:       "modeIsoHandler",
+		ExecutorBlockStrategy: "DISCARD_LATER",
+		LogID:                 2,
+		LogDateTime:           1700000000004,
+	}); !nextDiscardRet.IsSuccess() {
+		t.Fatalf("expected DISCARD_LATER logId=2 not to hang 10m behind background-deleted 0-Pod winner Job, got %+v", nextDiscardRet)
+	}
+
+	// Also verify AdvanceSerialQueueWithReader unsuspends a queued SERIAL_EXECUTION Job immediately behind a real-UID 0-Pod deleting Job:
+	dbNewJob2Name := BuildJobName("mode-iso-proxy", 88, 2)
+	var dbNewJob2 batchv1.Job
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: dbNewJob2Name}, &dbNewJob2)
+	dbNewJob2.UID = types.UID("uid-real-apiserver-dbnew-job2")
+	_ = fakeK8s.Update(ctx, &dbNewJob2)
+	dbNewJob2.Status.Active = 1
+	_ = fakeK8s.Status().Update(ctx, &dbNewJob2)
+	_ = fakeK8s.Delete(ctx, &dbNewJob2)
+	if serRet := post("run", xxlclient.TriggerParam{
+		JobID:                 88,
+		ExecutorHandler:       "modeIsoHandler",
+		ExecutorBlockStrategy: "SERIAL_EXECUTION",
+		LogID:                 3,
+		LogDateTime:           1700000000005,
+	}); !serRet.IsSuccess() {
+		t.Fatalf("expected SERIAL_EXECUTION logId=3 enqueue to succeed: %+v", serRet)
+	}
+	if err := AdvanceSerialQueueWithReader(ctx, fakeK8s, fakeK8s, "default", SanitizeLabel("mode-iso-proxy"), "88"); err != nil {
+		t.Fatalf("AdvanceSerialQueueWithReader after 0-Pod background delete: %v", err)
+	}
+	var dbNewJob3 batchv1.Job
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: BuildJobName("mode-iso-proxy", 88, 3)}, &dbNewJob3); err != nil {
+		t.Fatalf("get dbNewJob3: %v", err)
+	}
+	if dbNewJob3.Spec.Suspend != nil && *dbNewJob3.Spec.Suspend {
+		t.Fatalf("expected SERIAL_EXECUTION logId=3 to unsuspend immediately when predecessor real-UID deleting Job has 0 Pods in etcd")
+	}
+	dbNewJob3.Finalizers = nil
+	_ = fakeK8s.Update(ctx, &dbNewJob3)
+	_ = fakeK8s.Delete(ctx, &dbNewJob3)
+
+	// Meanwhile, minimal scheme (Pod GVK unregistered) OR synthetic UID=="" Job conservatively falls back to HasActiveOrTerminatingPods=true:
+	nowDel := metav1.Now()
+	uidLessBgJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "syn-uidless-bg",
+			Namespace:         "default",
+			DeletionTimestamp: &nowDel,
+			Finalizers:        []string{JobCallbackFinalizer},
+		},
+		Status: batchv1.JobStatus{Active: 1},
+	}
+	if draining, err := isDeletingJobDrainingPods(ctx, fakeK8s, uidLessBgJob); err != nil || !draining {
+		t.Fatalf("expected synthetic UID-less deleting Job with Active=1 to report draining=true, got draining=%v err=%v", draining, err)
+	}
+	minScheme := runtime.NewScheme()
+	_ = batchv1.AddToScheme(minScheme)
+	realUIDInMinScheme := uidLessBgJob.DeepCopy()
+	realUIDInMinScheme.UID = "uid-min-scheme-job"
+	minCli := fake.NewClientBuilder().WithScheme(minScheme).WithObjects(realUIDInMinScheme).Build()
+	if draining, err := isDeletingJobDrainingPods(ctx, minCli, realUIDInMinScheme); err != nil || !draining {
+		t.Fatalf("expected minimal-scheme client (Pod GVK unregistered) to conservatively fall back to draining=true, got draining=%v err=%v", draining, err)
+	}
+
+	// 4. Single-sided Pure-External ConditionAdminEndpointSynced on liveExec (with taskMeta == nil and admMeta == nil)
+	// remains compatible with synthetic tests and Pure-External mode.
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: adminCR.Name}, &liveAdmin)
+	liveAdmin.Spec.Image = ""
+	liveAdmin.Spec.Datasource.URL = ""
+	liveAdmin.Spec.ExternalURL = extURL
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+	liveAdmin.Status.Conditions = nil
+	_ = fakeK8s.Status().Update(ctx, &liveAdmin)
+
+	singleSidePureMeta := EncodeSyncedAdminEndpointMeta(&liveAdmin, extURL)
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: execCR.Name}, &liveExec)
+	liveExec.Status.Conditions = []metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: singleSidePureMeta}}
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: taskCR.Name}, &liveTask)
+	liveTask.Status.Conditions = nil
+	liveTask.Status.LastExecutionJobName = ""
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	if pureSingleRet := post("run", xxlclient.TriggerParam{
+		JobID:           88,
+		ExecutorHandler: "modeIsoHandler",
+		LogID:           99,
+		LogDateTime:     1700000000099,
+	}); !pureSingleRet.IsSuccess() {
+		t.Fatalf("expected single-sided Pure-External ConditionAdminEndpointSynced on liveExec with nil taskMeta/admMeta to succeed: %+v", pureSingleRet)
+	}
+}
+
+func TestAdversarialHalfConvergedWindowsAnd1cf04b3OriginIsolation(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+	_ = batchv1.AddToScheme(scheme)
+	_ = xxljobv1alpha1.AddToScheme(scheme)
+
+	extURL := "http://adv-r2-ext.example.com:8080/xxl-job-admin"
+	otherURL := "http://adv-r2-other.example.com:8080/xxl-job-admin"
+	jdbcOrder1 := "jdbc:mysql://mysql:3306/xxl_job?zParam=9&aParam=1&mParam=5"
+	jdbcOrder2 := "jdbc:mysql://mysql:3306/xxl_job?mParam=5&zParam=9&aParam=1"
+	rawHash1 := LegacyRawDatasourceURLHash(jdbcOrder1)
+	canonHash := DatasourceURLHash(jdbcOrder1)
+
+	adminA := &xxljobv1alpha1.XxlJobAdmin{
+		ObjectMeta: metav1.ObjectMeta{Name: "adv-r2-adm-a", Namespace: "default", UID: types.UID("uid-adv-r2-a")},
+		Spec: xxljobv1alpha1.XxlJobAdminSpec{
+			Image:       "xuxueli/xxl-job-admin:2.4.1",
+			ExternalURL: extURL,
+			Datasource:  xxljobv1alpha1.DatasourceSpec{URL: jdbcOrder1},
+			Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "adv-r2-tok"},
+		},
+	}
+	initAdmMeta := EncodeSyncedAdminEndpointMeta(adminA, extURL)
+	adminA.Status = xxljobv1alpha1.XxlJobAdminStatus{
+		AdminURL: extURL,
+		Conditions: []metav1.Condition{{
+			Type:    ConditionAdminEndpointSynced,
+			Status:  metav1.ConditionTrue,
+			Message: initAdmMeta,
+		}},
+	}
+	adminB := &xxljobv1alpha1.XxlJobAdmin{
+		ObjectMeta: metav1.ObjectMeta{Name: "adv-r2-adm-b", Namespace: "default", UID: types.UID("uid-adv-r2-b")},
+		Spec: xxljobv1alpha1.XxlJobAdminSpec{
+			ExternalURL: otherURL,
+			Auth:        xxljobv1alpha1.AuthSpec{AccessToken: "adv-r2-tok"},
+		},
+		Status: xxljobv1alpha1.XxlJobAdminStatus{AdminURL: otherURL},
+	}
+
+	execCR := &xxljobv1alpha1.XxlJobExecutor{
+		ObjectMeta: metav1.ObjectMeta{Name: "adv-r2-proxy", Namespace: "default"},
+		Spec: xxljobv1alpha1.XxlJobExecutorSpec{
+			AdminRef: xxljobv1alpha1.LocalObjectReference{Name: adminA.Name},
+			AppName:  "adv-r2-app",
+			Mode:     xxljobv1alpha1.ExecutorModeK8sJobProxy,
+		},
+		Status: xxljobv1alpha1.XxlJobExecutorStatus{
+			JobGroupID: 1,
+			AdminURL:   extURL,
+			Synced:     true,
+		},
+	}
+	taskCR := &xxljobv1alpha1.XxlJobTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "adv-r2-task", Namespace: "default"},
+		Spec: xxljobv1alpha1.XxlJobTaskSpec{
+			ExecutorRef:     xxljobv1alpha1.LocalObjectReference{Name: execCR.Name},
+			JobDesc:         "adv-r2-task",
+			Author:          "ops",
+			ScheduleType:    "CRON",
+			ScheduleConf:    "0 * * * * ?",
+			ExecutorHandler: "advR2Handler",
+			K8sJobTemplate: &xxljobv1alpha1.K8sJobTemplateSpec{
+				Image:   "alpine:3.19",
+				Command: []string{"/bin/sh", "-c"},
+				Args:    []string{"echo ok"},
+			},
+		},
+		Status: xxljobv1alpha1.XxlJobTaskStatus{
+			JobID:      66,
+			JobGroupID: 1,
+			AdminURL:   extURL,
+			Synced:     true,
+		},
+	}
+
+	// Pre-upgrade 1cf04b3 Pure-External active Job (UID set, NO AnnotationAdminManaged, NO dbHash) on extURL!
+	suspendFalse := false
+	pure1cfActiveJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       BuildJobName("adv-r2-proxy", 66, 9000),
+			Namespace:  "default",
+			UID:        types.UID("uid-pure-1cf-active"),
+			Finalizers: []string{JobCallbackFinalizer},
+			Labels: map[string]string{
+				LabelManagedBy:    ManagedByValue,
+				LabelExecutorName: SanitizeLabel("adv-r2-proxy"),
+				LabelJobID:        "66",
+				LabelLogID:        "9000",
+			},
+			Annotations: map[string]string{
+				AnnotationExecutorName:  "adv-r2-proxy",
+				AnnotationAdminName:     adminA.Name,
+				AnnotationAdminUID:      string(adminA.UID),
+				AnnotationAdminURL:      extURL,
+				AnnotationLogID:         "9000",
+				AnnotationLogDateTime:   "1700000009000",
+				AnnotationBlockStrategy: "SERIAL_EXECUTION",
+			},
+		},
+		Spec:   batchv1.JobSpec{Suspend: &suspendFalse},
+		Status: batchv1.JobStatus{Active: 1},
+	}
+
+	fakeK8s := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(adminA, adminB, execCR, taskCR, pure1cfActiveJob).
+		WithStatusSubresource(&xxljobv1alpha1.XxlJobAdmin{}, &xxljobv1alpha1.XxlJobExecutor{}, &xxljobv1alpha1.XxlJobTask{}, &batchv1.Job{}).
+		Build()
+
+	srv := NewServer(fakeK8s, ":0", "default", "adv-r2-tok")
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	post := func(action string, body any) xxlclient.ReturnT {
+		t.Helper()
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/proxy/default/adv-r2-proxy/"+action, bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(xxlclient.AccessTokenHeader, "adv-r2-tok")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s failed: %v", action, err)
+		}
+		defer resp.Body.Close()
+		var ret xxlclient.ReturnT
+		_ = json.NewDecoder(resp.Body).Decode(&ret)
+		return ret
+	}
+
+	// 1. Pre-reconcile AdminRef switch (exec.Spec.AdminRef -> adminB while task.Status.AdminURL is still adminA's extURL)
+	// when adminA is Managed and taskMeta == nil -> MUST find adminA via activeURL and reject stale JobID=66!
+	var liveExec xxljobv1alpha1.XxlJobExecutor
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: execCR.Name}, &liveExec)
+	liveExec.Spec.AdminRef.Name = adminB.Name
+	_ = fakeK8s.Update(ctx, &liveExec)
+	if ret := post("run", xxlclient.TriggerParam{
+		JobID:           66,
+		ExecutorHandler: "advR2Handler",
+		LogID:           1,
+		LogDateTime:     1700000000001,
+	}); ret.IsSuccess() {
+		t.Fatalf("expected half-converged Managed adminA found via activeURL (despite Spec.AdminRef=adminB) to reject nil taskMeta, got %+v", ret)
+	}
+	liveExec.Spec.AdminRef.Name = adminA.Name
+	_ = fakeK8s.Update(ctx, &liveExec)
+
+	// 2. Single-sided liveTask synthetic test setup (liveTask has converged Managed ConditionAdminEndpointSynced, liveExec has NO Conditions)
+	// MUST succeed, AND 1cf04b3 Pure-External active Job (pure1cfActiveJob) MUST be isolated from Managed non-empty DB!
+	var liveTask xxljobv1alpha1.XxlJobTask
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: taskCR.Name}, &liveTask)
+	liveTask.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: initAdmMeta,
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	if ib := post("idleBeat", xxlclient.IdleBeatParam{JobID: 66}); !ib.IsSuccess() {
+		t.Fatalf("expected /idleBeat on Hybrid Managed DB not to be blocked by 1cf04b3 Pure-External Job, got %+v", ib)
+	}
+
+	// Reorder JDBC params to unsorted jdbcOrder2 on adminA (preserving rawHash1 in LegacyDatasourceHash) while liveTask
+	// still holds pre-upgrade rawHash1 -> resolveExecutorOrigin MUST preserve canonical canonHash + alt rawHash1!
+	var liveAdmin xxljobv1alpha1.XxlJobAdmin
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: adminA.Name}, &liveAdmin)
+	preUpgTaskBytes, _ := json.Marshal(SyncedAdminEndpointMeta{
+		AdminName:        adminA.Name,
+		AdminUID:         string(adminA.UID),
+		AdminURL:         extURL,
+		ManagedInCluster: true,
+		DatasourceHash:   rawHash1,
+		AuthCaptured:     true,
+	})
+	liveAdmin.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: string(preUpgTaskBytes),
+	}}
+	firstUpgMeta := EncodeSyncedAdminEndpointMeta(&liveAdmin, extURL)
+	liveAdmin.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: firstUpgMeta,
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveAdmin)
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: adminA.Name}, &liveAdmin)
+	liveAdmin.Spec.Datasource.URL = jdbcOrder2
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+	reorderedAdmMeta := EncodeSyncedAdminEndpointMeta(&liveAdmin, extURL)
+	liveAdmin.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: reorderedAdmMeta,
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveAdmin)
+
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: taskCR.Name}, &liveTask)
+	liveTask.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: string(preUpgTaskBytes),
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	if runRet := post("run", xxlclient.TriggerParam{
+		JobID:                 66,
+		ExecutorHandler:       "advR2Handler",
+		ExecutorBlockStrategy: "SERIAL_EXECUTION",
+		LogID:                 10,
+		LogDateTime:           1700000000010,
+	}); !runRet.IsSuccess() {
+		t.Fatalf("expected single-sided liveTask trigger across multi-reorder JDBC equivalence to succeed: %+v", runRet)
+	}
+	var job10 batchv1.Job
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: BuildJobName("adv-r2-proxy", 66, 10)}, &job10); err != nil {
+		t.Fatalf("get job10: %v", err)
+	}
+	if job10.Annotations[AnnotationAdminDatasourceHash] != canonHash ||
+		job10.Annotations[AnnotationAdminLegacyDatasourceHash] != rawHash1 {
+		t.Fatalf("expected job10 to preserve canonical=%s and legacy=%s across multi-reorder, got %+v",
+			canonHash, rawHash1, job10.Annotations)
+	}
+
+	// /kill on Hybrid Managed DB MUST delete job10 without touching 1cf04b3 Pure-External pure1cfActiveJob!
+	if killRet := post("kill", xxlclient.KillParam{JobID: 66}); !killRet.IsSuccess() {
+		t.Fatalf("expected /kill to succeed: %+v", killRet)
+	}
+	var checkPure batchv1.Job
+	if err := fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: pure1cfActiveJob.Name}, &checkPure); err != nil || !checkPure.DeletionTimestamp.IsZero() {
+		t.Fatalf("expected 1cf04b3 Pure-External Job %s NOT to be deleted by /kill on Hybrid Managed DB, err=%v delTS=%v",
+			pure1cfActiveJob.Name, err, checkPure.DeletionTimestamp)
+	}
+
+	// 3. Minimal pre-mode-capture JSON on liveTask vs post-upgrade Hybrid Managed empty-DB on liveExec -> MUST reject!
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: adminA.Name}, &liveAdmin)
+	liveAdmin.Spec.Datasource.URL = ""
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+	empAdmMeta := EncodeSyncedAdminEndpointMeta(&liveAdmin, extURL)
+	liveAdmin.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: empAdmMeta,
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveAdmin)
+
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: execCR.Name}, &liveExec)
+	liveExec.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: empAdmMeta,
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: taskCR.Name}, &liveTask)
+	liveTask.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: `{"adminName":"adv-r2-adm-a","adminUID":"uid-adv-r2-a","adminURL":"` + extURL + `"}`,
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	if asymRet := post("run", xxlclient.TriggerParam{
+		JobID:           66,
+		ExecutorHandler: "advR2Handler",
+		LogID:           11,
+		LogDateTime:     1700000000011,
+	}); asymRet.IsSuccess() {
+		t.Fatalf("expected pre-mode-capture taskMeta vs Managed empty-DB execMeta asymmetry to reject trigger, got %+v", asymRet)
+	}
+
+	// 4. Hybrid Managed -> Pure-External switch where XxlJobAdmin already reconciled ConditionAdminEndpointSynced +
+	// ConditionPreviousAdminEndpoints while execMeta == nil and taskMeta == nil -> MUST reject until Task reconciles!
+	var retiredSlice []SyncedAdminEndpointMeta
+	if dec := DecodeSyncedAdminEndpointMeta([]metav1.Condition{{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: empAdmMeta}}); dec != nil {
+		retiredSlice = append(retiredSlice, *dec)
+	}
+	retiredJSON, _ := json.Marshal(retiredSlice)
+
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: adminA.Name}, &liveAdmin)
+	liveAdmin.Spec.Image = ""
+	liveAdmin.Spec.Datasource.URL = ""
+	_ = fakeK8s.Update(ctx, &liveAdmin)
+	newPureMeta := EncodeSyncedAdminEndpointMeta(&liveAdmin, extURL)
+	liveAdmin.Status.Conditions = []metav1.Condition{
+		{Type: ConditionAdminEndpointSynced, Status: metav1.ConditionTrue, Message: newPureMeta},
+		{Type: ConditionPreviousAdminEndpoints, Status: metav1.ConditionTrue, Message: string(retiredJSON)},
+	}
+	_ = fakeK8s.Status().Update(ctx, &liveAdmin)
+
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: execCR.Name}, &liveExec)
+	liveExec.Status.Conditions = nil
+	_ = fakeK8s.Status().Update(ctx, &liveExec)
+
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: taskCR.Name}, &liveTask)
+	liveTask.Status.Conditions = nil
+	liveTask.Status.LastExecutionJobName = ""
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	if mgrToPureRet := post("run", xxlclient.TriggerParam{
+		JobID:           66,
+		ExecutorHandler: "advR2Handler",
+		LogID:           12,
+		LogDateTime:     1700000000012,
+	}); mgrToPureRet.IsSuccess() {
+		t.Fatalf("expected Managed->Pure-External half-converged window (with ConditionPreviousAdminEndpoints & nil taskMeta) to reject stale JobID, got %+v", mgrToPureRet)
+	}
+
+	// Once Task reconciles newPureMeta, trigger succeeds!
+	_ = fakeK8s.Get(ctx, client.ObjectKey{Namespace: "default", Name: taskCR.Name}, &liveTask)
+	liveTask.Status.Conditions = []metav1.Condition{{
+		Type:    ConditionAdminEndpointSynced,
+		Status:  metav1.ConditionTrue,
+		Message: newPureMeta,
+	}}
+	_ = fakeK8s.Status().Update(ctx, &liveTask)
+
+	if convergedPureRet := post("run", xxlclient.TriggerParam{
+		JobID:           66,
+		ExecutorHandler: "advR2Handler",
+		LogID:           12,
+		LogDateTime:     1700000000012,
+	}); !convergedPureRet.IsSuccess() {
+		t.Fatalf("expected converged Pure-External Task to succeed after Managed->Pure-External transition, got %+v", convergedPureRet)
+	}
+}

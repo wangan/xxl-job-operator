@@ -129,6 +129,8 @@ func (r *XxlJobAdminReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			prevAdminURL := admin.Status.AdminURL
 			if prevAdminURL != "" && strings.TrimRight(strings.TrimSpace(prevAdminURL), "/") != strings.TrimRight(strings.TrimSpace(adminURL), "/") {
 				recordPreviousAdminURLCondition(&admin, prevAdminURL)
+			} else {
+				recordRetiredAdminEndpointCondition(&admin)
 			}
 			syncAdminCurrentEndpointCondition(&admin, adminURL)
 			admin.Status.Phase = "Running"
@@ -288,6 +290,8 @@ func (r *XxlJobAdminReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		prevAdminURL := admin.Status.AdminURL
 		if prevAdminURL != "" && strings.TrimRight(strings.TrimSpace(prevAdminURL), "/") != strings.TrimRight(strings.TrimSpace(adminURL), "/") {
 			recordPreviousAdminURLCondition(&admin, prevAdminURL)
+		} else {
+			recordRetiredAdminEndpointCondition(&admin)
 		}
 		syncAdminCurrentEndpointCondition(&admin, adminURL)
 		admin.Status.Phase = phase
@@ -389,7 +393,6 @@ func (r *XxlJobAdminReconciler) countReferencingExecutors(ctx context.Context, a
 		}
 	}
 
-	otherOwnedURLs := make(map[string]bool)
 	var adminList xxljobv1alpha1.XxlJobAdminList
 	if err := r.List(ctx, &adminList, client.InNamespace(admin.Namespace)); err != nil {
 		return 0, err
@@ -400,27 +403,25 @@ func (r *XxlJobAdminReconciler) countReferencingExecutors(ctx context.Context, a
 			continue
 		}
 		if ou := strings.TrimRight(ResolveAdminURL(other), "/"); ou != "" {
-			otherOwnedURLs[ou] = true
 			delete(candidateURLs, ou)
 		}
 		if osu := strings.TrimRight(strings.TrimSpace(other.Status.AdminURL), "/"); osu != "" {
-			otherOwnedURLs[osu] = true
 			delete(candidateURLs, osu)
 		}
 	}
 
-	matchesSavedEndpointAdmin := func(conds []metav1.Condition, statusURL string) bool {
-		if statusURL != "" && otherOwnedURLs[statusURL] {
-			return false
-		}
+	matchesSavedEndpointAdmin := func(conds []metav1.Condition) (matched bool, hasExplicitIdentity bool) {
 		saved := extractSyncedAdminEndpointMeta(conds)
-		if saved == nil || saved.AdminName != admin.Name {
-			return false
+		if saved == nil || strings.TrimSpace(saved.AdminName) == "" {
+			return false, false
+		}
+		if saved.AdminName != admin.Name {
+			return false, true
 		}
 		if saved.AdminUID != "" && admin.UID != "" && saved.AdminUID != string(admin.UID) {
-			return false
+			return false, true
 		}
-		return true
+		return true, true
 	}
 
 	count := 0
@@ -439,8 +440,16 @@ func (r *XxlJobAdminReconciler) countReferencingExecutors(ctx context.Context, a
 			len(item.Status.RegisteredAddresses) > 0 ||
 			len(item.Status.DrainedAddresses) > 0 ||
 			len(item.Status.RegistryKeepAliveAddresses) > 0
-		if hasRemoteExecState &&
-			((itemAdminURL != "" && candidateURLs[itemAdminURL]) || matchesSavedEndpointAdmin(item.Status.Conditions, itemAdminURL)) {
+		if !hasRemoteExecState {
+			continue
+		}
+		if matched, explicit := matchesSavedEndpointAdmin(item.Status.Conditions); explicit {
+			if matched {
+				count++
+			}
+			continue
+		}
+		if itemAdminURL != "" && candidateURLs[itemAdminURL] {
 			count++
 		}
 	}
@@ -451,9 +460,17 @@ func (r *XxlJobAdminReconciler) countReferencingExecutors(ctx context.Context, a
 	}
 	for i := range taskList.Items {
 		t := &taskList.Items[i]
+		if t.Status.JobID <= 0 && t.Status.JobGroupID <= 0 {
+			continue
+		}
+		if matched, explicit := matchesSavedEndpointAdmin(t.Status.Conditions); explicit {
+			if matched {
+				count++
+			}
+			continue
+		}
 		taskAdminURL := strings.TrimRight(strings.TrimSpace(t.Status.AdminURL), "/")
-		if (t.Status.JobID > 0 || t.Status.JobGroupID > 0) &&
-			((taskAdminURL != "" && candidateURLs[taskAdminURL]) || matchesSavedEndpointAdmin(t.Status.Conditions, taskAdminURL)) {
+		if taskAdminURL != "" && candidateURLs[taskAdminURL] {
 			count++
 		}
 	}
@@ -776,6 +793,18 @@ func (r *XxlJobAdminReconciler) findDeletingAdminsForExecutor(ctx context.Contex
 	return reqs
 }
 
+func syncedEndpointConditionChanged(oldConds, newConds []metav1.Condition) bool {
+	oldCond := meta.FindStatusCondition(oldConds, ConditionAdminEndpointSynced)
+	newCond := meta.FindStatusCondition(newConds, ConditionAdminEndpointSynced)
+	if (oldCond == nil) != (newCond == nil) {
+		return true
+	}
+	if oldCond == nil {
+		return false
+	}
+	return oldCond.Status != newCond.Status || oldCond.Message != newCond.Message
+}
+
 func executorForDeletingAdminPredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(event.CreateEvent) bool {
@@ -789,7 +818,8 @@ func executorForDeletingAdminPredicate() predicate.Predicate {
 			}
 			return oldExec.Spec.AdminRef != newExec.Spec.AdminRef ||
 				oldExec.Status.AdminURL != newExec.Status.AdminURL ||
-				oldExec.Status.JobGroupID != newExec.Status.JobGroupID
+				oldExec.Status.JobGroupID != newExec.Status.JobGroupID ||
+				syncedEndpointConditionChanged(oldExec.Status.Conditions, newExec.Status.Conditions)
 		},
 		DeleteFunc: func(event.DeleteEvent) bool {
 			return true
@@ -809,7 +839,8 @@ func taskForDeletingAdminPredicate() predicate.Predicate {
 				return false
 			}
 			return oldTask.Status.AdminURL != newTask.Status.AdminURL ||
-				oldTask.Status.JobID != newTask.Status.JobID
+				oldTask.Status.JobID != newTask.Status.JobID ||
+				syncedEndpointConditionChanged(oldTask.Status.Conditions, newTask.Status.Conditions)
 		},
 		DeleteFunc: func(event.DeleteEvent) bool {
 			return true

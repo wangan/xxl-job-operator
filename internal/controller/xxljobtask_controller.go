@@ -211,7 +211,7 @@ func (r *XxlJobTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	if execErr != nil {
 		if apierrors.IsNotFound(execErr) && prevAdminURL != "" && (task.Status.JobID > 0 || task.Status.JobGroupID > 0) {
-			prevDeleting, delCheckErr := isPreviousAdminDeleting(ctx, reader, task.Namespace, prevAdminURL)
+			prevDeleting, delCheckErr := isPreviousAdminDeleting(ctx, reader, task.Namespace, prevAdminURL, extractSyncedAdminEndpointMeta(task.Status.Conditions))
 			if delCheckErr != nil {
 				return ctrl.Result{}, delCheckErr
 			}
@@ -593,7 +593,57 @@ func (r *XxlJobTaskReconciler) cleanupTaskOnPreviousAdmin(
 	return nil
 }
 
+func jobDatasourceHashesMatchTaskMeta(jobDBHash, jobLegacyDBHash string, taskMeta *syncedAdminEndpointMeta) bool {
+	if taskMeta == nil {
+		return false
+	}
+	taskDBHash := strings.TrimSpace(taskMeta.DatasourceHash)
+	taskLegacyDBHash := strings.TrimSpace(taskMeta.LegacyDatasourceHash)
+	for _, jh := range []string{jobDBHash, jobLegacyDBHash} {
+		if jh == "" {
+			continue
+		}
+		if jh == taskDBHash || jh == taskLegacyDBHash {
+			return true
+		}
+	}
+	return false
+}
+
+func jobDatasourceHashesMatchTaskMetaWithAdmin(
+	jobDBHash, jobLegacyDBHash string,
+	taskMeta *syncedAdminEndpointMeta,
+	adminCR *xxljobv1alpha1.XxlJobAdmin,
+) bool {
+	if jobDatasourceHashesMatchTaskMeta(jobDBHash, jobLegacyDBHash, taskMeta) {
+		return true
+	}
+	if adminCR == nil || taskMeta == nil || (jobDBHash == "" && jobLegacyDBHash == "") || !taskMeta.HasDatasourceHash() {
+		return false
+	}
+	if !sameAdminIdentity(taskMeta.AdminName, types.UID(taskMeta.AdminUID), adminCR) {
+		return false
+	}
+	if !metaMatchesAdminDatasource(adminCR, taskMeta) {
+		return false
+	}
+	jobMeta := &syncedAdminEndpointMeta{
+		DatasourceHash:       jobDBHash,
+		LegacyDatasourceHash: jobLegacyDBHash,
+	}
+	return metaMatchesAdminDatasource(adminCR, jobMeta)
+}
+
 func jobMatchesDeletedTaskFallback(j *batchv1.Job, task *xxljobv1alpha1.XxlJobTask, taskMeta *syncedAdminEndpointMeta) bool {
+	return jobMatchesDeletedTaskFallbackWithAdmin(j, task, taskMeta, nil)
+}
+
+func jobMatchesDeletedTaskFallbackWithAdmin(
+	j *batchv1.Job,
+	task *xxljobv1alpha1.XxlJobTask,
+	taskMeta *syncedAdminEndpointMeta,
+	adminCR *xxljobv1alpha1.XxlJobAdmin,
+) bool {
 	if j == nil || task == nil {
 		return false
 	}
@@ -612,22 +662,43 @@ func jobMatchesDeletedTaskFallback(j *batchv1.Job, task *xxljobv1alpha1.XxlJobTa
 	}
 	taskAdminURL := strings.TrimRight(strings.TrimSpace(task.Status.AdminURL), "/")
 	if j.Annotations != nil {
+		jobAdminName := strings.TrimSpace(j.Annotations[proxyexecutor.AnnotationAdminName])
 		jobAdminUID := strings.TrimSpace(j.Annotations[proxyexecutor.AnnotationAdminUID])
+		jobAdminURL := strings.TrimRight(strings.TrimSpace(j.Annotations[proxyexecutor.AnnotationAdminURL]), "/")
 		if taskMeta != nil && taskMeta.AdminUID != "" && jobAdminUID != "" && taskMeta.AdminUID != jobAdminUID {
 			return false
 		}
 		jobDBHash := strings.TrimSpace(j.Annotations[proxyexecutor.AnnotationAdminDatasourceHash])
-		if taskMeta != nil && taskMeta.DatasourceHash != "" && jobDBHash != "" && taskMeta.DatasourceHash != jobDBHash {
+		jobLegacyDBHash := strings.TrimSpace(j.Annotations[proxyexecutor.AnnotationAdminLegacyDatasourceHash])
+		jobHasDBHash := jobDBHash != "" || jobLegacyDBHash != ""
+		taskHasDBHash := taskMeta != nil && taskMeta.HasDatasourceHash()
+		sameDBHashes := jobDatasourceHashesMatchTaskMetaWithAdmin(jobDBHash, jobLegacyDBHash, taskMeta, adminCR)
+		if taskHasDBHash && jobHasDBHash && !sameDBHashes {
 			return false
 		}
-		jobAdminURL := strings.TrimRight(strings.TrimSpace(j.Annotations[proxyexecutor.AnnotationAdminURL]), "/")
+		if rawJobManaged := strings.TrimSpace(j.Annotations[proxyexecutor.AnnotationAdminManaged]); rawJobManaged != "" &&
+			taskMeta != nil && taskMeta.HasExplicitMode() {
+			jobManaged := strings.EqualFold(rawJobManaged, "true") || jobHasDBHash
+			taskManaged := taskMeta.ManagedInCluster || taskHasDBHash
+			if jobManaged != taskManaged || jobHasDBHash != taskHasDBHash {
+				return false
+			}
+		} else if taskMeta != nil && taskMeta.HasExplicitMode() {
+			if jobHasDBHash && !taskHasDBHash {
+				return false
+			}
+			if !jobHasDBHash && taskHasDBHash && jobAdminUID != "" &&
+				(jobAdminURL == "" || !proxyexecutor.IsClusterLocalAdminServiceURL(jobAdminURL, jobAdminName, task.Namespace)) {
+				return false
+			}
+		}
 		if taskAdminURL != "" && jobAdminURL != "" && jobAdminURL != taskAdminURL {
-			jobAdminName := strings.TrimSpace(j.Annotations[proxyexecutor.AnnotationAdminName])
 			sameManaged := taskMeta != nil &&
 				taskMeta.AdminName != "" &&
 				(jobAdminName == "" || jobAdminName == taskMeta.AdminName) &&
-				taskMeta.DatasourceHash != "" &&
-				jobDBHash == taskMeta.DatasourceHash
+				taskHasDBHash &&
+				jobHasDBHash &&
+				sameDBHashes
 			if !sameManaged {
 				return false
 			}
@@ -650,6 +721,26 @@ func (r *XxlJobTaskReconciler) cleanupActiveTaskJobs(ctx context.Context, reader
 	liveQueues := make(map[[2]string]bool)
 	candidateClearQueues := make(map[[2]string]bool)
 	taskMeta := extractSyncedAdminEndpointMeta(task.Status.Conditions)
+	var adminCR *xxljobv1alpha1.XxlJobAdmin
+	adminName := ""
+	if taskMeta != nil {
+		adminName = strings.TrimSpace(taskMeta.AdminName)
+	}
+	if adminName == "" && task.Spec.ExecutorRef.Name != "" &&
+		(task.Spec.ExecutorRef.Namespace == "" || task.Spec.ExecutorRef.Namespace == task.Namespace) {
+		var execCR xxljobv1alpha1.XxlJobExecutor
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.ExecutorRef.Name}, &execCR); err == nil {
+			if execCR.Spec.AdminRef.Namespace == "" || execCR.Spec.AdminRef.Namespace == execCR.Namespace {
+				adminName = strings.TrimSpace(execCR.Spec.AdminRef.Name)
+			}
+		}
+	}
+	if adminName != "" {
+		var adm xxljobv1alpha1.XxlJobAdmin
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: adminName}, &adm); err == nil {
+			adminCR = &adm
+		}
+	}
 	for i := range jobList.Items {
 		j := &jobList.Items[i]
 		taskNameAnnot := ""
@@ -660,7 +751,7 @@ func (r *XxlJobTaskReconciler) cleanupActiveTaskJobs(ctx context.Context, reader
 		if taskNameAnnot != "" {
 			belongsToTask = (taskNameAnnot == task.Name)
 		} else if task.Status.JobID > 0 && j.Labels != nil && j.Labels[proxyexecutor.LabelJobID] == strconv.Itoa(task.Status.JobID) {
-			belongsToTask = jobMatchesDeletedTaskFallback(j, task, taskMeta)
+			belongsToTask = jobMatchesDeletedTaskFallbackWithAdmin(j, task, taskMeta, adminCR)
 		}
 		if !belongsToTask {
 			if j.DeletionTimestamp.IsZero() && j.Spec.Suspend != nil && *j.Spec.Suspend && j.Labels != nil {
